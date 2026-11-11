@@ -97,10 +97,91 @@ pub struct DocPermission {
     pub authorization: Authorization,
 }
 
+/// The largest `user_id` the mint endpoint accepts, in bytes.
+pub const MAX_ACTOR_USER_ID_BYTES: usize = 128;
+/// The largest `writer` the mint endpoint accepts, in bytes.
+pub const MAX_ACTOR_WRITER_BYTES: usize = 64;
+
+/// The server-verified identity of whoever writes through a doc token.
+///
+/// Both fields are opaque to this server: the application that mints tokens owns their meaning.
+/// The struct is part of the (positional, bincode) token payload, so fields must never be
+/// added, removed, reordered or skipped during serialization.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct Actor {
+    pub user_id: Option<String>,
+    pub writer: Option<String>,
+}
+
+/// `user_id` is never printed: actors end up in log lines through `{:?}` far too easily.
+impl std::fmt::Debug for Actor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Actor")
+            .field("user_id", &self.user_id.as_ref().map(|_| "<redacted>"))
+            .field("writer", &self.writer)
+            .finish()
+    }
+}
+
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum ActorError {
+    #[error("user_id is longer than {MAX_ACTOR_USER_ID_BYTES} bytes")]
+    UserIdTooLong,
+    #[error("writer is longer than {MAX_ACTOR_WRITER_BYTES} bytes")]
+    WriterTooLong,
+}
+
+impl Actor {
+    /// Builds the actor for a mint request. Returns `Ok(None)` when the request names neither a
+    /// user nor a writer, and an error when either is over its size limit.
+    pub fn from_request(
+        user_id: Option<String>,
+        writer: Option<String>,
+    ) -> Result<Option<Self>, ActorError> {
+        if user_id
+            .as_ref()
+            .is_some_and(|v| v.len() > MAX_ACTOR_USER_ID_BYTES)
+        {
+            return Err(ActorError::UserIdTooLong);
+        }
+        if writer
+            .as_ref()
+            .is_some_and(|v| v.len() > MAX_ACTOR_WRITER_BYTES)
+        {
+            return Err(ActorError::WriterTooLong);
+        }
+        if user_id.is_none() && writer.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self { user_id, writer }))
+    }
+}
+
+/// What a verified doc token grants, and on whose behalf.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocAccess {
+    pub authorization: Authorization,
+    /// `None` for server tokens and for doc tokens minted without an actor.
+    pub actor: Option<Actor>,
+}
+
+impl DocAccess {
+    /// Full, unattributed access: what a server token or a server without auth grants.
+    pub fn full() -> Self {
+        Self {
+            authorization: Authorization::Full,
+            actor: None,
+        }
+    }
+}
+
+// The payload is bincode and positional: variants may only ever be appended, and the fields of
+// an existing variant may never change, or every outstanding token stops verifying.
 #[derive(Serialize, Deserialize)]
 pub enum Permission {
     Server,
     Doc(DocPermission),
+    AttributedDoc(DocPermission, Actor),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -336,6 +417,29 @@ impl Authenticator {
         self.sign(payload)
     }
 
+    /// Like [Authenticator::gen_doc_token], but binds `actor` into the token when one is given.
+    /// Without an actor this mints exactly the token `gen_doc_token` does.
+    ///
+    /// Binaries that predate `Permission::AttributedDoc` reject a token carrying an actor, so
+    /// callers must only pass one once every verifier of the token has been upgraded.
+    pub fn gen_doc_token_with_actor(
+        &self,
+        doc_id: &str,
+        authorization: Authorization,
+        expiration_time: ExpirationTimeEpochMillis,
+        actor: Option<Actor>,
+    ) -> String {
+        let doc_permission = DocPermission {
+            doc_id: doc_id.to_string(),
+            authorization,
+        };
+        let permission = match actor {
+            Some(actor) => Permission::AttributedDoc(doc_permission, actor),
+            None => Permission::Doc(doc_permission),
+        };
+        self.sign(Payload::new_with_expiration(permission, expiration_time))
+    }
+
     fn verify_token(
         &self,
         token: &str,
@@ -350,18 +454,23 @@ impl Authenticator {
         token: &str,
         doc: &str,
         current_time_epoch_millis: u64,
-    ) -> Result<Authorization, AuthError> {
+    ) -> Result<DocAccess, AuthError> {
         let payload = self.verify_token(token, current_time_epoch_millis)?;
 
-        match payload {
-            Permission::Doc(doc_permission) => {
-                if doc_permission.doc_id == doc {
-                    Ok(doc_permission.authorization)
-                } else {
-                    Err(AuthError::InvalidResource)
-                }
-            }
-            Permission::Server => Ok(Authorization::Full), // Server tokens can access any doc.
+        let (doc_permission, actor) = match payload {
+            Permission::Doc(doc_permission) => (doc_permission, None),
+            Permission::AttributedDoc(doc_permission, actor) => (doc_permission, Some(actor)),
+            // Server tokens can access any doc, and are never attributed.
+            Permission::Server => return Ok(DocAccess::full()),
+        };
+
+        if doc_permission.doc_id == doc {
+            Ok(DocAccess {
+                authorization: doc_permission.authorization,
+                actor,
+            })
+        } else {
+            Err(AuthError::InvalidResource)
         }
     }
 
@@ -406,7 +515,10 @@ mod tests {
         );
         assert!(matches!(
             authenticator.verify_doc_token(&token, "doc123", 0),
-            Ok(Authorization::Full)
+            Ok(DocAccess {
+                authorization: Authorization::Full,
+                actor: None
+            })
         ));
         assert!(matches!(
             authenticator.verify_doc_token(&token, "doc123", DEFAULT_EXPIRATION_SECONDS + 1),
@@ -428,7 +540,10 @@ mod tests {
         );
         assert!(matches!(
             authenticator.verify_doc_token(&token, "doc123", 0),
-            Ok(Authorization::ReadOnly)
+            Ok(DocAccess {
+                authorization: Authorization::ReadOnly,
+                actor: None
+            })
         ));
     }
 
@@ -438,7 +553,10 @@ mod tests {
         let server_token = authenticator.server_token();
         assert!(matches!(
             authenticator.verify_doc_token(&server_token, "doc123", 0),
-            Ok(Authorization::Full)
+            Ok(DocAccess {
+                authorization: Authorization::Full,
+                actor: None
+            })
         ));
     }
 
@@ -459,7 +577,10 @@ mod tests {
         );
         assert!(matches!(
             authenticator.verify_doc_token(&token, "doc123", 0),
-            Ok(Authorization::Full)
+            Ok(DocAccess {
+                authorization: Authorization::Full,
+                actor: None
+            })
         ));
 
         let token = authenticator.server_token();
@@ -574,5 +695,141 @@ mod tests {
         let serialized = serde_json::to_string(&authenticator).unwrap();
         let deserialized: Authenticator = serde_json::from_str(&serialized).unwrap();
         assert_eq!(authenticator, deserialized);
+    }
+
+    fn actor(user_id: Option<&str>, writer: Option<&str>) -> Actor {
+        Actor {
+            user_id: user_id.map(str::to_string),
+            writer: writer.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_attributed_doc_token_roundtrip() {
+        let authenticator = Authenticator::gen_key().unwrap();
+        let expected = actor(Some("user-1"), Some("ui"));
+        let token = authenticator.gen_doc_token_with_actor(
+            "doc123",
+            Authorization::Full,
+            ExpirationTimeEpochMillis(0),
+            Some(expected.clone()),
+        );
+
+        assert_eq!(
+            authenticator.verify_doc_token(&token, "doc123", 0),
+            Ok(DocAccess {
+                authorization: Authorization::Full,
+                actor: Some(expected),
+            })
+        );
+        assert_eq!(
+            authenticator.verify_doc_token(&token, "doc456", 0),
+            Err(AuthError::InvalidResource)
+        );
+        assert_eq!(
+            authenticator.verify_doc_token(&token, "doc123", 1),
+            Err(AuthError::Expired)
+        );
+        // An attributed doc token is still not a server token.
+        assert_eq!(
+            authenticator.verify_server_token(&token, 0),
+            Err(AuthError::InvalidResource)
+        );
+    }
+
+    #[test]
+    fn test_attributed_doc_token_partial_actor_and_read_only() {
+        let authenticator = Authenticator::gen_key()
+            .unwrap()
+            .with_key_id("myKeyId".try_into().unwrap());
+        for expected in [actor(None, Some("agent")), actor(Some("user-1"), None)] {
+            let token = authenticator.gen_doc_token_with_actor(
+                "doc123",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(0),
+                Some(expected.clone()),
+            );
+            assert_eq!(
+                authenticator.verify_doc_token(&token, "doc123", 0),
+                Ok(DocAccess {
+                    authorization: Authorization::ReadOnly,
+                    actor: Some(expected),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn test_doc_token_without_actor_is_the_plain_doc_token() {
+        let authenticator = Authenticator::gen_key().unwrap();
+        let expiration = ExpirationTimeEpochMillis(1234);
+        assert_eq!(
+            authenticator.gen_doc_token_with_actor("doc123", Authorization::Full, expiration, None),
+            authenticator.gen_doc_token("doc123", Authorization::Full, expiration),
+        );
+    }
+
+    /// A token in the format every binary before `Permission::AttributedDoc` minted. The bytes
+    /// were produced independently of this crate (bincode varint layout written out by hand:
+    /// variant 1, doc id, authorization, expiration, then the SHA-256 of payload + key), so this
+    /// fails if the payload layout of existing tokens ever shifts.
+    #[test]
+    fn test_old_format_token_verifies_without_actor() {
+        let authenticator = Authenticator::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd").unwrap();
+        let old_token = "AQZkb2MxMjMBAf3__________yBWZatYGvHMXUiFyJcgDOrKestcqJ8SOUawshErWx-Olg";
+
+        assert_eq!(
+            authenticator.verify_doc_token(old_token, "doc123", 0),
+            Ok(DocAccess {
+                authorization: Authorization::Full,
+                actor: None,
+            })
+        );
+        // And the current code still mints that exact token for the same input.
+        assert_eq!(
+            authenticator.gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis::max()
+            ),
+            old_token
+        );
+    }
+
+    #[test]
+    fn test_actor_from_request_limits() {
+        assert_eq!(Actor::from_request(None, None), Ok(None));
+        assert_eq!(
+            Actor::from_request(Some("user-1".to_string()), None),
+            Ok(Some(actor(Some("user-1"), None)))
+        );
+
+        let max_user_id = "u".repeat(MAX_ACTOR_USER_ID_BYTES);
+        let max_writer = "w".repeat(MAX_ACTOR_WRITER_BYTES);
+        assert_eq!(
+            Actor::from_request(Some(max_user_id.clone()), Some(max_writer.clone())),
+            Ok(Some(actor(Some(&max_user_id), Some(&max_writer))))
+        );
+
+        assert_eq!(
+            Actor::from_request(Some(format!("{max_user_id}u")), None),
+            Err(ActorError::UserIdTooLong)
+        );
+        assert_eq!(
+            Actor::from_request(None, Some(format!("{max_writer}w"))),
+            Err(ActorError::WriterTooLong)
+        );
+        // The limit is in bytes, not characters.
+        assert_eq!(
+            Actor::from_request(None, Some("é".repeat(MAX_ACTOR_WRITER_BYTES / 2 + 1))),
+            Err(ActorError::WriterTooLong)
+        );
+    }
+
+    #[test]
+    fn test_actor_debug_redacts_user_id() {
+        let debug = format!("{:?}", actor(Some("secret-user"), Some("ui")));
+        assert!(!debug.contains("secret-user"), "{debug}");
+        assert!(debug.contains("ui"), "{debug}");
     }
 }

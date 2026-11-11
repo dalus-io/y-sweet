@@ -1,7 +1,8 @@
 use crate::api_types::Authorization;
+use crate::auth::Actor;
 use crate::sync::{
-    self, awareness::Awareness, DefaultProtocol, Message, Protocol, SyncMessage, MSG_SYNC,
-    MSG_SYNC_UPDATE,
+    self, actor_origin, awareness::Awareness, DefaultProtocol, Message, Protocol, SyncMessage,
+    MSG_SYNC, MSG_SYNC_UPDATE,
 };
 use std::sync::{Arc, OnceLock, RwLock};
 use yrs::{
@@ -11,7 +12,7 @@ use yrs::{
         decoder::Decode,
         encoder::{Encode, Encoder, EncoderV1},
     },
-    ReadTxn, Subscription, Transact, Update,
+    Origin, ReadTxn, Subscription, Transact, Update,
 };
 
 // TODO: this is an implementation detail and should not be exposed.
@@ -32,6 +33,9 @@ pub struct DocConnection {
     #[allow(unused)] // acts as RAII guard
     awareness_subscription: Subscription,
     authorization: Authorization,
+    /// The origin every write from this connection is applied under. It encodes the actor the
+    /// connection authenticated as; `None` for an unattributed connection.
+    origin: Option<Origin>,
     callback: Callback,
     closed: Arc<OnceLock<()>>,
 
@@ -45,29 +49,32 @@ impl DocConnection {
     pub fn new<F>(
         awareness: Arc<RwLock<Awareness>>,
         authorization: Authorization,
+        actor: Option<Actor>,
         callback: F,
     ) -> Self
     where
         F: Fn(&[u8]) + 'static,
     {
-        Self::new_inner(awareness, authorization, Arc::new(callback))
+        Self::new_inner(awareness, authorization, actor, Arc::new(callback))
     }
 
     #[cfg(feature = "sync")]
     pub fn new<F>(
         awareness: Arc<RwLock<Awareness>>,
         authorization: Authorization,
+        actor: Option<Actor>,
         callback: F,
     ) -> Self
     where
         F: Fn(&[u8]) + 'static + Send + Sync,
     {
-        Self::new_inner(awareness, authorization, Arc::new(callback))
+        Self::new_inner(awareness, authorization, actor, Arc::new(callback))
     }
 
     pub fn new_inner(
         awareness: Arc<RwLock<Awareness>>,
         authorization: Authorization,
+        actor: Option<Actor>,
         callback: Callback,
     ) -> Self {
         let closed = Arc::new(OnceLock::new());
@@ -142,6 +149,7 @@ impl DocConnection {
             doc_subscription,
             awareness_subscription,
             authorization,
+            origin: actor.as_ref().map(actor_origin),
             callback,
             client_id: OnceLock::new(),
             closed,
@@ -178,7 +186,11 @@ impl DocConnection {
                 SyncMessage::SyncStep2(update) => {
                     if can_write {
                         let mut awareness = a.write().unwrap();
-                        protocol.handle_sync_step2(&mut awareness, Update::decode_v1(&update)?)
+                        protocol.handle_sync_step2_with(
+                            &mut awareness,
+                            Update::decode_v1(&update)?,
+                            self.origin.clone(),
+                        )
                     } else {
                         Err(sync::Error::PermissionDenied {
                             reason: "Token does not have write access".to_string(),
@@ -188,7 +200,11 @@ impl DocConnection {
                 SyncMessage::Update(update) => {
                     if can_write {
                         let mut awareness = a.write().unwrap();
-                        protocol.handle_update(&mut awareness, Update::decode_v1(&update)?)
+                        protocol.handle_update_with(
+                            &mut awareness,
+                            Update::decode_v1(&update)?,
+                            self.origin.clone(),
+                        )
                     } else {
                         Err(sync::Error::PermissionDenied {
                             reason: "Token does not have write access".to_string(),

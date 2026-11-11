@@ -1,4 +1,12 @@
-use crate::{doc_connection::DOC_NAME, store::Store, sync::awareness::Awareness, sync_kv::SyncKv};
+#[cfg(feature = "sync")]
+use crate::update_events::{observe_attributed_updates, UpdateCallback};
+use crate::{
+    auth::Actor,
+    doc_connection::DOC_NAME,
+    store::Store,
+    sync::{actor_origin, awareness::Awareness},
+    sync_kv::SyncKv,
+};
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Arc, RwLock};
 use yrs::{updates::decoder::Decode, ReadTxn, StateVector, Subscription, Transact, Update};
@@ -9,6 +17,9 @@ pub struct DocWithSyncKv {
     sync_kv: Arc<SyncKv>,
     #[allow(unused)] // acts as RAII guard
     subscription: Subscription,
+    #[cfg(feature = "sync")]
+    #[allow(unused)] // acts as RAII guard
+    update_subscription: Option<Subscription>,
 }
 
 impl DocWithSyncKv {
@@ -25,6 +36,7 @@ impl DocWithSyncKv {
         store: Option<Arc<Box<dyn Store>>>,
         dirty_callback: F,
         skip_gc: bool,
+        #[cfg(feature = "sync")] on_update: Option<UpdateCallback>,
     ) -> Result<Self>
     where
         F: Fn() + Send + Sync + 'static,
@@ -57,11 +69,23 @@ impl DocWithSyncKv {
             .map_err(|_| anyhow!("Failed to subscribe to updates"))?
         };
 
+        // Registered after the initial load, so loading a doc from the store emits nothing.
+        #[cfg(feature = "sync")]
+        let update_subscription = match on_update {
+            Some(on_update) => Some(
+                observe_attributed_updates(&doc, key, on_update)
+                    .map_err(|_| anyhow!("Failed to subscribe to attributed updates"))?,
+            ),
+            None => None,
+        };
+
         let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
         Ok(Self {
             awareness,
             sync_kv,
             subscription,
+            #[cfg(feature = "sync")]
+            update_subscription,
         })
     }
 
@@ -74,14 +98,19 @@ impl DocWithSyncKv {
         txn.encode_state_as_update_v1(&StateVector::default())
     }
 
-    pub fn apply_update(&self, update: &[u8]) -> Result<()> {
+    /// Applies a v1 update to the doc. When `actor` is given, the transaction is tagged with it
+    /// so that update observers can attribute the change.
+    pub fn apply_update(&self, update: &[u8], actor: Option<&Actor>) -> Result<()> {
         let awareness_guard = self.awareness.write().unwrap();
         let doc = &awareness_guard.doc;
 
         let update: Update =
             Update::decode_v1(update).map_err(|_| anyhow!("Failed to decode update"))?;
 
-        let mut txn = doc.transact_mut();
+        let mut txn = match actor {
+            Some(actor) => doc.transact_mut_with(actor_origin(actor)),
+            None => doc.transact_mut(),
+        };
         txn.apply_update(update);
 
         Ok(())

@@ -2,11 +2,32 @@
 
 pub mod awareness;
 
+use crate::auth::Actor;
 use awareness::{Awareness, AwarenessUpdate};
 use thiserror::Error;
 use yrs::updates::decoder::{Decode, Decoder};
 use yrs::updates::encoder::{Encode, Encoder};
-use yrs::{ReadTxn, StateVector, Transact, Update};
+use yrs::{Origin, ReadTxn, StateVector, Transact, Update};
+
+/// Prefix of a transaction origin that carries an [Actor].
+const ACTOR_ORIGIN_PREFIX: &[u8] = b"actor:";
+
+/// Encodes `actor` as a transaction origin: `b"actor:"` followed by the actor as JSON.
+///
+/// Every update the server applies on behalf of an attributed writer runs in a transaction with
+/// this origin, so any observer of the doc can recover the actor with [actor_from_origin].
+pub fn actor_origin(actor: &Actor) -> Origin {
+    let mut bytes = ACTOR_ORIGIN_PREFIX.to_vec();
+    serde_json::to_writer(&mut bytes, actor).expect("Serializing an actor to JSON cannot fail.");
+    Origin::from(bytes.as_slice())
+}
+
+/// Reads the actor back out of a transaction origin. Any other origin, or none, is `None`: the
+/// transaction is unattributed.
+pub fn actor_from_origin(origin: Option<&Origin>) -> Option<Actor> {
+    let json = origin?.as_ref().strip_prefix(ACTOR_ORIGIN_PREFIX)?;
+    serde_json::from_slice(json).ok()
+}
 
 /*
  Core Yjs defines two message types:
@@ -74,7 +95,22 @@ pub trait Protocol {
         awareness: &mut Awareness,
         update: Update,
     ) -> Result<Option<Message>, Error> {
-        let mut txn = awareness.doc().transact_mut();
+        self.handle_sync_step2_with(awareness, update, None)
+    }
+
+    /// Like [Protocol::handle_sync_step2], but applies the update in a transaction tagged with
+    /// `origin` when one is given, so that update observers can tell who wrote it.
+    fn handle_sync_step2_with(
+        &self,
+        awareness: &mut Awareness,
+        update: Update,
+        origin: Option<Origin>,
+    ) -> Result<Option<Message>, Error> {
+        let doc = awareness.doc();
+        let mut txn = match origin {
+            Some(origin) => doc.transact_mut_with(origin),
+            None => doc.transact_mut(),
+        };
         txn.apply_update(update);
         Ok(None)
     }
@@ -87,6 +123,17 @@ pub trait Protocol {
         update: Update,
     ) -> Result<Option<Message>, Error> {
         self.handle_sync_step2(awareness, update)
+    }
+
+    /// Like [Protocol::handle_update], but applies the update in a transaction tagged with
+    /// `origin` when one is given.
+    fn handle_update_with(
+        &self,
+        awareness: &mut Awareness,
+        update: Update,
+        origin: Option<Origin>,
+    ) -> Result<Option<Message>, Error> {
+        self.handle_sync_step2_with(awareness, update, origin)
     }
 
     /// Handle authorization message. By default, if reason for auth denial has been provided,

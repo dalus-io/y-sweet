@@ -142,7 +142,7 @@ async fn update_doc(mut req: Request, ctx: RouteContext<&mut YServe>) -> Result<
         .await
         .map_err(|_| "Couldn't get doc.")?;
     let bytes = req.bytes().await.map_err(|_| "Couldn't get bytes.")?;
-    doc.apply_update(&bytes)
+    doc.apply_update(&bytes, None)
         .map_err(|_| "Couldn't apply update.")?;
     Response::ok("ok")
 }
@@ -177,7 +177,7 @@ async fn websocket_connect(req: Request, ctx: RouteContext<&mut YServe>) -> Resu
 
     let connection = {
         let server = server.clone();
-        DocConnection::new(awareness, Authorization::Full, move |bytes| {
+        DocConnection::new(awareness, Authorization::Full, None, move |bytes| {
             let uint8_array = Uint8Array::from(bytes);
             let result = server
                 .as_ref()

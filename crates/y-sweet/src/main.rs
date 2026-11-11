@@ -15,6 +15,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use url::Url;
 use y_sweet::cli::{print_auth_message, print_server_url};
 use y_sweet::stores::filesystem::FileSystemStore;
+use y_sweet::update_webhook::UpdateWebhookConfig;
 use y_sweet_core::{
     auth::Authenticator,
     store::{
@@ -33,6 +34,7 @@ struct Opts {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // Parsed once at startup; boxing the options buys nothing.
 enum ServSubcommand {
     Serve {
         #[clap(env = "Y_SWEET_STORE")]
@@ -59,6 +61,39 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "false", env = "Y_SWEET_SKIP_GC")]
         skip_gc: bool,
+
+        /// Mint doc tokens that carry the `userId` and `writer` of the auth request, so that
+        /// updates can be attributed. Only turn this on once every server that verifies the
+        /// tokens runs a version that understands them. Accepts `true` or `false`.
+        #[clap(
+            long,
+            env = "Y_SWEET_ATTRIBUTED_TOKENS",
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_value = "false",
+            default_missing_value = "true",
+            value_parser = parse_switch,
+        )]
+        attributed_tokens: bool,
+
+        /// URL that receives attributed doc updates. Unset (or empty) disables the webhook.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_URL")]
+        update_webhook_url: Option<String>,
+
+        /// Secret the update webhook requests are signed with. Required with the URL.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_SECRET", hide_env_values = true)]
+        update_webhook_secret: Option<String>,
+
+        /// How long updates to one doc are collected into a batch, in milliseconds.
+        /// Defaults to 1000.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_BATCH_MS")]
+        update_webhook_batch_ms: Option<String>,
+
+        /// Upper bound, in bytes, on the updates held in memory awaiting delivery.
+        /// Defaults to 268435456.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES")]
+        update_webhook_max_bytes: Option<String>,
     },
 
     GenAuth {
@@ -142,6 +177,70 @@ fn parse_s3_config_from_env_and_args(
     })
 }
 
+/// Parses an on/off switch. An empty value is off, so that an environment that passes the
+/// variable through unset (`VAR=`) behaves like one that does not pass it at all.
+fn parse_switch(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "false" | "0" | "no" | "off" => Ok(false),
+        "true" | "1" | "yes" | "on" => Ok(true),
+        other => Err(format!("expected `true` or `false`, got `{other}`")),
+    }
+}
+
+/// `None` for an option that is unset or set to nothing.
+fn non_empty(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+}
+
+fn parse_number<T: std::str::FromStr>(name: &str, value: &Option<String>) -> Result<Option<T>> {
+    non_empty(value)
+        .map(|v| {
+            v.parse::<T>()
+                .map_err(|_| anyhow::anyhow!("{name} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+/// Builds the update webhook configuration from the `serve` options. `Ok(None)` means the
+/// webhook is not configured.
+fn update_webhook_config_from_opts(
+    url: &Option<String>,
+    secret: &Option<String>,
+    batch_ms: &Option<String>,
+    max_bytes: &Option<String>,
+) -> Result<Option<UpdateWebhookConfig>> {
+    let Some(url) = non_empty(url) else {
+        if non_empty(secret).is_some() {
+            tracing::warn!(
+                "Y_SWEET_UPDATE_WEBHOOK_SECRET is set but Y_SWEET_UPDATE_WEBHOOK_URL is not; the update webhook stays disabled."
+            );
+        }
+        return Ok(None);
+    };
+
+    // Errors never echo the URL: it may carry credentials.
+    let url = Url::parse(url).map_err(|e| anyhow::anyhow!("Invalid update webhook URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        anyhow::bail!("The update webhook URL must be an http or https URL");
+    }
+    // Whitespace decides only whether a secret was given. The key is the value exactly as
+    // configured: trimming it would make the server sign with a different key than the receiver.
+    let Some(secret) = secret.as_deref().filter(|s| !s.trim().is_empty()) else {
+        anyhow::bail!(
+            "Y_SWEET_UPDATE_WEBHOOK_SECRET is required when Y_SWEET_UPDATE_WEBHOOK_URL is set"
+        );
+    };
+
+    let mut config = UpdateWebhookConfig::new(url, secret.to_string());
+    if let Some(batch_ms) = parse_number::<u64>("Y_SWEET_UPDATE_WEBHOOK_BATCH_MS", batch_ms)? {
+        config.batch_window = std::time::Duration::from_millis(batch_ms.max(1));
+    }
+    if let Some(max_bytes) = parse_number::<usize>("Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES", max_bytes)? {
+        config.max_held_bytes = max_bytes;
+    }
+    Ok(Some(config))
+}
+
 fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
     if store_path.starts_with("s3://") {
         let url = url::Url::parse(store_path)?;
@@ -182,13 +281,26 @@ async fn main() -> Result<()> {
             prod,
             max_body_size,
             skip_gc,
+            attributed_tokens,
+            update_webhook_url,
+            update_webhook_secret,
+            update_webhook_batch_ms,
+            update_webhook_max_bytes,
         } => {
+            let update_webhook = update_webhook_config_from_opts(
+                update_webhook_url,
+                update_webhook_secret,
+                update_webhook_batch_ms,
+                update_webhook_max_bytes,
+            )?;
+
             let auth = if let Some(auth) = auth {
                 Some(Authenticator::new(auth)?)
             } else {
                 tracing::warn!("No auth key set. Only use this for local development!");
                 None
             };
+            let server_has_no_auth = auth.is_none();
 
             let addr = SocketAddr::new(
                 host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
@@ -223,7 +335,35 @@ async fn main() -> Result<()> {
                 *max_body_size,
                 *skip_gc,
             )
-            .await?;
+            .await?
+            .with_attributed_tokens(*attributed_tokens);
+
+            // One line that says what this process will do about attribution. The host only:
+            // the rest of the URL and the secret are never logged.
+            tracing::info!(
+                attributed_tokens = *attributed_tokens,
+                update_webhook_enabled = update_webhook.is_some(),
+                update_webhook_host = update_webhook
+                    .as_ref()
+                    .and_then(|config| config.url.host_str()),
+                update_webhook_batch_ms = update_webhook
+                    .as_ref()
+                    .map(|config| config.batch_window.as_millis() as u64),
+                update_webhook_max_bytes = update_webhook
+                    .as_ref()
+                    .map(|config| config.max_held_bytes as u64),
+                "attributed updates configuration"
+            );
+            if *attributed_tokens && server_has_no_auth {
+                tracing::warn!(
+                    "Attributed tokens are enabled but no auth key is set, so no tokens are minted and every update is unattributed."
+                );
+            }
+
+            let server = match update_webhook {
+                Some(config) => server.with_update_webhook(config)?,
+                None => server,
+            };
 
             let prod = *prod;
             let handle = tokio::spawn(async move {
@@ -372,4 +512,134 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opt(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn switch_parsing() {
+        for on in ["true", "TRUE", "1", "yes", "on", " true "] {
+            assert_eq!(parse_switch(on), Ok(true), "{on}");
+        }
+        for off in ["", "false", "False", "0", "no", "off"] {
+            assert_eq!(parse_switch(off), Ok(false), "{off}");
+        }
+        assert!(parse_switch("maybe").is_err());
+    }
+
+    fn serve_attributed_tokens(args: &[&str]) -> bool {
+        let opts = Opts::try_parse_from([&["y-sweet", "serve"], args].concat()).unwrap();
+        match opts.subcmd {
+            ServSubcommand::Serve {
+                attributed_tokens, ..
+            } => attributed_tokens,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn attributed_tokens_flag() {
+        // The environment variable is not set under `cargo test`, so these see only the flag.
+        assert!(!serve_attributed_tokens(&[]));
+        assert!(serve_attributed_tokens(&["--attributed-tokens"]));
+        assert!(serve_attributed_tokens(&["--attributed-tokens=true"]));
+        assert!(!serve_attributed_tokens(&["--attributed-tokens=false"]));
+        // A bare flag does not swallow the positional store argument.
+        assert!(serve_attributed_tokens(&["--attributed-tokens", "/data"]));
+    }
+
+    #[test]
+    fn webhook_is_off_without_a_url() {
+        assert!(update_webhook_config_from_opts(&None, &None, &None, &None)
+            .unwrap()
+            .is_none());
+        // Variables passed through empty count as unset.
+        assert!(
+            update_webhook_config_from_opts(&opt(""), &opt(""), &opt(""), &opt(""))
+                .unwrap()
+                .is_none()
+        );
+        // A secret alone does not enable anything.
+        assert!(
+            update_webhook_config_from_opts(&None, &opt("secret"), &None, &None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn webhook_defaults_and_overrides() {
+        let url = opt("https://app.example.com/api/internal/y-sweet/updates");
+        let config = update_webhook_config_from_opts(&url, &opt("secret"), &None, &opt(""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.url.host_str(), Some("app.example.com"));
+        assert_eq!(config.secret, "secret");
+        assert_eq!(config.batch_window, std::time::Duration::from_millis(1000));
+        assert_eq!(config.max_held_bytes, 268_435_456);
+
+        let config =
+            update_webhook_config_from_opts(&url, &opt("secret"), &opt("250"), &opt("1048576"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(config.batch_window, std::time::Duration::from_millis(250));
+        assert_eq!(config.max_held_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn webhook_secret_is_used_exactly_as_given() {
+        let url = opt("https://app.example.com/hook");
+        for secret in [" padded ", "trailing-newline\n", "\tin ner "] {
+            let config = update_webhook_config_from_opts(&url, &opt(secret), &None, &None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(config.secret, secret);
+            // And that exact value is the HMAC key.
+            assert_eq!(
+                y_sweet::update_webhook::sign(config.secret.as_bytes(), 1, b"{}"),
+                y_sweet::update_webhook::sign(secret.as_bytes(), 1, b"{}"),
+            );
+            assert_ne!(
+                y_sweet::update_webhook::sign(config.secret.as_bytes(), 1, b"{}"),
+                y_sweet::update_webhook::sign(secret.trim().as_bytes(), 1, b"{}"),
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_misconfiguration_is_an_error() {
+        let url = opt("https://app.example.com/hook");
+        fn error(
+            url: &Option<String>,
+            secret: &Option<String>,
+            batch_ms: &Option<String>,
+            max_bytes: &Option<String>,
+        ) -> String {
+            update_webhook_config_from_opts(url, secret, batch_ms, max_bytes)
+                .err()
+                .expect("expected an error")
+                .to_string()
+        }
+
+        assert!(error(&url, &None, &None, &None).contains("SECRET is required"));
+        assert!(error(&url, &opt(" "), &None, &None).contains("SECRET is required"));
+        assert!(error(&url, &opt("s"), &opt("soon"), &None).contains("BATCH_MS"));
+        assert!(error(&url, &opt("s"), &None, &opt("-1")).contains("MAX_BYTES"));
+        assert!(error(&opt("ftp://example.com/x"), &opt("s"), &None, &None).contains("http"));
+
+        // The message does not repeat the URL, which may carry credentials.
+        let message = error(
+            &opt("https://user:hunter2@exa mple.com"),
+            &opt("s"),
+            &None,
+            &None,
+        );
+        assert!(!message.contains("hunter2"), "{message}");
+    }
 }

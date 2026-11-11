@@ -1,3 +1,4 @@
+use crate::update_webhook::{self, UpdateWebhookConfig};
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -35,12 +36,15 @@ use y_sweet_core::{
         validate_doc_name, AuthDocRequest, Authorization, ClientToken, DocCreationRequest,
         NewDocResponse,
     },
-    auth::{Authenticator, ExpirationTimeEpochMillis, DEFAULT_EXPIRATION_SECONDS},
+    auth::{
+        Actor, Authenticator, DocAccess, ExpirationTimeEpochMillis, DEFAULT_EXPIRATION_SECONDS,
+    },
     doc_connection::DocConnection,
     doc_sync::DocWithSyncKv,
     store::Store,
     sync::awareness::Awareness,
     sync_kv::SyncKv,
+    update_events::UpdateCallback,
 };
 
 const PLANE_VERIFIED_USER_DATA_HEADER: &str = "x-verified-user-data";
@@ -94,6 +98,11 @@ pub struct Server {
     max_body_size: Option<usize>,
     /// Whether to skip garbage collection in Yrs documents.
     skip_gc: bool,
+    /// Whether the mint endpoint binds the requested actor into the tokens it issues.
+    /// Off by default: binaries that predate attributed tokens reject them.
+    attributed_tokens: bool,
+    /// Receives every update applied to a doc when the update webhook is configured.
+    on_update: Option<UpdateCallback>,
 }
 
 impl Server {
@@ -118,7 +127,30 @@ impl Server {
             doc_gc,
             max_body_size,
             skip_gc,
+            attributed_tokens: false,
+            on_update: None,
         })
+    }
+
+    /// Sets whether `POST /doc/:doc_id/auth` mints attributed tokens when the request names a
+    /// `userId` or a `writer`. Verification of attributed tokens is always on.
+    pub fn with_attributed_tokens(mut self, attributed_tokens: bool) -> Self {
+        self.attributed_tokens = attributed_tokens;
+        self
+    }
+
+    /// Delivers every update applied to a doc loaded from now on to the configured webhook.
+    ///
+    /// Spawns the dispatcher, so it must be called from within a Tokio runtime. The dispatcher
+    /// stops when the server's cancellation token is cancelled, and `serve` waits for its final
+    /// flush.
+    pub fn with_update_webhook(mut self, config: UpdateWebhookConfig) -> Result<Self> {
+        let (on_update, dispatcher) =
+            update_webhook::start(config, self.cancellation_token.clone())?;
+        self.doc_worker_tracker
+            .spawn(dispatcher.instrument(span!(Level::INFO, "update_webhook")));
+        self.on_update = Some(on_update);
+        Ok(self)
     }
 
     pub async fn doc_exists(&self, doc_id: &str) -> bool {
@@ -152,6 +184,7 @@ impl Server {
                 send.try_send(()).unwrap();
             },
             self.skip_gc,
+            self.on_update.clone(),
         )
         .await?;
 
@@ -411,18 +444,18 @@ impl Server {
         s.serve_internal(listener, redact_errors, routes).await
     }
 
-    fn verify_doc_token(&self, token: Option<&str>, doc: &str) -> Result<Authorization, AppError> {
+    fn verify_doc_token(&self, token: Option<&str>, doc: &str) -> Result<DocAccess, AppError> {
         if let Some(authenticator) = &self.authenticator {
             if let Some(token) = token {
-                let authorization = authenticator
+                let access = authenticator
                     .verify_doc_token(token, doc, current_time_epoch_millis())
                     .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
-                Ok(authorization)
+                Ok(access)
             } else {
                 Err((StatusCode::UNAUTHORIZED, anyhow!("No token provided.")))?
             }
         } else {
-            Ok(Authorization::Full)
+            Ok(DocAccess::full())
         }
     }
 
@@ -455,7 +488,8 @@ async fn get_doc_as_update(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let update = dwskv.as_update();
-    tracing::debug!("update: {:?}", update);
+    // The size only: doc content is never logged.
+    tracing::debug!(doc_id = %doc_id, bytes = update.len(), "serving doc as update");
     Ok(update.into_response())
 }
 
@@ -493,17 +527,17 @@ async fn update_doc(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let token = get_token_from_header(auth_header);
-    let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-    update_doc_inner(doc_id, server_state, authorization, body).await
+    let access = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    update_doc_inner(doc_id, server_state, access, body).await
 }
 
 async fn update_doc_inner(
     doc_id: String,
     server_state: Arc<Server>,
-    authorization: Authorization,
+    access: DocAccess,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    if !matches!(authorization, Authorization::Full) {
+    if !matches!(access.authorization, Authorization::Full) {
         return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
     }
 
@@ -512,7 +546,7 @@ async fn update_doc_inner(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    if let Err(err) = dwskv.apply_update(&body) {
+    if let Err(err) = dwskv.apply_update(&body, access.actor.as_ref()) {
         tracing::error!(?err, "Failed to apply update");
         return Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, err));
     }
@@ -529,16 +563,22 @@ async fn update_doc_single(
     // the doc server is meant to be run in Plane, so we expect verified plane
     // headers to be used for authorization.
     let authorization = get_authorization_from_plane_header(headers)?;
-    update_doc_inner(doc_id, server_state, authorization, body).await
+    let access = DocAccess {
+        authorization,
+        actor: None,
+    };
+    update_doc_inner(doc_id, server_state, access, body).await
 }
 
 async fn handle_socket_upgrade(
     ws: WebSocketUpgrade,
     Path(doc_id): Path<String>,
-    authorization: Authorization,
+    access: DocAccess,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
-    if !matches!(authorization, Authorization::Full) && !server_state.docs.contains_key(&doc_id) {
+    if !matches!(access.authorization, Authorization::Full)
+        && !server_state.docs.contains_key(&doc_id)
+    {
         return Err(AppError(
             StatusCode::NOT_FOUND,
             anyhow!("Doc {} not found", doc_id),
@@ -553,7 +593,7 @@ async fn handle_socket_upgrade(
     let cancellation_token = server_state.cancellation_token.clone();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, awareness, authorization, cancellation_token)
+        handle_socket(socket, doc_id, awareness, access, cancellation_token)
     }))
 }
 
@@ -566,8 +606,8 @@ async fn handle_socket_upgrade_deprecated(
     tracing::warn!(
         "/doc/ws/:doc_id is deprecated; call /doc/:doc_id/auth instead and use the returned URL."
     );
-    let authorization = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
-    handle_socket_upgrade(ws, Path(doc_id), authorization, State(server_state)).await
+    let access = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
+    handle_socket_upgrade(ws, Path(doc_id), access, State(server_state)).await
 }
 
 async fn handle_socket_upgrade_full_path(
@@ -582,8 +622,8 @@ async fn handle_socket_upgrade_full_path(
             anyhow!("For Yjs compatibility, the doc_id appears twice in the URL. It must be the same in both places, but we got {} and {}.", doc_id, doc_id2),
         ));
     }
-    let authorization = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
-    handle_socket_upgrade(ws, Path(doc_id), authorization, State(server_state)).await
+    let access = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
+    handle_socket_upgrade(ws, Path(doc_id), access, State(server_state)).await
 }
 
 async fn handle_socket_upgrade_single(
@@ -603,15 +643,34 @@ async fn handle_socket_upgrade_single(
     // the doc server is meant to be run in Plane, so we expect verified plane
     // headers to be used for authorization.
     let authorization = get_authorization_from_plane_header(headers)?;
-    handle_socket_upgrade(ws, Path(single_doc_id), authorization, State(server_state)).await
+    let access = DocAccess {
+        authorization,
+        actor: None,
+    };
+    handle_socket_upgrade(ws, Path(single_doc_id), access, State(server_state)).await
 }
 
 async fn handle_socket(
     socket: WebSocket,
+    doc_id: String,
     awareness: Arc<RwLock<Awareness>>,
-    authorization: Authorization,
+    access: DocAccess,
     cancellation_token: CancellationToken,
 ) {
+    let DocAccess {
+        authorization,
+        actor,
+    } = access;
+    if let Some(actor) = &actor {
+        // The writer kind only: user ids are never logged.
+        tracing::debug!(
+            doc_id = %doc_id,
+            writer = actor.writer.as_deref(),
+            has_user_id = actor.user_id.is_some(),
+            "websocket opened with actor"
+        );
+    }
+
     let (mut sink, mut stream) = socket.split();
     let (send, mut recv) = channel(1024);
 
@@ -641,7 +700,7 @@ async fn handle_socket(
         }
     });
 
-    let connection = DocConnection::new(awareness, authorization, move |bytes| {
+    let connection = DocConnection::new(awareness, authorization, actor, move |bytes| {
         if let Err(e) = send.try_send(bytes.to_vec()) {
             tracing::warn!(?e, "Error sending message");
         }
@@ -756,8 +815,13 @@ async fn auth_doc(
     let Json(AuthDocRequest {
         authorization,
         valid_for_seconds,
-        ..
+        user_id,
+        writer,
     }) = body.unwrap_or_default();
+
+    // Oversize values are rejected whether or not attributed tokens are being minted, so that
+    // turning the switch on cannot start failing requests that used to succeed.
+    let actor = Actor::from_request(user_id, writer).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     if !server_state.doc_exists(&doc_id).await {
         Err((StatusCode::NOT_FOUND, anyhow!("Doc {} not found", doc_id)))?;
@@ -767,8 +831,22 @@ async fn auth_doc(
     let expiration_time =
         ExpirationTimeEpochMillis(current_time_epoch_millis() + valid_for_seconds * 1000);
 
+    let actor_requested = actor.is_some();
+    let requested_writer = actor.as_ref().and_then(|actor| actor.writer.clone());
+    // Without the switch the actor is dropped and the token is the plain doc token every
+    // earlier binary understands.
+    let actor = actor.filter(|_| server_state.attributed_tokens);
+
     let token = if let Some(auth) = &server_state.authenticator {
-        let token = auth.gen_doc_token(&doc_id, authorization, expiration_time);
+        // The writer kind only: user ids and tokens are never logged.
+        tracing::info!(
+            doc_id = %doc_id,
+            attributed = actor.is_some(),
+            actor_requested,
+            writer = requested_writer.as_deref(),
+            "minted doc token"
+        );
+        let token = auth.gen_doc_token_with_actor(&doc_id, authorization, expiration_time, actor);
         Some(token)
     } else {
         None
@@ -862,6 +940,7 @@ mod test {
             Some(Json(AuthDocRequest {
                 authorization: Authorization::Full,
                 user_id: None,
+                writer: None,
                 valid_for_seconds: None,
             })),
         )
@@ -908,5 +987,237 @@ mod test {
         assert_eq!(token.url, expected_url);
         assert_eq!(token.doc_id, doc_id);
         assert!(token.token.is_none());
+    }
+
+    const DOC_ID: &str = "doc123";
+
+    fn localhost() -> TypedHeader<headers::Host> {
+        TypedHeader(headers::Host::from(http::uri::Authority::from_static(
+            "localhost",
+        )))
+    }
+
+    fn bearer(
+        token: &str,
+    ) -> Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>> {
+        Some(TypedHeader(headers::Authorization::bearer(token).unwrap()))
+    }
+
+    /// A server with auth and one doc, plus a second authenticator over the same key to mint
+    /// server tokens and verify what the server mints.
+    async fn server_with_auth(attributed_tokens: bool) -> (Server, Authenticator) {
+        let authenticator = Authenticator::gen_key().unwrap();
+        let verifier = Authenticator::new(&authenticator.private_key()).unwrap();
+        let server = Server::new(
+            None,
+            Duration::from_secs(60),
+            Some(authenticator),
+            None,
+            CancellationToken::new(),
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .with_attributed_tokens(attributed_tokens);
+        server.load_doc(DOC_ID).await.unwrap();
+        (server, verifier)
+    }
+
+    async fn mint(
+        server: &Arc<Server>,
+        verifier: &Authenticator,
+        request: Option<AuthDocRequest>,
+    ) -> Result<DocAccess, StatusCode> {
+        let response = auth_doc(
+            bearer(&verifier.server_token()),
+            localhost(),
+            State(server.clone()),
+            Path(DOC_ID.to_string()),
+            request.map(Json),
+        )
+        .await;
+        match response {
+            Ok(Json(client_token)) => Ok(verifier
+                .verify_doc_token(
+                    &client_token.token.expect("a token"),
+                    DOC_ID,
+                    current_time_epoch_millis(),
+                )
+                .unwrap()),
+            Err(AppError(status, _)) => Err(status),
+        }
+    }
+
+    fn request(user_id: Option<&str>, writer: Option<&str>) -> Option<AuthDocRequest> {
+        Some(AuthDocRequest {
+            authorization: Authorization::Full,
+            user_id: user_id.map(str::to_string),
+            writer: writer.map(str::to_string),
+            valid_for_seconds: None,
+        })
+    }
+
+    #[test]
+    fn auth_request_accepts_user_id_and_writer() {
+        let request: AuthDocRequest =
+            serde_json::from_str(r#"{"userId": "user-1", "writer": "ui"}"#).unwrap();
+        assert_eq!(request.user_id.as_deref(), Some("user-1"));
+        assert_eq!(request.writer.as_deref(), Some("ui"));
+
+        // What every existing client sends still parses.
+        let request: AuthDocRequest = serde_json::from_str(r#"{"userId": "user-1"}"#).unwrap();
+        assert_eq!(request.writer, None);
+        let request: AuthDocRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!((request.user_id, request.writer), (None, None));
+    }
+
+    #[tokio::test]
+    async fn mint_with_switch_off_ignores_the_actor() {
+        let (server, verifier) = server_with_auth(false).await;
+        let server = Arc::new(server);
+
+        let access = mint(&server, &verifier, request(Some("user-1"), Some("ui")))
+            .await
+            .unwrap();
+        assert_eq!(access, DocAccess::full());
+    }
+
+    #[tokio::test]
+    async fn mint_with_switch_on_binds_the_actor() {
+        let (server, verifier) = server_with_auth(true).await;
+        let server = Arc::new(server);
+
+        let access = mint(&server, &verifier, request(Some("user-1"), Some("ui")))
+            .await
+            .unwrap();
+        assert_eq!(
+            access.actor,
+            Some(Actor {
+                user_id: Some("user-1".to_string()),
+                writer: Some("ui".to_string()),
+            })
+        );
+
+        // Either field alone is enough.
+        let access = mint(&server, &verifier, request(None, Some("agent")))
+            .await
+            .unwrap();
+        assert_eq!(
+            access.actor,
+            Some(Actor {
+                user_id: None,
+                writer: Some("agent".to_string()),
+            })
+        );
+
+        // A request that names no one still gets the plain doc token.
+        let access = mint(&server, &verifier, request(None, None)).await.unwrap();
+        assert_eq!(access, DocAccess::full());
+        let access = mint(&server, &verifier, None).await.unwrap();
+        assert_eq!(access, DocAccess::full());
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_oversize_actor_fields_whatever_the_switch() {
+        let max_user_id = "u".repeat(128);
+        let max_writer = "w".repeat(64);
+
+        for attributed_tokens in [false, true] {
+            let (server, verifier) = server_with_auth(attributed_tokens).await;
+            let server = Arc::new(server);
+
+            assert!(mint(
+                &server,
+                &verifier,
+                request(Some(&max_user_id), Some(&max_writer))
+            )
+            .await
+            .is_ok());
+            assert_eq!(
+                mint(
+                    &server,
+                    &verifier,
+                    request(Some(&format!("{max_user_id}u")), None)
+                )
+                .await,
+                Err(StatusCode::BAD_REQUEST)
+            );
+            assert_eq!(
+                mint(
+                    &server,
+                    &verifier,
+                    request(None, Some(&format!("{max_writer}w")))
+                )
+                .await,
+                Err(StatusCode::BAD_REQUEST)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_update_is_attributed_to_the_bearer_token() {
+        use std::sync::Mutex;
+        use y_sweet_core::update_events::AttributedUpdate;
+        use yrs::{Doc, Text, Transact};
+
+        let (mut server, verifier) = server_with_auth(true).await;
+        let events: Arc<Mutex<Vec<AttributedUpdate>>> = Arc::default();
+        server.on_update = Some({
+            let events = events.clone();
+            Arc::new(move |event| events.lock().unwrap().push(event))
+        });
+        // Docs pick the observer up when they are loaded.
+        server.docs.remove(DOC_ID);
+        server.load_doc(DOC_ID).await.unwrap();
+        let server = Arc::new(server);
+
+        let client = Doc::with_client_id(1);
+        let text = client.get_or_insert_text("t");
+        let edit = |chunk: &str| {
+            let mut txn = client.transact_mut();
+            text.push(&mut txn, chunk);
+            Bytes::from(txn.encode_update_v1())
+        };
+
+        let alice = Actor {
+            user_id: Some("alice".to_string()),
+            writer: Some("server-fallback".to_string()),
+        };
+        let expiration = ExpirationTimeEpochMillis(current_time_epoch_millis() + 60_000);
+        let attributed_token = verifier.gen_doc_token_with_actor(
+            DOC_ID,
+            Authorization::Full,
+            expiration,
+            Some(alice.clone()),
+        );
+        let plain_token = verifier.gen_doc_token(DOC_ID, Authorization::Full, expiration);
+
+        for token in [attributed_token, plain_token, verifier.server_token()] {
+            update_doc(
+                Path(DOC_ID.to_string()),
+                State(server.clone()),
+                bearer(&token),
+                edit("x"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let actors: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| (event.doc_id.clone(), event.actor.clone()))
+            .collect();
+        assert_eq!(
+            actors,
+            vec![
+                (DOC_ID.to_string(), Some(alice)),
+                (DOC_ID.to_string(), None),
+                (DOC_ID.to_string(), None),
+            ]
+        );
     }
 }
