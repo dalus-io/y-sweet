@@ -357,93 +357,109 @@ async fn main() -> Result<()> {
             update_webhook_concurrency,
             update_webhook_ca_file,
         } => {
-            // Before anything else, so a stop request during startup is not lost either.
-            let shutdown = shutdown_signal();
+            // Before anything else, so a stop request during startup is not lost either. Once
+            // installed, the handlers replace the default "terminate the process", so the
+            // startup below races them: a signal while the store is initialising (an S3 endpoint
+            // that never answers, say) abandons startup instead of being held until it is done.
+            let mut shutdown = Box::pin(shutdown_signal());
 
-            let update_webhook = update_webhook_config_from_opts(
-                update_webhook_url,
-                update_webhook_secret,
-                update_webhook_batch_ms,
-                update_webhook_max_bytes,
-                update_webhook_concurrency,
-                update_webhook_ca_file,
-            )?;
+            let startup = async {
+                let update_webhook = update_webhook_config_from_opts(
+                    update_webhook_url,
+                    update_webhook_secret,
+                    update_webhook_batch_ms,
+                    update_webhook_max_bytes,
+                    update_webhook_concurrency,
+                    update_webhook_ca_file,
+                )?;
 
-            let auth = if let Some(auth) = auth {
-                Some(Authenticator::new(auth)?)
-            } else {
-                tracing::warn!("No auth key set. Only use this for local development!");
-                None
-            };
-            let server_has_no_auth = auth.is_none();
+                let auth = if let Some(auth) = auth {
+                    Some(Authenticator::new(auth)?)
+                } else {
+                    tracing::warn!("No auth key set. Only use this for local development!");
+                    None
+                };
+                let server_has_no_auth = auth.is_none();
 
-            let addr = SocketAddr::new(
-                host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-                *port,
-            );
+                let addr = SocketAddr::new(
+                    host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                    *port,
+                );
 
-            let listener = TcpListener::bind(addr).await?;
-            let addr = listener.local_addr()?;
+                let listener = TcpListener::bind(addr).await?;
+                let addr = listener.local_addr()?;
 
-            let store = if let Some(store) = store {
-                let store = get_store_from_opts(store)?;
-                store.init().await?;
-                Some(store)
-            } else {
-                tracing::warn!("No store set. Documents will be stored in memory only.");
-                None
-            };
+                let store = if let Some(store) = store {
+                    let store = get_store_from_opts(store)?;
+                    store.init().await?;
+                    Some(store)
+                } else {
+                    tracing::warn!("No store set. Documents will be stored in memory only.");
+                    None
+                };
 
-            if !prod {
-                print_server_url(auth.as_ref(), url_prefix.as_ref(), addr);
-            }
+                if !prod {
+                    print_server_url(auth.as_ref(), url_prefix.as_ref(), addr);
+                }
 
-            let token = CancellationToken::new();
+                let token = CancellationToken::new();
 
-            let server = y_sweet::server::Server::new(
-                store,
-                std::time::Duration::from_secs(*checkpoint_freq_seconds),
-                auth,
-                url_prefix.clone(),
-                token.clone(),
-                true,
-                *max_body_size,
-                *skip_gc,
-            )
-            .await?
-            .with_attributed_tokens(*attributed_tokens);
+                let server = y_sweet::server::Server::new(
+                    store,
+                    std::time::Duration::from_secs(*checkpoint_freq_seconds),
+                    auth,
+                    url_prefix.clone(),
+                    token.clone(),
+                    true,
+                    *max_body_size,
+                    *skip_gc,
+                )
+                .await?
+                .with_attributed_tokens(*attributed_tokens);
 
-            // One line that says what this process will do about attribution. The host only:
-            // the rest of the URL and the secret are never logged.
-            tracing::info!(
-                attributed_tokens = *attributed_tokens,
-                update_webhook_enabled = update_webhook.is_some(),
-                update_webhook_host = update_webhook
-                    .as_ref()
-                    .and_then(|config| config.url.host_str()),
-                update_webhook_batch_ms = update_webhook
-                    .as_ref()
-                    .map(|config| config.batch_window.as_millis() as u64),
-                update_webhook_max_bytes = update_webhook
-                    .as_ref()
-                    .map(|config| config.max_held_bytes as u64),
-                update_webhook_concurrency = update_webhook
-                    .as_ref()
-                    .map(|config| config.max_concurrent_deliveries as u64),
-                update_webhook_ca_file = update_webhook
-                    .as_ref()
-                    .map(|config| config.ca_file.is_some()),
-                "attributed updates configuration"
-            );
-            if *attributed_tokens && server_has_no_auth {
-                tracing::warn!(
+                // One line that says what this process will do about attribution. The host only:
+                // the rest of the URL and the secret are never logged.
+                tracing::info!(
+                    attributed_tokens = *attributed_tokens,
+                    update_webhook_enabled = update_webhook.is_some(),
+                    update_webhook_host = update_webhook
+                        .as_ref()
+                        .and_then(|config| config.url.host_str()),
+                    update_webhook_batch_ms = update_webhook
+                        .as_ref()
+                        .map(|config| config.batch_window.as_millis() as u64),
+                    update_webhook_max_bytes = update_webhook
+                        .as_ref()
+                        .map(|config| config.max_held_bytes as u64),
+                    update_webhook_concurrency = update_webhook
+                        .as_ref()
+                        .map(|config| config.max_concurrent_deliveries as u64),
+                    update_webhook_ca_file = update_webhook
+                        .as_ref()
+                        .map(|config| config.ca_file.is_some()),
+                    "attributed updates configuration"
+                );
+                if *attributed_tokens && server_has_no_auth {
+                    tracing::warn!(
                     "Attributed tokens are enabled but no auth key is set, so no tokens are minted and every update is unattributed."
                 );
-            }
+                }
 
-            let server = match update_webhook {
-                Some(config) => server.with_update_webhook(config)?,
-                None => server,
+                let server = match update_webhook {
+                    Some(config) => server.with_update_webhook(config)?,
+                    None => server,
+                };
+                Ok::<_, anyhow::Error>((server, listener, addr, token))
+            };
+
+            let (server, listener, addr, token) = tokio::select! {
+                started = startup => started?,
+                signal = &mut shutdown => {
+                    // Nothing is serving yet: no doc is loaded and no update was accepted, so
+                    // there is nothing to persist or flush.
+                    tracing::info!(signal, "Received {signal} during startup, exiting.");
+                    return Ok(());
+                }
             };
 
             let prod = *prod;

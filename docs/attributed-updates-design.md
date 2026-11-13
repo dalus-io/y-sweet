@@ -273,7 +273,9 @@ Concurrency across docs is capped: at most 16 requests (`Y_SWEET_UPDATE_WEBHOOK_
 once, through a semaphore taken per attempt. Without it, a receiver coming back from an outage would get one
 POST per backlogged doc at the same moment, each up to 12 MiB. The permit is held for the request only, not
 during a retry delay, so docs that are backing off do not starve the rest; a batch waiting for a permit
-still counts as its doc's in-flight batch, so per-doc ordering is unchanged. The shutdown flush uses the
+still counts as its doc's in-flight batch, so per-doc ordering is unchanged, and the wait for a permit is
+bounded by the batch's remaining retry age (a batch that cannot get one in time is dropped like one that
+kept failing). The shutdown flush uses the
 same cap.
 
 ### 4.6 Shutdown
@@ -283,7 +285,8 @@ Doc persistence to S3 is not delayed by this.
 
 `serve` cancels on `SIGINT` and on `SIGTERM`; the latter is what `docker stop` and an ECS stop or scale-in
 send, so without it the flush (and the existing persist-on-shutdown) would never run in production. The
-handlers are installed before the server starts listening.
+handlers are installed before startup and startup races them, so a signal during a hung store init exits
+cleanly instead of being held until init returns.
 
 ### 4.7 Configuration
 

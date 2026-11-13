@@ -202,7 +202,8 @@ send, and without a cap they would all POST at once, each body up to 12 MiB. Wit
 receiver sees at most 16 concurrent requests from one server, so at most about 16 x 12 MiB of
 request bodies in flight; size its body buffering and worker count for that, times the number of
 Y-Sweet servers. A batch waiting for a slot is still in flight as far as its doc is concerned, so
-ordering is unaffected. The slot is held for the request only, not while a batch waits out its
+ordering is unaffected; the wait counts toward its 10 minute retry limit, so a batch that cannot
+get a slot in time is dropped (and its doc gapped) like one that kept failing. The slot is held for the request only, not while a batch waits out its
 retry delay, so docs that are backing off do not hold up the others.
 
 Delivery is at-least-once: a batch whose `2xx` was lost on the way back is sent again. Deduplicate
@@ -284,7 +285,9 @@ default 30 s ECS stop timeout. Whatever does not make it is lost; the receiver l
 through the new `instance_id` after the restart (rule 2 under [Gaps](#gaps)). Saving docs to the
 store is not delayed by this.
 
-A `SIGKILL`, or a stop timeout shorter than the flush, skips all of this.
+A signal that arrives during startup, for example while the store is still being initialised,
+abandons startup and exits at once; nothing has been served yet, so there is nothing to save or
+flush. A `SIGKILL`, or a stop timeout shorter than the flush, skips all of this.
 
 ### Attribution is "who made it visible"
 

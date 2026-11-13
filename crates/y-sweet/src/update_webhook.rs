@@ -834,6 +834,20 @@ fn load_ca_file(path: &std::path::Path) -> anyhow::Result<Vec<reqwest::Certifica
     Ok(certs)
 }
 
+/// How long to wait before retrying a batch that is `age` old. A longer `Retry-After` wins
+/// over the backoff, but nothing waits past the retry age: the batch then gets its last attempt
+/// right at that age. Called only while `age < max_retry_age`.
+fn retry_delay(
+    backoff: Duration,
+    retry_after: Option<Duration>,
+    age: Duration,
+    max_retry_age: Duration,
+) -> Duration {
+    backoff
+        .max(retry_after.unwrap_or_default())
+        .min(max_retry_age.saturating_sub(age))
+}
+
 struct Deliverer {
     client: reqwest::Client,
     config: UpdateWebhookConfig,
@@ -864,14 +878,8 @@ impl Deliverer {
     }
 
     /// One signed POST. The timestamp and signature are computed here, per attempt, so a batch
-    /// that has been retrying for a long time still verifies.
+    /// that has been retrying for a long time still verifies. The caller holds a permit.
     async fn attempt(&self, batch: &PreparedBatch) -> Attempt {
-        // Waits for a free slot first: the timestamp is taken once the request can go out.
-        let _permit = self
-            .permits
-            .acquire()
-            .await
-            .expect("The semaphore is never closed.");
         let timestamp = unix_seconds();
         let signature = sign(self.config.secret.as_bytes(), timestamp, &batch.body);
 
@@ -935,10 +943,24 @@ impl Deliverer {
         let started = Instant::now();
         let mut backoff = self.config.retry_backoff_initial;
         let mut attempt = 0u32;
+        let mut last_status = None;
 
         loop {
+            // Waiting for a slot counts against the retry age like any other time in flight: a
+            // batch that cannot get one in time is dropped, and its doc moves on (gapped),
+            // instead of every later batch of the doc queueing behind it. A free slot is still
+            // taken at zero remaining age, so the last attempt at the limit happens.
+            let remaining = self.config.max_retry_age.saturating_sub(started.elapsed());
+            let Ok(permit) = tokio::time::timeout(remaining, self.permits.acquire()).await else {
+                log_dropped(batch, "retry_age", last_status, attempt, started.elapsed());
+                return false;
+            };
+            let permit = permit.expect("The semaphore is never closed.");
             attempt += 1;
-            match self.attempt(batch).await {
+            let outcome = self.attempt(batch).await;
+            drop(permit);
+
+            match outcome {
                 Attempt::Acked { status } => {
                     log_sent(batch, attempt, status);
                     return true;
@@ -952,16 +974,13 @@ impl Deliverer {
                     error_kind,
                     retry_after,
                 } => {
+                    last_status = status;
                     let age = started.elapsed();
                     if age >= self.config.max_retry_age {
                         log_dropped(batch, "retry_age", status, attempt, age);
                         return false;
                     }
-                    // A longer `Retry-After` wins over the backoff, but nothing waits past the
-                    // retry age: the batch then gets its last attempt right at that age.
-                    let delay = backoff
-                        .max(retry_after.unwrap_or_default())
-                        .min(self.config.max_retry_age - age);
+                    let delay = retry_delay(backoff, retry_after, age, self.config.max_retry_age);
                     tracing::warn!(
                         doc_id = %batch.doc_id,
                         seq_start = batch.seq_start,
@@ -983,8 +1002,14 @@ impl Deliverer {
         }
     }
 
-    /// The shutdown variant: one attempt, no retry.
+    /// The shutdown variant: one attempt, no retry. The wait for a slot is bounded by the
+    /// shutdown budget, which the caller enforces.
     async fn deliver_once(&self, batch: &PreparedBatch) -> bool {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .expect("The semaphore is never closed.");
         match self.attempt(batch).await {
             Attempt::Acked { status } => {
                 log_sent(batch, 1, status);
@@ -2712,11 +2737,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retry_delay_takes_the_longer_wait_but_never_passes_the_retry_age() {
+        let ms = Duration::from_millis;
+        let max = ms(10_000);
+        // The backoff alone.
+        assert_eq!(retry_delay(ms(500), None, ms(0), max), ms(500));
+        // A longer Retry-After wins; a shorter one does not shorten the backoff.
+        assert_eq!(retry_delay(ms(500), Some(ms(3_000)), ms(0), max), ms(3_000));
+        assert_eq!(retry_delay(ms(500), Some(ms(100)), ms(0), max), ms(500));
+        // Either is cut to what is left of the retry age, so the last attempt lands at the
+        // limit.
+        assert_eq!(
+            retry_delay(ms(500), Some(ms(3_600_000)), ms(9_000), max),
+            ms(1_000)
+        );
+        assert_eq!(retry_delay(ms(30_000), None, ms(9_900), max), ms(100));
+    }
+
     #[tokio::test]
     async fn retry_after_is_bounded_by_the_retry_age() {
         let (url, seen) = throttling_receiver(usize::MAX, "3600").await;
+        let max_retry_age = Duration::from_millis(300);
         let deliverer = Deliverer::new(UpdateWebhookConfig {
-            max_retry_age: Duration::from_millis(300),
+            max_retry_age,
             ..dispatcher_config(url)
         })
         .unwrap();
@@ -2725,10 +2769,43 @@ mod tests {
         let started = Instant::now();
         assert!(!deliverer.deliver(&batch).await);
         let took = started.elapsed();
-        // One attempt, one last attempt at the retry age, then dropped; no hour-long wait.
-        assert!(took >= Duration::from_millis(300), "{took:?}");
-        assert!(took < Duration::from_secs(3), "{took:?}");
-        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        // Holds however slow the machine is: if the first round trip ends inside the retry
+        // age, the one retry waits for the limit (not an hour) and is the last; if it ends
+        // after, the batch is dropped then. Either way it is dropped at or after the limit,
+        // after at most two attempts. The exact delay is pinned by
+        // `retry_delay_takes_the_longer_wait_but_never_passes_the_retry_age`.
+        assert!(took >= max_retry_age, "{took:?}");
+        assert!(took < Duration::from_secs(60), "{took:?}");
+        let attempts = seen.lock().unwrap().len();
+        assert!((1..=2).contains(&attempts), "{attempts} attempts");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_slot_counts_against_the_retry_age() {
+        let max_retry_age = Duration::from_secs(600);
+        let deliverer = Deliverer::new(UpdateWebhookConfig {
+            max_concurrent_deliveries: 1,
+            max_retry_age,
+            ..test_config()
+        })
+        .unwrap();
+        let batch = prepare("doc", "instance-1", Batch::default(), true);
+
+        // Every slot is taken (by other docs' requests) and never freed.
+        let _taken = deliverer.permits.acquire().await.unwrap();
+
+        // The batch is not stuck behind them past its retry age: it is dropped at the limit
+        // without sending anything. (The URL is unreachable; an attempt would fail at once and
+        // retry, which the clock below would show.)
+        let started = tokio::time::Instant::now();
+        assert!(!deliverer.deliver(&batch).await);
+        // (The remaining age is measured on the real clock, which moved a little.)
+        let waited = started.elapsed();
+        assert!(
+            waited > max_retry_age - Duration::from_secs(1) && waited <= max_retry_age,
+            "{waited:?}"
+        );
     }
 
     #[test]
