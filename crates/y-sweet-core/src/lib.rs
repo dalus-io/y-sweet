@@ -5,3 +5,5 @@ pub mod doc_sync;
 pub mod store;
 pub mod sync;
 pub mod sync_kv;
+#[cfg(feature = "sync")]
+pub mod update_events;

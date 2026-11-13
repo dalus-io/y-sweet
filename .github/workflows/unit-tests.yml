@@ -12,7 +12,7 @@ env:
 
 jobs:
   unit-test:
-    runs-on: ubuntu-latest-16-cores
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ./crates
@@ -27,5 +27,13 @@ jobs:
           cache-on-failure: "true"
           workspaces: |
             crates
+            crates/y-sweet-worker
       - name: Run unit tests
         run: cargo test --verbose
+      # The worker is excluded from the workspace, so `cargo test` above never compiles it.
+      # It builds y-sweet-core without the `sync` feature, for wasm32 (see its .cargo/config).
+      - name: Check y-sweet-worker
+        working-directory: ./crates/y-sweet-worker
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check

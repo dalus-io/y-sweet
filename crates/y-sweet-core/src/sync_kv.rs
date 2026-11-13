@@ -59,22 +59,48 @@ impl SyncKv {
     }
 
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Only persist if actually dirty
-        if !self.dirty.load(Ordering::SeqCst) {
-            tracing::info!("Not persisting, no changes detected");
-            return Ok(());
+        /// Marks the doc dirty again unless disarmed: a save that fails, or is abandoned
+        /// mid-write (its future dropped, e.g. by a timeout), has not saved anything.
+        struct StillDirty<'a>(&'a AtomicBool, bool);
+        impl Drop for StillDirty<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
         }
 
-        if let Some(store) = &self.store {
-            let snapshot = {
-                let data = self.data.lock().unwrap();
-                bincode::serialize(&*data)?
-            };
+        // The dirty flag is cleared together with taking the snapshot, under the data lock that
+        // every write holds while it marks the doc dirty. A write that lands while the snapshot
+        // is being stored therefore sets the flag again and is saved by the next persist.
+        // (Clearing it after the store write, as before, erased that write's flag: the final
+        // save at shutdown then skipped it.)
+        let snapshot = {
+            let data = self.data.lock().unwrap();
+            if !self.dirty.swap(false, Ordering::SeqCst) {
+                tracing::info!("Not persisting, no changes detected");
+                return Ok(());
+            }
+            match &self.store {
+                Some(_) => match bincode::serialize(&*data) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(err) => {
+                        self.dirty.store(true, Ordering::SeqCst);
+                        return Err(err.into());
+                    }
+                },
+                None => None,
+            }
+        };
 
+        if let (Some(store), Some(snapshot)) = (&self.store, snapshot) {
+            // Not saved until the write returns Ok: stay dirty so the next persist tries
+            // again. No callback: the persistence worker retries on its own schedule.
+            let mut still_dirty = StillDirty(&self.dirty, true);
             tracing::info!(size=?snapshot.len(), "Persisting snapshot");
             store.set(&self.key, snapshot).await?;
+            still_dirty.1 = false;
         }
-        self.dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -101,6 +127,12 @@ impl SyncKv {
 
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Undoes [SyncKv::shutdown]: writes are marked dirty again. For a doc that GC retired but
+    /// could not save, and so keeps.
+    pub fn resume(&self) {
+        self.shutdown.store(false, Ordering::SeqCst);
     }
 
     pub fn shutdown(&self) {
@@ -202,7 +234,7 @@ impl<'a> yrs_kvstore::KVStore<'a> for SyncKv {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use crate::store::Result;
     use async_trait::async_trait;
@@ -211,7 +243,7 @@ mod test {
     use tokio;
 
     #[derive(Default, Clone)]
-    struct MemoryStore {
+    pub(crate) struct MemoryStore {
         data: Arc<DashMap<String, Vec<u8>>>,
     }
 
@@ -331,5 +363,119 @@ mod test {
 
         // Should not persist when not dirty
         assert!(store.data.is_empty());
+    }
+
+    /// A store whose writes wait for the test to release them, and can be made to fail once.
+    #[derive(Clone)]
+    struct HeldStore {
+        inner: MemoryStore,
+        set_entered: Arc<tokio::sync::Notify>,
+        set_release: Arc<tokio::sync::Semaphore>,
+        fail_next_set: Arc<AtomicBool>,
+    }
+
+    impl HeldStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::default(),
+                set_entered: Default::default(),
+                set_release: Arc::new(tokio::sync::Semaphore::new(0)),
+                fail_next_set: Default::default(),
+            }
+        }
+
+        fn stored(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+            let snapshot = self.inner.data.get("foo/data.ysweet").unwrap().clone();
+            bincode::deserialize(&snapshot).unwrap()
+        }
+    }
+
+    #[cfg_attr(not(feature = "single-threaded"), async_trait)]
+    #[cfg_attr(feature = "single-threaded", async_trait(?Send))]
+    impl Store for HeldStore {
+        async fn init(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+        async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
+            self.set_entered.notify_one();
+            self.set_release.acquire().await.unwrap().forget();
+            if self.fail_next_set.swap(false, Ordering::SeqCst) {
+                return Err(crate::store::StoreError::ConnectionError(
+                    "test failure".to_string(),
+                ));
+            }
+            self.inner.set(key, value).await
+        }
+        async fn remove(&self, key: &str) -> Result<()> {
+            self.inner.remove(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_during_a_save_is_saved_by_the_next_persist() {
+        let store = HeldStore::new();
+        let sync_kv = Arc::new(
+            SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+                .await
+                .unwrap(),
+        );
+
+        // A checkpoint snapshots A and is waiting on the store...
+        sync_kv.set(b"a", b"1");
+        let checkpoint = tokio::spawn({
+            let sync_kv = sync_kv.clone();
+            async move { sync_kv.persist().await.map_err(|e| e.to_string()) }
+        });
+        store.set_entered.notified().await;
+
+        // ...when B lands. Then the checkpoint completes.
+        sync_kv.set(b"b", b"2");
+        store.set_release.add_permits(1);
+        checkpoint.await.unwrap().unwrap();
+        assert!(!store.stored().contains_key(b"b".as_slice()));
+
+        // The final save must still see B as unsaved, and save it.
+        store.set_release.add_permits(1);
+        sync_kv.persist().await.unwrap();
+        assert_eq!(store.stored().get(b"b".as_slice()), Some(&b"2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_keeps_the_doc_dirty() {
+        let store = HeldStore::new();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+            .await
+            .unwrap();
+        sync_kv.set(b"a", b"1");
+
+        store.fail_next_set.store(true, Ordering::SeqCst);
+        store.set_release.add_permits(1);
+        assert!(sync_kv.persist().await.is_err());
+        assert!(sync_kv.dirty.load(Ordering::SeqCst));
+
+        store.set_release.add_permits(1);
+        sync_kv.persist().await.unwrap();
+        assert_eq!(store.stored().get(b"a".as_slice()), Some(&b"1".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_save_keeps_the_doc_dirty() {
+        let store = HeldStore::new();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+            .await
+            .unwrap();
+        sync_kv.set(b"a", b"1");
+
+        // The write never returns; the save is given up on.
+        let abandoned =
+            tokio::time::timeout(std::time::Duration::from_millis(50), sync_kv.persist()).await;
+        assert!(abandoned.is_err());
+        assert!(sync_kv.dirty.load(Ordering::SeqCst));
     }
 }

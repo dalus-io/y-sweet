@@ -6,7 +6,7 @@ pub struct NewDocResponse {
     pub doc_id: String,
 }
 
-#[derive(Copy, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Copy, Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub enum Authorization {
     #[serde(rename = "read-only")]
     ReadOnly,
@@ -26,6 +26,10 @@ pub struct AuthDocRequest {
     pub authorization: Authorization,
     #[serde(rename = "userId")]
     pub user_id: Option<String>,
+    /// An opaque label for the kind of writer the token is for (e.g. `"ui"`). The application
+    /// owns the taxonomy; the server only carries it.
+    #[serde(default)]
+    pub writer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "validForSeconds")]
     pub valid_for_seconds: Option<u64>,
 }
@@ -35,6 +39,7 @@ impl Default for AuthDocRequest {
         Self {
             authorization: Authorization::Full,
             user_id: None,
+            writer: None,
             valid_for_seconds: None,
         }
     }
