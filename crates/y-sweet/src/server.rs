@@ -819,9 +819,32 @@ async fn auth_doc(
         writer,
     }) = body.unwrap_or_default();
 
-    // Oversize values are rejected whether or not attributed tokens are being minted, so that
-    // turning the switch on cannot start failing requests that used to succeed.
-    let actor = Actor::from_request(user_id, writer).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let actor_requested = user_id.is_some() || writer.is_some();
+    let (user_id_bytes, writer_bytes) = (
+        user_id.as_ref().map(String::len),
+        writer.as_ref().map(String::len),
+    );
+    let actor = match Actor::from_request(user_id, writer) {
+        Ok(actor) => actor,
+        // With attributed tokens on, an oversize value would end up in the token: refuse it.
+        Err(err) if server_state.attributed_tokens => {
+            return Err(AppError(StatusCode::BAD_REQUEST, err.into()));
+        }
+        // With them off the fields are ignored, as in upstream Y-Sweet, so the request goes
+        // through. Warn, because turning the switch on will start refusing it. Lengths only:
+        // the values are user ids.
+        Err(_) => {
+            tracing::warn!(
+                doc_id = %doc_id,
+                user_id_bytes,
+                writer_bytes,
+                max_user_id_bytes = y_sweet_core::auth::MAX_ACTOR_USER_ID_BYTES,
+                max_writer_bytes = y_sweet_core::auth::MAX_ACTOR_WRITER_BYTES,
+                "auth request actor too long; ignored, would be rejected with attributed tokens on"
+            );
+            None
+        }
+    };
 
     if !server_state.doc_exists(&doc_id).await {
         Err((StatusCode::NOT_FOUND, anyhow!("Doc {} not found", doc_id)))?;
@@ -831,7 +854,6 @@ async fn auth_doc(
     let expiration_time =
         ExpirationTimeEpochMillis(current_time_epoch_millis() + valid_for_seconds * 1000);
 
-    let actor_requested = actor.is_some();
     let requested_writer = actor.as_ref().and_then(|actor| actor.writer.clone());
     // Without the switch the actor is dropped and the token is the plain doc token every
     // earlier binary understands.
@@ -1120,9 +1142,11 @@ mod test {
     }
 
     #[tokio::test]
-    async fn mint_rejects_oversize_actor_fields_whatever_the_switch() {
+    async fn oversize_actor_fields_are_rejected_only_with_the_switch_on() {
         let max_user_id = "u".repeat(128);
         let max_writer = "w".repeat(64);
+        let long_user_id = format!("{max_user_id}u");
+        let long_writer = format!("{max_writer}w");
 
         for attributed_tokens in [false, true] {
             let (server, verifier) = server_with_auth(attributed_tokens).await;
@@ -1135,24 +1159,20 @@ mod test {
             )
             .await
             .is_ok());
-            assert_eq!(
-                mint(
-                    &server,
-                    &verifier,
-                    request(Some(&format!("{max_user_id}u")), None)
-                )
-                .await,
-                Err(StatusCode::BAD_REQUEST)
-            );
-            assert_eq!(
-                mint(
-                    &server,
-                    &verifier,
-                    request(None, Some(&format!("{max_writer}w")))
-                )
-                .await,
-                Err(StatusCode::BAD_REQUEST)
-            );
+
+            for oversize in [
+                request(Some(&long_user_id), None),
+                request(None, Some(&long_writer)),
+                request(Some(&long_user_id), Some(&long_writer)),
+            ] {
+                let minted = mint(&server, &verifier, oversize).await;
+                if attributed_tokens {
+                    assert_eq!(minted, Err(StatusCode::BAD_REQUEST));
+                } else {
+                    // As upstream: the fields are ignored and a plain doc token is minted.
+                    assert_eq!(minted, Ok(DocAccess::full()));
+                }
+            }
         }
     }
 
