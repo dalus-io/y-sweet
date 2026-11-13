@@ -49,10 +49,10 @@ impl DocWithSyncKv {
         let subscription = {
             let sync_kv = sync_kv.clone();
             doc.observe_update_v1(move |_, event| {
+                // Append only. Merging the log into the full state costs time in proportion to
+                // the document size, so it runs before each save (SyncKv::compact) on a
+                // blocking thread instead of here under the document write lock on every edit.
                 sync_kv.push_update(DOC_NAME, &event.update).unwrap();
-                sync_kv
-                    .flush_doc_with(DOC_NAME, Default::default())
-                    .unwrap();
             })
             .map_err(|_| anyhow!("Failed to subscribe to updates"))?
         };
