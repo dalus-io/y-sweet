@@ -59,6 +59,17 @@ impl SyncKv {
     }
 
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
+        /// Marks the doc dirty again unless disarmed: a save that fails, or is abandoned
+        /// mid-write (its future dropped, e.g. by a timeout), has not saved anything.
+        struct StillDirty<'a>(&'a AtomicBool, bool);
+        impl Drop for StillDirty<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
         // The dirty flag is cleared together with taking the snapshot, under the data lock that
         // every write holds while it marks the doc dirty. A write that lands while the snapshot
         // is being stored therefore sets the flag again and is saved by the next persist.
@@ -83,13 +94,12 @@ impl SyncKv {
         };
 
         if let (Some(store), Some(snapshot)) = (&self.store, snapshot) {
+            // Not saved until the write returns Ok: stay dirty so the next persist tries
+            // again. No callback: the persistence worker retries on its own schedule.
+            let mut still_dirty = StillDirty(&self.dirty, true);
             tracing::info!(size=?snapshot.len(), "Persisting snapshot");
-            if let Err(err) = store.set(&self.key, snapshot).await {
-                // Not saved: stay dirty so the next persist tries again. No callback: the
-                // persistence worker retries on its own schedule.
-                self.dirty.store(true, Ordering::SeqCst);
-                return Err(err.into());
-            }
+            store.set(&self.key, snapshot).await?;
+            still_dirty.1 = false;
         }
         Ok(())
     }
@@ -117,6 +127,12 @@ impl SyncKv {
 
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Undoes [SyncKv::shutdown]: writes are marked dirty again. For a doc that GC retired but
+    /// could not save, and so keeps.
+    pub fn resume(&self) {
+        self.shutdown.store(false, Ordering::SeqCst);
     }
 
     pub fn shutdown(&self) {
@@ -446,5 +462,20 @@ pub(crate) mod test {
         store.set_release.add_permits(1);
         sync_kv.persist().await.unwrap();
         assert_eq!(store.stored().get(b"a".as_slice()), Some(&b"1".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_save_keeps_the_doc_dirty() {
+        let store = HeldStore::new();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+            .await
+            .unwrap();
+        sync_kv.set(b"a", b"1");
+
+        // The write never returns; the save is given up on.
+        let abandoned =
+            tokio::time::timeout(std::time::Duration::from_millis(50), sync_kv.persist()).await;
+        assert!(abandoned.is_err());
+        assert!(sync_kv.dirty.load(Ordering::SeqCst));
     }
 }

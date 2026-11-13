@@ -325,9 +325,21 @@ being applied at that moment was acknowledged and never saved. Now:
 - A writer (HTTP update or websocket upgrade) takes the doc with `Server::live_doc`: it holds the awareness
   and checks, under the doc lock, that the doc is not retired. From then on GC cannot retire it, and the
   write is applied to that doc without any lookup or load under write admission.
-- A retired doc's persistence worker saves at once and exits; GC removes the doc from the map only after
-  that save. A writer that finds a retired doc waits for the removal and loads it afresh, so the reload reads
-  what was saved.
+- GC saves the retired doc itself, within 10 s, under a per-doc lock it shares with the persistence worker
+  (so it cannot see "nothing to save" while the worker's save of the same changes is still being written).
+  Only if that save succeeds does it drop the doc and stop the doc's persistence worker. If the save fails
+  or times out, GC un-retires the doc (`SyncKv::resume`): it stays loaded and writable, its worker keeps
+  retrying, and GC tries again later. A save that fails or is abandoned mid-write leaves the doc dirty.
+- A writer that finds a retired doc waits for it to be dropped (then loads it afresh, reading what was
+  saved) or un-retired, for at most 15 s, and gets `503` after that or once shutdown starts.
+- Loads of one doc are serialized by a per-doc lock, and a load never replaces a doc already in the map.
+  Upstream let two concurrent first requests both load the doc, the second replacing the first and dropping
+  its persistence subscription while the first request's writer held it.
+
+The S3 client still has no request timeout of its own (the store module is also built for wasm, where
+reqwest has no timeout setting, so it is not a one-line change). Every wait on the store that this design
+depends on is bounded instead: the GC save (10 s), a writer's wait for a retired doc (15 s) and the shutdown
+stages.
 
 ### 4.7 Configuration
 

@@ -81,6 +81,26 @@ impl Default for ShutdownBudgets {
     }
 }
 
+/// Time limits on doc garbage collection.
+#[derive(Clone, Copy, Debug)]
+pub struct GcTimeouts {
+    /// How long GC's save of a doc it is retiring may take. If it fails or runs out, the doc is
+    /// not dropped: GC un-retires it and tries again later.
+    pub retire_save: Duration,
+    /// How long a writer waits for a retired doc to be dropped (or un-retired) before it gives
+    /// up with `503`. Longer than `retire_save`, so a normal retirement never trips it.
+    pub retired_doc_wait: Duration,
+}
+
+impl Default for GcTimeouts {
+    fn default() -> Self {
+        Self {
+            retire_save: Duration::from_secs(10),
+            retired_doc_wait: Duration::from_secs(15),
+        }
+    }
+}
+
 /// Admission for writes to docs, closed once at shutdown before the final saves.
 ///
 /// Closing has two parts. [WriteGate::close] stops admitting at once: every write that has not
@@ -191,6 +211,9 @@ pub struct Server {
     webhook_tracker: TaskTracker,
     webhook_token: CancellationToken,
     shutdown_budgets: ShutdownBudgets,
+    gc_timeouts: GcTimeouts,
+    /// One lock per doc being loaded, so that concurrent requests load it once.
+    loading: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl Server {
@@ -223,6 +246,8 @@ impl Server {
             webhook_tracker: TaskTracker::new(),
             webhook_token: CancellationToken::new(),
             shutdown_budgets: ShutdownBudgets::default(),
+            gc_timeouts: GcTimeouts::default(),
+            loading: DashMap::new(),
         })
     }
 
@@ -271,7 +296,27 @@ impl Server {
         Ok(doc_id)
     }
 
+    /// Loads a doc into the map, unless it is there already.
+    ///
+    /// Loads of one doc are serialized: a request that finds a load under way waits for it and
+    /// then uses the doc it loaded. A second load replacing the first would drop the first
+    /// doc's persistence subscription while writers still hold it, losing their writes.
     pub async fn load_doc(&self, doc_id: &str) -> Result<()> {
+        let lock = self.loading.entry(doc_id.to_string()).or_default().clone();
+        let guard = lock.lock().await;
+        let result = if self.docs.contains_key(doc_id) {
+            Ok(())
+        } else {
+            self.load_doc_unlocked(doc_id).await
+        };
+        drop(guard);
+        // Forget the lock once no one else is waiting on it (the map's reference and ours).
+        self.loading
+            .remove_if(doc_id, |_, lock| Arc::strong_count(lock) <= 2);
+        result
+    }
+
+    async fn load_doc_unlocked(&self, doc_id: &str) -> Result<()> {
         let (send, recv) = channel(1024);
 
         let dwskv = DocWithSyncKv::new(
@@ -293,12 +338,13 @@ impl Server {
             let sync_kv = dwskv.sync_kv();
             let checkpoint_freq = self.checkpoint_freq;
             let doc_id = doc_id.to_string();
-            // Not the server's cancellation token: these stop only once nothing can write.
-            let cancellation_token = self.doc_workers_token.clone();
-
-            // Dropped by the persistence worker when it exits, after its last save; GC waits for
-            // that before removing the doc.
-            let (worker_done_tx, worker_done) = tokio::sync::oneshot::channel::<()>();
+            // Not the server's cancellation token: these stop only once nothing can write (see
+            // `shut_down`). A child token per doc, so GC can also stop them once it dropped the
+            // doc.
+            let cancellation_token = self.doc_workers_token.child_token();
+            // Saves of this doc run one at a time, so GC's save cannot report "nothing to
+            // save" while the worker's save of the same changes is still being written.
+            let persist_lock = Arc::new(tokio::sync::Mutex::new(()));
 
             // Spawn a task to save the document to the store when it changes.
             self.doc_worker_tracker.spawn(
@@ -308,7 +354,7 @@ impl Server {
                     checkpoint_freq,
                     doc_id.clone(),
                     cancellation_token.clone(),
-                    worker_done_tx,
+                    persist_lock.clone(),
                 )
                 .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
             );
@@ -320,14 +366,17 @@ impl Server {
                         doc_id.clone(),
                         checkpoint_freq,
                         cancellation_token,
-                        worker_done,
+                        persist_lock,
+                        self.gc_timeouts.retire_save,
                     )
                     .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
                 );
             }
         }
 
-        self.docs.insert(doc_id.to_string(), dwskv);
+        // Under the load lock the entry is empty here; `or_insert` keeps it that way should any
+        // other path have filled it, rather than replacing a doc writers may hold.
+        self.docs.entry(doc_id.to_string()).or_insert(dwskv);
         Ok(())
     }
 
@@ -335,15 +384,18 @@ impl Server {
         docs: Arc<DashMap<String, DocWithSyncKv>>,
         doc_id: String,
         checkpoint_freq: Duration,
+        // This doc's workers' token: cancelled at shutdown, and by this worker once it has
+        // dropped the doc.
         cancellation_token: CancellationToken,
-        persistence_worker_done: tokio::sync::oneshot::Receiver<()>,
+        persist_lock: Arc<tokio::sync::Mutex<()>>,
+        retire_save_timeout: Duration,
     ) {
         let mut checkpoints_without_refs = 0;
 
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(checkpoint_freq) => {
-                    let retired = {
+                    let (retired, sync_kv) = {
                         let Some(doc) = docs.get(&doc_id) else {
                             break;
                         };
@@ -357,22 +409,46 @@ impl Server {
                         }
                         // Retired only if, under the doc lock, nothing holds it: a writer that
                         // took the doc since the count above keeps it alive.
-                        checkpoints_without_refs >= 2 && doc.retire_if_unused()
+                        (checkpoints_without_refs >= 2 && doc.retire_if_unused(), doc.sync_kv())
                     };
-
-                    if retired {
-                        tracing::info!("GCing doc");
-                        // Retiring woke the persistence worker for its last save. The doc stays
-                        // in the map until that is done: writers wait for a retired doc to go
-                        // (see `live_doc`), so their reload reads what was saved.
-                        let _ = persistence_worker_done.await;
-                        docs.remove_if(&doc_id, |_, doc| doc.sync_kv().is_shutdown());
-                        break;
-                    }
-                    if checkpoints_without_refs >= 2 {
+                    if checkpoints_without_refs >= 2 && !retired {
                         // A writer got in first.
                         checkpoints_without_refs = 0;
                     }
+                    if !retired {
+                        continue;
+                    }
+
+                    // Save before dropping: a writer that finds the doc retired waits for it to
+                    // go (see `live_doc`), and its reload must read everything. Bounded, so a
+                    // hung store cannot keep writers waiting.
+                    let saved = tokio::time::timeout(retire_save_timeout, async {
+                        let _saving = persist_lock.lock().await;
+                        sync_kv.persist().await.map_err(|e| e.to_string())
+                    })
+                    .await;
+                    match saved {
+                        Ok(Ok(())) => {
+                            tracing::info!("GCing doc");
+                            docs.remove_if(&doc_id, |_, doc| doc.sync_kv().is_shutdown());
+                            // The doc is gone: its persistence worker has nothing left to do.
+                            cancellation_token.cancel();
+                            break;
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "could not save the doc being collected; keeping it loaded");
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = retire_save_timeout.as_millis() as u64,
+                                "saving the doc being collected timed out; keeping it loaded"
+                            );
+                        }
+                    }
+                    // Not saved: the only copy of its latest state is this one. Keep it, writable,
+                    // with its persistence worker, which retries the save; try again later.
+                    sync_kv.resume();
+                    checkpoints_without_refs = 0;
                 }
                 _ = cancellation_token.cancelled() => {
                     break;
@@ -387,20 +463,19 @@ impl Server {
         sync_kv: Arc<SyncKv>,
         checkpoint_freq: Duration,
         doc_id: String,
+        // Cancelled at shutdown, or by GC once it dropped the doc. Retirement alone does not
+        // stop this worker: GC un-retires a doc it could not save, and this worker then keeps
+        // retrying the save.
         cancellation_token: CancellationToken,
-        // Dropped when this returns, which tells GC the last save is done.
-        _done: tokio::sync::oneshot::Sender<()>,
+        persist_lock: Arc<tokio::sync::Mutex<()>>,
     ) {
         let mut last_save = std::time::Instant::now();
 
         loop {
             let is_done = tokio::select! {
-                // A retired doc (GC) saves at once and stops, without the usual throttling.
-                v = recv.recv() => v.is_none() || sync_kv.is_shutdown(),
+                v = recv.recv() => v.is_none(),
                 _ = cancellation_token.cancelled() => true,
-                _ = tokio::time::sleep(checkpoint_freq) => {
-                    sync_kv.is_shutdown()
-                }
+                _ = tokio::time::sleep(checkpoint_freq) => false,
             };
 
             tracing::info!("Received signal. done: {}", is_done);
@@ -431,7 +506,10 @@ impl Server {
                 }
             }
             tracing::info!("Persisting.");
-            if let Err(e) = sync_kv.persist().await {
+            let saving = persist_lock.lock().await;
+            let result = sync_kv.persist().await;
+            drop(saving);
+            if let Err(e) = result {
                 tracing::error!(?e, "Error persisting.");
             } else {
                 tracing::info!("Done persisting.");
@@ -448,19 +526,41 @@ impl Server {
     /// The awareness and store of a doc that GC has not retired, loading the doc if needed.
     ///
     /// Holding the returned awareness keeps GC from retiring the doc, so writes made through it
-    /// are saved. A doc that GC has retired but not yet removed (it is still making its last
-    /// save) is waited out, so that the reload reads what was saved.
-    pub async fn live_doc(&self, doc_id: &str) -> Result<(Arc<RwLock<Awareness>>, Arc<SyncKv>)> {
+    /// are saved. A doc that GC has retired but not yet dropped (it is still being saved) is
+    /// waited out, so that a reload reads what was saved; if that takes longer than
+    /// [GcTimeouts::retired_doc_wait], or the server is shutting down, the answer is `503`.
+    pub async fn live_doc(
+        &self,
+        doc_id: &str,
+    ) -> Result<(Arc<RwLock<Awareness>>, Arc<SyncKv>), AppError> {
+        let deadline = tokio::time::Instant::now() + self.gc_timeouts.retired_doc_wait;
         loop {
             let (awareness, sync_kv) = {
-                let doc = self.get_or_create_doc(doc_id).await?;
+                let doc = self
+                    .get_or_create_doc(doc_id)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
                 (doc.awareness(), doc.sync_kv())
             };
             if is_live(&awareness, &sync_kv) {
                 return Ok((awareness, sync_kv));
             }
             drop(awareness);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    anyhow!("The doc is being unloaded; try again."),
+                ));
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                _ = self.cancellation_token.cancelled() => {
+                    return Err(AppError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        anyhow!("The server is shutting down."),
+                    ));
+                }
+            }
         }
     }
 
@@ -790,10 +890,7 @@ async fn update_doc_inner(
     // hold up shutdown. The awareness held from here on keeps GC from retiring the doc, so the
     // update is applied to a doc whose writes are saved, and no lookup or load is needed
     // under admission.
-    let (awareness, _sync_kv) = server_state
-        .live_doc(&doc_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (awareness, _sync_kv) = server_state.live_doc(&doc_id).await?;
 
     // Admitted only while the gate is open, and held until the update is applied, so
     // shutdown's final save comes after it.
@@ -845,10 +942,7 @@ async fn handle_socket_upgrade(
     }
 
     // A doc GC has not retired; the connection holds its awareness, which keeps GC off it.
-    let (awareness, _sync_kv) = server_state
-        .live_doc(&doc_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (awareness, _sync_kv) = server_state.live_doc(&doc_id).await?;
     let cancellation_token = server_state.cancellation_token.clone();
     let write_gate = server_state.write_gate.clone();
     let connection_tracker = server_state.connection_tracker.clone();
@@ -1763,6 +1857,12 @@ mod test {
         held_get_release: Arc<tokio::sync::Semaphore>,
         /// How many reads of the held key started.
         held_gets: Arc<std::sync::atomic::AtomicUsize>,
+        /// Writes fail while set.
+        fail_sets: Arc<std::sync::atomic::AtomicBool>,
+        /// Writes wait for `set_release` while set.
+        hold_sets: Arc<std::sync::atomic::AtomicBool>,
+        set_entered: Arc<tokio::sync::Notify>,
+        set_release: Arc<tokio::sync::Semaphore>,
     }
 
     impl Default for TestStore {
@@ -1774,6 +1874,10 @@ mod test {
                 held_get_entered: Default::default(),
                 held_get_release: Arc::new(tokio::sync::Semaphore::new(0)),
                 held_gets: Default::default(),
+                fail_sets: Default::default(),
+                hold_sets: Default::default(),
+                set_entered: Default::default(),
+                set_release: Arc::new(tokio::sync::Semaphore::new(0)),
             }
         }
     }
@@ -1794,8 +1898,18 @@ mod test {
             Ok(self.data.get(key).map(|v| v.clone()))
         }
         async fn set(&self, key: &str, value: Vec<u8>) -> y_sweet_core::store::Result<()> {
-            if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.slow.load(SeqCst) {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+            if self.hold_sets.load(SeqCst) {
+                self.set_entered.notify_one();
+                self.set_release.acquire().await.unwrap().forget();
+            }
+            if self.fail_sets.load(SeqCst) {
+                return Err(y_sweet_core::store::StoreError::ConnectionError(
+                    "test failure".to_string(),
+                ));
             }
             self.data.insert(key.to_string(), value);
             Ok(())
@@ -1819,7 +1933,16 @@ mod test {
         token: &CancellationToken,
         checkpoint_freq: Duration,
     ) -> Server {
-        let server = Server::new(
+        server_with_gc(store, token, checkpoint_freq, GcTimeouts::default()).await
+    }
+
+    async fn server_with_gc(
+        store: &TestStore,
+        token: &CancellationToken,
+        checkpoint_freq: Duration,
+        gc_timeouts: GcTimeouts,
+    ) -> Server {
+        let mut server = Server::new(
             Some(Box::new(store.clone())),
             checkpoint_freq,
             None,
@@ -1831,6 +1954,8 @@ mod test {
         )
         .await
         .unwrap();
+        // Before the doc is loaded: its GC worker takes the timeouts when it starts.
+        server.gc_timeouts = gc_timeouts;
         server.load_doc(DOC_ID).await.unwrap();
         server
     }
@@ -2339,23 +2464,16 @@ mod test {
         let addr = listener.local_addr().unwrap();
         let serving = tokio::spawn(server.serve(listener, false));
 
-        // GC retires the doc; its persistence worker makes the last save.
+        // GC retires the doc...
         assert!(try_retire(&docs, DOC_ID));
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !stored_keys(&store).await.contains("1") {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the retired doc was not saved"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        // A write arriving now waits while the retired doc is still in the map...
+        // ...and a write arriving now waits while the retired doc is still in the map...
         let response = post_update(addr, DOC_ID, map_edit(2));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!response.is_finished());
 
-        // ...and goes to a fresh load once GC removes it.
+        // ...until GC has saved it and dropped it; then it goes to a fresh load.
+        let sync_kv = docs.get(DOC_ID).unwrap().sync_kv();
+        sync_kv.persist().await.unwrap();
         docs.remove_if(DOC_ID, |_, doc| doc.sync_kv().is_shutdown());
         assert_eq!(response.await.unwrap(), Some(200));
         token.cancel();
@@ -2364,8 +2482,27 @@ mod test {
         assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
     }
 
+    /// Waits until `condition` holds, for up to 10 s.
+    async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn is_retired(docs: &DashMap<String, DocWithSyncKv>, doc_id: &str) -> bool {
+        docs.get(doc_id)
+            .is_some_and(|doc| doc.sync_kv().is_shutdown())
+    }
+
     #[tokio::test]
-    async fn gc_saves_a_doc_before_dropping_it_and_a_later_write_reloads_it() {
+    async fn gc_drops_a_doc_only_after_saving_it_and_a_later_write_reloads_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+
         let store = TestStore::default();
         let token = CancellationToken::new();
         let server = server_with_checkpoints(&store, &token, Duration::from_millis(50)).await;
@@ -2374,28 +2511,195 @@ mod test {
         let addr = listener.local_addr().unwrap();
         let serving = tokio::spawn(server.serve(listener, false));
 
+        // Every save of the doc is held until the test lets it through.
+        store.hold_sets.store(true, SeqCst);
         assert_eq!(
             post_update(addr, DOC_ID, map_edit(1)).await.unwrap(),
             Some(200)
         );
-        // Nothing holds the doc, so GC drops it after two checkpoints, having saved it.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while docs.contains_key(DOC_ID) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "GC never dropped the doc"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(stored_keys(&store).await.contains("1"));
+        store.set_entered.notified().await;
+        eventually("GC retires the doc", || is_retired(&docs, DOC_ID)).await;
 
+        // While the save is held, the doc is not dropped and a writer cannot reload it.
+        let response = post_update(addr, DOC_ID, map_edit(2));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(docs.contains_key(DOC_ID), "dropped before it was saved");
+        assert!(
+            !response.is_finished(),
+            "the writer did not wait for the save"
+        );
+        assert!(!stored_keys(&store).await.contains("1"));
+
+        // Once saved, GC drops it and the writer reloads it, with the saved edit.
+        store.hold_sets.store(false, SeqCst);
+        store.set_release.add_permits(100);
+        assert_eq!(response.await.unwrap(), Some(200));
+        token.cancel();
+        serving.await.unwrap().unwrap();
+        let stored = stored_keys(&store).await;
+        assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_a_doc_it_could_not_save() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_checkpoints(&store, &token, Duration::from_millis(50)).await;
+        let docs = server.docs.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        // The store refuses every write; the acknowledged edit exists only in memory.
+        store.fail_sets.store(true, SeqCst);
+        assert_eq!(
+            post_update(addr, DOC_ID, map_edit(1)).await.unwrap(),
+            Some(200)
+        );
+        // Many GC rounds: each retires the doc, fails to save it, and must keep it.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            docs.contains_key(DOC_ID),
+            "GC dropped a doc it could not save"
+        );
+        assert!(!stored_keys(&store).await.contains("1"));
+        // It is still writable.
         assert_eq!(
             post_update(addr, DOC_ID, map_edit(2)).await.unwrap(),
             Some(200)
         );
+
+        // The store recovers: the doc is saved (and then collected), with both edits.
+        store.fail_sets.store(false, SeqCst);
+        eventually("GC drops the doc once saved", || !docs.contains_key(DOC_ID)).await;
+        let stored = stored_keys(&store).await;
+        assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
         token.cancel();
         serving.await.unwrap().unwrap();
-        let stored = stored_keys(&store).await;
+    }
+
+    #[tokio::test]
+    async fn a_hung_save_does_not_block_writers_for_ever() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_gc(
+            &store,
+            &token,
+            Duration::from_millis(50),
+            GcTimeouts {
+                retire_save: Duration::from_millis(200),
+                retired_doc_wait: Duration::from_secs(2),
+            },
+        )
+        .await
+        .with_shutdown_budgets(ShutdownBudgets {
+            connections: Duration::from_millis(300),
+            persist: Duration::from_millis(300),
+            webhook: Duration::from_secs(1),
+        });
+        let docs = server.docs.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        // Every store write now hangs, so GC's save of the retired doc never finishes.
+        store.slow.store(true, SeqCst);
+        assert_eq!(
+            post_update(addr, DOC_ID, map_edit(1)).await.unwrap(),
+            Some(200)
+        );
+        eventually("GC retires the doc", || is_retired(&docs, DOC_ID)).await;
+
+        // GC gives up on the save and keeps the doc, so a writer is not stuck behind it.
+        let response = post_update(addr, DOC_ID, map_edit(2));
+        let status = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("the writer is stuck behind the hung save")
+            .unwrap();
+        assert_eq!(status, Some(200));
+        assert!(docs.contains_key(DOC_ID));
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_writer_waits_for_a_retired_doc_only_so_long() {
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        // No GC (an hour between checkpoints): nothing will drop or un-retire the doc.
+        let mut server = server_with_store(&store, &token).await;
+        server.gc_timeouts.retired_doc_wait = Duration::from_millis(300);
+        let docs = server.docs.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+        assert!(try_retire(&docs, DOC_ID));
+
+        // Bounded by the wait...
+        let started = std::time::Instant::now();
+        assert_eq!(
+            post_update(addr, DOC_ID, map_edit(1)).await.unwrap(),
+            Some(503)
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        // ...and by shutdown.
+        let response = post_update(addr, DOC_ID, map_edit(2));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+        let status = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .expect("the writer did not notice the shutdown")
+            .unwrap();
+        assert!(matches!(status, Some(503) | None), "{status:?}");
+        serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_loads_of_a_doc_share_one_doc() {
+        // Two writers load the same absent doc at once; the first load finishes first and its
+        // writer has the doc. A second load must not then replace it: the first writer's edit
+        // would go to a doc no longer saved.
+        let store = TestStore::default();
+        *store.held_key.lock().unwrap() = Some("race-doc/data.ysweet".to_string());
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token).await;
+        let (gate, docs) = (server.write_gate.clone(), server.docs.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        let holding_admission = gate.in_progress.write().await;
+        let first = post_update(addr, "race-doc", map_edit(1));
+        store.held_get_entered.notified().await;
+        let second = post_update(addr, "race-doc", map_edit(2));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The first load finishes; its writer takes the doc and waits for admission.
+        store.held_get_release.add_permits(1);
+        eventually("the first load completes", || docs.contains_key("race-doc")).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A second load, had one started, finishes now.
+        store.held_get_release.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        drop(holding_admission);
+        assert_eq!(first.await.unwrap(), Some(200));
+        assert_eq!(second.await.unwrap(), Some(200));
+        token.cancel();
+        serving.await.unwrap().unwrap();
+
+        *store.held_key.lock().unwrap() = None;
+        let stored = stored_keys_of(&store, "race-doc").await;
         assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
     }
 }

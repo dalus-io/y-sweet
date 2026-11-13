@@ -33,8 +33,11 @@ these ways:
 - **Edits are not lost to doc garbage collection or checkpoints.** Upstream can unload an idle
   doc while an HTTP write to it is being applied (the write is then acknowledged and never
   saved), and a checkpoint that is still writing can clear the unsaved mark of an edit made
-  meanwhile. Here an unloaded doc is saved before it is dropped, a doc being written to is not
-  unloaded, and a write that finds a doc being unloaded waits for it and goes to a fresh load.
+  meanwhile. Here an unloaded doc is saved before it is dropped, and kept (and retried) if that
+  save fails or takes over 10 s; a doc being written to is not unloaded; a write that finds a doc
+  being unloaded waits for it (up to 15 s, else `503`) and goes to a fresh load. Two requests
+  that load the same doc at once share one load; upstream could let the second replace the
+  first while it was being written to, losing those writes.
 
 The request and response formats of every endpoint are unchanged. `userId` and `writer` in the
 auth request are accepted and ignored, as upstream does (upstream ignores `writer` as an unknown
