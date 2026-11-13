@@ -64,13 +64,16 @@ enum ServSubcommand {
 
         /// Mint doc tokens that carry the `userId` and `writer` of the auth request, so that
         /// updates can be attributed. Only turn this on once every server that verifies the
-        /// tokens runs a version that understands them. Accepts `true` or `false`.
+        /// tokens runs a version that understands them. Accepts `true` or `false`, either as
+        /// the next argument or after `=`; on its own (as the last argument) it means `true`.
+        ///
+        /// The next argument is always read as the value, so `--attributed-tokens false` is
+        /// off, and `--attributed-tokens /data` is an error rather than "on, store `/data`".
         #[clap(
             long,
             env = "Y_SWEET_ATTRIBUTED_TOKENS",
             action = clap::ArgAction::Set,
             num_args = 0..=1,
-            require_equals = true,
             default_value = "false",
             default_missing_value = "true",
             value_parser = parse_switch,
@@ -193,7 +196,11 @@ fn parse_switch(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "false" | "0" | "no" | "off" => Ok(false),
         "true" | "1" | "yes" | "on" => Ok(true),
-        other => Err(format!("expected `true` or `false`, got `{other}`")),
+        other => Err(format!(
+            "expected `true` or `false`, got `{other}`. A value after `--attributed-tokens` \
+             is read as the switch's value: to turn it on and also pass a store, write \
+             `--attributed-tokens=true` or `--attributed-tokens true` before the store."
+        )),
     }
 }
 
@@ -612,12 +619,16 @@ mod tests {
         assert!(parse_switch("maybe").is_err());
     }
 
-    fn serve_attributed_tokens(args: &[&str]) -> bool {
-        let opts = Opts::try_parse_from([&["y-sweet", "serve"], args].concat()).unwrap();
+    /// `(attributed_tokens, store)` as parsed from `y-sweet serve <args>`.
+    fn parse_serve(args: &[&str]) -> Result<(bool, Option<String>), String> {
+        let opts = Opts::try_parse_from([&["y-sweet", "serve"], args].concat())
+            .map_err(|e| e.to_string())?;
         match opts.subcmd {
             ServSubcommand::Serve {
-                attributed_tokens, ..
-            } => attributed_tokens,
+                attributed_tokens,
+                store,
+                ..
+            } => Ok((attributed_tokens, store)),
             _ => unreachable!(),
         }
     }
@@ -625,12 +636,33 @@ mod tests {
     #[test]
     fn attributed_tokens_flag() {
         // The environment variable is not set under `cargo test`, so these see only the flag.
-        assert!(!serve_attributed_tokens(&[]));
-        assert!(serve_attributed_tokens(&["--attributed-tokens"]));
-        assert!(serve_attributed_tokens(&["--attributed-tokens=true"]));
-        assert!(!serve_attributed_tokens(&["--attributed-tokens=false"]));
-        // A bare flag does not swallow the positional store argument.
-        assert!(serve_attributed_tokens(&["--attributed-tokens", "/data"]));
+        let parsed = |args: &[&str]| parse_serve(args).unwrap();
+        let data = Some("/data".to_string());
+        assert_eq!(parsed(&[]), (false, None));
+        assert_eq!(parsed(&["--attributed-tokens"]), (true, None));
+        assert_eq!(parsed(&["--attributed-tokens=true"]), (true, None));
+        assert_eq!(parsed(&["--attributed-tokens=false"]), (false, None));
+
+        // With a space, the value is the switch's, never the store.
+        assert_eq!(parsed(&["--attributed-tokens", "false"]), (false, None));
+        assert_eq!(parsed(&["--attributed-tokens", "true"]), (true, None));
+        assert_eq!(
+            parsed(&["--attributed-tokens", "false", "/data"]),
+            (false, data.clone())
+        );
+        assert_eq!(
+            parsed(&["/data", "--attributed-tokens"]),
+            (true, data.clone())
+        );
+        assert_eq!(
+            parsed(&["--attributed-tokens=true", "/data"]),
+            (true, data.clone())
+        );
+
+        // A store path right after a bare flag is an error that says what to write instead,
+        // not a silent "on".
+        let error = parse_serve(&["--attributed-tokens", "/data"]).unwrap_err();
+        assert!(error.contains("--attributed-tokens=true"), "{error}");
     }
 
     #[test]
