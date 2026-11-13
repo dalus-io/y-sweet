@@ -1220,4 +1220,237 @@ mod test {
             ]
         );
     }
+
+    type Events = Arc<std::sync::Mutex<Vec<y_sweet_core::update_events::AttributedUpdate>>>;
+
+    /// A server with auth and attributed tokens, serving on a local port, whose docs report
+    /// their updates into `events`.
+    struct Served {
+        addr: std::net::SocketAddr,
+        events: Events,
+        verifier: Authenticator,
+        token: CancellationToken,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl Served {
+        async fn start() -> Self {
+            let authenticator = Authenticator::gen_key().unwrap();
+            let verifier = Authenticator::new(&authenticator.private_key()).unwrap();
+            let token = CancellationToken::new();
+            let mut server = Server::new(
+                None,
+                Duration::from_secs(60),
+                Some(authenticator),
+                None,
+                token.clone(),
+                true,
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .with_attributed_tokens(true);
+            let events = Events::default();
+            server.on_update = Some({
+                let events = events.clone();
+                Arc::new(move |event| events.lock().unwrap().push(event))
+            });
+            server.load_doc(DOC_ID).await.unwrap();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(server.serve(listener, false));
+            Self {
+                addr,
+                events,
+                verifier,
+                token,
+                task,
+            }
+        }
+
+        fn doc_token(&self, authorization: Authorization, actor: Option<Actor>) -> String {
+            let expiration = ExpirationTimeEpochMillis(current_time_epoch_millis() + 60_000);
+            self.verifier
+                .gen_doc_token_with_actor(DOC_ID, authorization, expiration, actor)
+        }
+
+        fn actors(&self) -> Vec<Option<Actor>> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| event.actor.clone())
+                .collect()
+        }
+
+        async fn wait_for_events(&self, count: usize) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while self.events.lock().unwrap().len() < count {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {count} update events"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        async fn stop(self) {
+            self.token.cancel();
+            tokio::time::timeout(Duration::from_secs(10), self.task)
+                .await
+                .expect("server did not stop")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// The incremental update of one edit by a client that types into the text `t`.
+    fn edit(client: &yrs::Doc, chunk: &str) -> Vec<u8> {
+        use yrs::{Text, Transact};
+        let text = client.get_or_insert_text("t");
+        let mut txn = client.transact_mut();
+        text.push(&mut txn, chunk);
+        txn.encode_update_v1()
+    }
+
+    #[tokio::test]
+    async fn websocket_updates_are_attributed_to_the_token_they_connected_with() {
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        use y_sweet_core::sync::{Message as SyncProtocolMessage, SyncMessage};
+        use yrs::updates::encoder::Encode;
+
+        let served = Served::start().await;
+        let alice = Actor {
+            user_id: Some("alice".to_string()),
+            writer: Some("ui".to_string()),
+        };
+        let client = yrs::Doc::with_client_id(1);
+
+        for (expected, actor) in [(1, Some(alice.clone())), (2, None)] {
+            let token = served.doc_token(Authorization::Full, actor);
+            let url = format!("ws://{}/d/{DOC_ID}/ws/{DOC_ID}?token={token}", served.addr);
+            let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            let message = SyncProtocolMessage::Sync(SyncMessage::Update(edit(&client, "x")));
+            socket
+                .send(WsMessage::Binary(message.encode_v1()))
+                .await
+                .unwrap();
+            served.wait_for_events(expected).await;
+            socket.close(None).await.unwrap();
+        }
+
+        assert_eq!(served.actors(), vec![Some(alice), None]);
+        served.stop().await;
+    }
+
+    #[tokio::test]
+    async fn http_update_with_a_read_only_token_is_forbidden_and_emits_nothing() {
+        let served = Served::start().await;
+        let client = yrs::Doc::with_client_id(1);
+        let alice = Actor {
+            user_id: Some("alice".to_string()),
+            writer: Some("http".to_string()),
+        };
+        let http = reqwest::Client::new();
+        let post = |token: String, body: Vec<u8>| {
+            http.post(format!("http://{}/d/{DOC_ID}/update", served.addr))
+                .bearer_auth(token)
+                .body(body)
+                .send()
+        };
+
+        let read_only = served.doc_token(Authorization::ReadOnly, Some(alice.clone()));
+        let response = post(read_only, edit(&client, "x")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // A full token goes through the same route, so the 403 was the token's doing; and the
+        // only event is the full token's. (Another client: an edit by the first one would
+        // depend on the rejected "x", and yrs would hold it back as pending.)
+        let full = served.doc_token(Authorization::Full, Some(alice.clone()));
+        let response = post(full, edit(&yrs::Doc::with_client_id(2), "y"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        served.wait_for_events(1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(served.actors(), vec![Some(alice)]);
+
+        served.stop().await;
+    }
+
+    #[tokio::test]
+    async fn serve_runs_the_update_webhook_flush_on_shutdown() {
+        // The receiver answers slowly, so `serve` returning before it answered would show.
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let receiver = {
+            let received = received.clone();
+            Router::new().route(
+                "/updates",
+                post(move |body: Bytes| {
+                    let received = received.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        received
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&body).unwrap());
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+        };
+        let receiver_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let receiver_url: Url =
+            format!("http://{}/updates", receiver_listener.local_addr().unwrap())
+                .parse()
+                .unwrap();
+        tokio::spawn(async move { axum::serve(receiver_listener, receiver).await.unwrap() });
+
+        let token = CancellationToken::new();
+        let server = Server::new(
+            None,
+            Duration::from_secs(60),
+            None,
+            None,
+            token.clone(),
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .with_update_webhook(UpdateWebhookConfig {
+            // Only the shutdown flush can close this batch.
+            batch_window: Duration::from_secs(3600),
+            ..UpdateWebhookConfig::new(receiver_url, "secret".to_string())
+        })
+        .unwrap();
+        server.load_doc(DOC_ID).await.unwrap();
+        server
+            .docs
+            .get(DOC_ID)
+            .unwrap()
+            .apply_update(&edit(&yrs::Doc::with_client_id(1), "x"), None)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(received.lock().unwrap().is_empty());
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+
+        // Already there when `serve` returns: it waited for the flush.
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["doc_id"], DOC_ID);
+        assert_eq!(received[0]["events"].as_array().unwrap().len(), 1);
+    }
 }

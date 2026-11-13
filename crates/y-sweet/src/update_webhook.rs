@@ -11,10 +11,15 @@
 //! - [Batcher] is the per-doc state machine: it assigns sequence numbers, groups events into
 //!   batches, bounds each doc's queue and tracks the gap flag. It is synchronous and does no IO.
 //! - The dispatcher task drives the batcher from the channel and a timer, and delivers at most
-//!   one batch per doc at a time, signing every attempt.
+//!   one batch per doc at a time, signing every attempt. Across docs, at most
+//!   [UpdateWebhookConfig::max_concurrent_deliveries] requests are in flight at once.
 //!
 //! Nothing here is durable. A batch that cannot be delivered is dropped and the doc's next batch
-//! says so with `gap_before: true`; a restart is visible to the receiver as a new `instance_id`.
+//! says so with `gap_before: true`. Gap state lives only in memory, though: a restart, or a reset
+//! of gap tracking (see [Batcher::enforce_gap_only_cap]), discards it, and all that is left is a
+//! new `instance_id` on whatever batch is sent next, for any doc. A doc whose gap was discarded
+//! and that is never written again gets no batch of its own. The receiver therefore has to treat
+//! a new `instance_id` as "every doc may have a gap", not just the doc in that batch.
 //!
 //! Update bytes, user ids and the signing secret are never logged, at any level.
 
@@ -31,13 +36,17 @@ use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    Semaphore,
+};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use y_sweet_core::{
@@ -49,16 +58,15 @@ const MIB: usize = 1024 * 1024;
 
 pub const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(1000);
 pub const DEFAULT_MAX_HELD_BYTES: usize = 256 * MIB;
+pub const DEFAULT_MAX_CONCURRENT_DELIVERIES: usize = 16;
 
 pub const TIMESTAMP_HEADER: &str = "X-Y-Sweet-Timestamp";
 pub const SIGNATURE_HEADER: &str = "X-Y-Sweet-Signature";
 
-/// How many shutdown deliveries run at once.
-const SHUTDOWN_CONCURRENCY: usize = 32;
 /// How many events the dispatcher takes off the channel before looking at anything else.
 const MAX_EVENTS_PER_WAKEUP: usize = 256;
 
-/// Configuration of the update webhook. Only the first four fields are operator-facing; the
+/// Configuration of the update webhook. Only the first six fields are operator-facing; the
 /// rest are fixed by the design and exist as fields so tests can shrink them.
 #[derive(Clone)]
 pub struct UpdateWebhookConfig {
@@ -70,6 +78,12 @@ pub struct UpdateWebhookConfig {
     pub batch_window: Duration,
     /// The global budget for update bytes held anywhere in the pipeline.
     pub max_held_bytes: usize,
+    /// How many requests may be in flight at once, across all docs (each doc has at most one).
+    /// Bounds the burst when the receiver comes back after an outage. Values below 1 count as 1.
+    pub max_concurrent_deliveries: usize,
+    /// A PEM file of extra CA certificates to trust for the webhook URL, on top of the bundled
+    /// public roots. For a receiver behind a private CA.
+    pub ca_file: Option<PathBuf>,
 
     /// An event larger than this is dropped.
     pub max_event_bytes: usize,
@@ -90,7 +104,8 @@ pub struct UpdateWebhookConfig {
     pub retry_backoff_initial: Duration,
     /// Upper bound of the retry delay.
     pub retry_backoff_max: Duration,
-    /// A batch that is still failing after this long in flight is dropped.
+    /// A batch that is still failing after this long in flight is dropped. A `Retry-After` from
+    /// the receiver is honoured only up to this age.
     pub max_retry_age: Duration,
     /// How long the final flush may take at shutdown.
     pub shutdown_budget: Duration,
@@ -103,6 +118,8 @@ impl UpdateWebhookConfig {
             secret,
             batch_window: DEFAULT_BATCH_WINDOW,
             max_held_bytes: DEFAULT_MAX_HELD_BYTES,
+            max_concurrent_deliveries: DEFAULT_MAX_CONCURRENT_DELIVERIES,
+            ca_file: None,
             max_event_bytes: 8 * MIB,
             max_batch_events: 256,
             max_batch_bytes: MIB,
@@ -543,9 +560,13 @@ impl Batcher {
     /// Such a state lives until a batch carrying its flag is acked, which never happens while
     /// the receiver rejects everything: each doc written during the outage would keep a state,
     /// and an empty-batch delivery, forever. So past the cap all of them are discarded and
-    /// `instance_id` is replaced. By the payload contract an `instance_id` the receiver has not
-    /// seen for a doc means "resync it", which is exactly what the discarded flags meant, so the
-    /// next batch of any of those docs still tells the receiver. Sequence numbers keep running.
+    /// `instance_id` is replaced. Sequence numbers keep running.
+    ///
+    /// This loses information on purpose: a discarded doc is never sent its own gap signal. What
+    /// remains is the new `instance_id` on the next batch sent for any doc, and by the payload
+    /// contract a receiver that sees an `instance_id` for the first time must resync every doc it
+    /// knew under earlier ids, not only the doc in that batch. If nothing at all is sent after
+    /// the reset, the receiver learns nothing until something is.
     ///
     /// Docs with events open, queued or in flight are kept; their later batches carry the new
     /// id. Returns the discarded docs that had an (empty) batch in flight, for the dispatcher
@@ -766,6 +787,8 @@ enum Attempt {
     Retryable {
         status: Option<u16>,
         error_kind: Option<&'static str>,
+        /// What a 429 or 503 asked for in `Retry-After`, if it parsed.
+        retry_after: Option<Duration>,
     },
     /// This body will never be accepted.
     Terminal {
@@ -773,24 +796,82 @@ enum Attempt {
     },
 }
 
+/// Reads `Retry-After` in either form: delta-seconds, or an HTTP-date (a date in the past means
+/// no wait). `None` when the header is absent or unparsable.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap, now: SystemTime) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// Reads the CA certificates to trust on top of the bundled roots.
+fn load_ca_file(path: &std::path::Path) -> anyhow::Result<Vec<reqwest::Certificate>> {
+    let pem = std::fs::read(path).map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot read the update webhook CA file {}: {e}",
+            path.display()
+        )
+    })?;
+    let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid PEM in the update webhook CA file {}: {e}",
+            path.display()
+        )
+    })?;
+    if certs.is_empty() {
+        anyhow::bail!(
+            "The update webhook CA file {} holds no certificate",
+            path.display()
+        );
+    }
+    Ok(certs)
+}
+
 struct Deliverer {
     client: reqwest::Client,
     config: UpdateWebhookConfig,
+    /// One permit per request in flight, across all docs. Held for the request only, never
+    /// while a batch waits out its retry delay, so a doc that is backing off does not hold
+    /// back the others.
+    permits: Semaphore,
 }
 
 impl Deliverer {
     fn new(config: UpdateWebhookConfig) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(config.request_timeout)
             // A redirect is not an ack, and a signed body must not follow one elsewhere.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        Ok(Self { client, config })
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(path) = &config.ca_file {
+            for cert in load_ca_file(path)? {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        let client = builder.build()?;
+        let permits = Semaphore::new(config.max_concurrent_deliveries.max(1));
+        Ok(Self {
+            client,
+            config,
+            permits,
+        })
     }
 
     /// One signed POST. The timestamp and signature are computed here, per attempt, so a batch
     /// that has been retrying for a long time still verifies.
     async fn attempt(&self, batch: &PreparedBatch) -> Attempt {
+        // Waits for a free slot first: the timestamp is taken once the request can go out.
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .expect("The semaphore is never closed.");
         let timestamp = unix_seconds();
         let signature = sign(self.config.secret.as_bytes(), timestamp, &batch.body);
 
@@ -815,9 +896,17 @@ impl Deliverer {
                     || status == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error()
                 {
+                    let retry_after = if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    {
+                        parse_retry_after(response.headers(), SystemTime::now())
+                    } else {
+                        None
+                    };
                     Attempt::Retryable {
                         status: Some(status.as_u16()),
                         error_kind: None,
+                        retry_after,
                     }
                 } else {
                     Attempt::Terminal {
@@ -835,6 +924,7 @@ impl Deliverer {
                 } else {
                     "request"
                 }),
+                retry_after: None,
             },
         }
     }
@@ -857,12 +947,21 @@ impl Deliverer {
                     log_dropped(batch, "status", Some(status), attempt, started.elapsed());
                     return false;
                 }
-                Attempt::Retryable { status, error_kind } => {
+                Attempt::Retryable {
+                    status,
+                    error_kind,
+                    retry_after,
+                } => {
                     let age = started.elapsed();
                     if age >= self.config.max_retry_age {
                         log_dropped(batch, "retry_age", status, attempt, age);
                         return false;
                     }
+                    // A longer `Retry-After` wins over the backoff, but nothing waits past the
+                    // retry age: the batch then gets its last attempt right at that age.
+                    let delay = backoff
+                        .max(retry_after.unwrap_or_default())
+                        .min(self.config.max_retry_age - age);
                     tracing::warn!(
                         doc_id = %batch.doc_id,
                         seq_start = batch.seq_start,
@@ -873,10 +972,11 @@ impl Deliverer {
                         status,
                         error_kind,
                         age_ms = age.as_millis() as u64,
-                        retry_in_ms = backoff.as_millis() as u64,
+                        retry_after_ms = retry_after.map(|d| d.as_millis() as u64),
+                        retry_in_ms = delay.as_millis() as u64,
                         "update webhook batch retry"
                     );
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(delay).await;
                     backoff = backoff.saturating_mul(2).min(self.config.retry_backoff_max);
                 }
             }
@@ -1044,7 +1144,10 @@ impl Dispatcher {
 
         let delivered = AtomicUsize::new(0);
         let instance_id = self.batcher.instance_id.clone();
-        let flush = stream::iter(plan).for_each_concurrent(SHUTDOWN_CONCURRENCY, |doc| {
+        // The deliveries that were retrying are gone, so every permit is free again; the cap
+        // still applies, inside each attempt.
+        let concurrency = self.batcher.config.max_concurrent_deliveries.max(1);
+        let flush = stream::iter(plan).for_each_concurrent(concurrency, |doc| {
             let deliverer = &self.deliverer;
             let delivered = &delivered;
             let instance_id = &instance_id;
@@ -1118,7 +1221,7 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{http::HeaderMap, http::StatusCode, routing::post, Router};
+    use axum::{http::HeaderMap, http::StatusCode, response::IntoResponse, routing::post, Router};
     use serde_json::Value;
 
     const SECRET: &str = "test-secret";
@@ -1721,7 +1824,9 @@ mod tests {
         assert_eq!((seqs(&next), next.gap_before), (vec![2], true));
         assert_eq!(instance_id(&next), rotated);
 
-        // A discarded doc that is written again is announced by the new instance id alone.
+        // A discarded doc that is written again carries no gap flag: the new instance id is all
+        // that is left of its gap. (One that is never written again gets nothing; see
+        // `an_idle_doc_loses_its_gap_signal_when_gap_tracking_resets`.)
         p.ack(&next);
         p.emit("g1", 10);
         let again = p.start_one();
@@ -2004,7 +2109,8 @@ mod tests {
             deliverer.attempt(&batch).await,
             Attempt::Retryable {
                 status: None,
-                error_kind: Some("connect")
+                error_kind: Some("connect"),
+                ..
             }
         ));
         let started = Instant::now();
@@ -2255,7 +2361,8 @@ mod tests {
         }
 
         // Each doc's batch is rejected, leaving three gap-only states: one over the cap. They
-        // are discarded, so the empty gap batches stop instead of repeating forever.
+        // are discarded, so the empty gap batches stop instead of repeating forever. The price
+        // is the gap signal itself (see the next test).
         wait_for_requests(&requests, 3).await;
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut settled = requests.lock().unwrap().len();
@@ -2270,8 +2377,8 @@ mod tests {
         }
         let first_instance = requests.lock().unwrap()[0].body["instance_id"].clone();
 
-        // The receiver recovers. The next write to a discarded doc arrives under a new
-        // instance id, which is what tells the receiver to resync it.
+        // The receiver recovers. The next write to a discarded doc arrives under a new instance
+        // id but without `gap_before`: the unseen id is the only trace of the lost gap.
         accept.store(true, Ordering::SeqCst);
         running.emit("a");
         let seen = wait_for_requests(&requests, settled + 1).await;
@@ -2359,5 +2466,307 @@ mod tests {
         );
         // It did wait for the receiver rather than give up at once.
         assert!(took >= budget - Duration::from_millis(50), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn an_idle_doc_loses_its_gap_signal_when_gap_tracking_resets() {
+        use std::sync::atomic::AtomicBool;
+
+        let accept = Arc::new(AtomicBool::new(false));
+        let (url, requests) = receiver({
+            let accept = accept.clone();
+            move |_, _| {
+                if accept.load(Ordering::SeqCst) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }
+        })
+        .await;
+        let running = run(UpdateWebhookConfig {
+            max_gap_only_docs: 2,
+            ..dispatcher_config(url)
+        });
+        for doc_id in ["a", "b", "c"] {
+            running.emit(doc_id);
+        }
+
+        // All three are rejected and their gap states discarded by the reset.
+        wait_for_requests(&requests, 3).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut settled = requests.lock().unwrap().len();
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = requests.lock().unwrap().len();
+            if now == settled {
+                break;
+            }
+            settled = now;
+            assert!(Instant::now() < deadline, "requests never stopped");
+        }
+        let first_instance = requests.lock().unwrap()[0].body["instance_id"].clone();
+
+        // The receiver recovers and only an unrelated doc is written. a, b and c are never
+        // written again, so they never get a batch of their own, with or without
+        // `gap_before`: their lost updates are signalled only by the new instance id on d's
+        // batch. That is why the receiver must resync every doc it knew under the old id.
+        accept.store(true, Ordering::SeqCst);
+        running.emit("d");
+        let seen = wait_for_requests(&requests, settled + 1).await;
+        let last = seen.last().unwrap();
+        assert_eq!(
+            (last.body["doc_id"].as_str(), last.status),
+            (Some("d"), 200)
+        );
+        assert_ne!(last.body["instance_id"], first_instance);
+        assert!(!last.gap_before());
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after_recovery: Vec<_> = requests.lock().unwrap()[settled..]
+            .iter()
+            .map(|r| r.body["doc_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(after_recovery, vec!["d".to_string()]);
+    }
+
+    /// A receiver that counts how many of its requests are open at once.
+    async fn concurrency_probe(hold: Duration) -> (Url, Requests, Arc<AtomicUsize>) {
+        let open = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let requests = Requests::default();
+        let app = {
+            let (open, peak, requests) = (open.clone(), peak.clone(), requests.clone());
+            Router::new().route(
+                "/updates",
+                post(move |raw_body: Bytes| {
+                    let (open, peak, requests) = (open.clone(), peak.clone(), requests.clone());
+                    async move {
+                        let now_open = open.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now_open, Ordering::SeqCst);
+                        tokio::time::sleep(hold).await;
+                        open.fetch_sub(1, Ordering::SeqCst);
+                        requests.lock().unwrap().push(Request {
+                            timestamp: 0,
+                            signature: String::new(),
+                            content_type: String::new(),
+                            body: serde_json::from_slice(&raw_body).unwrap(),
+                            raw_body: raw_body.to_vec(),
+                            status: 200,
+                        });
+                        StatusCode::OK
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/updates", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, requests, peak)
+    }
+
+    #[tokio::test]
+    async fn concurrent_deliveries_never_exceed_the_cap() {
+        let (url, requests, peak) = concurrency_probe(Duration::from_millis(50)).await;
+        let running = run(UpdateWebhookConfig {
+            max_concurrent_deliveries: 4,
+            ..dispatcher_config(url)
+        });
+        // 30 docs with two batches each, all ready at once, as after an outage.
+        for _ in 0..2 {
+            for doc in 0..30 {
+                running.emit(&format!("doc-{doc}"));
+            }
+        }
+
+        let seen = wait_for_requests(&requests, 60).await;
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            4,
+            "the cap was not reached or exceeded"
+        );
+
+        // Still one batch per doc at a time, in order.
+        let mut per_doc: HashMap<String, Vec<u64>> = HashMap::new();
+        for request in &seen {
+            per_doc
+                .entry(request.body["doc_id"].as_str().unwrap().to_string())
+                .or_default()
+                .extend(request.seqs());
+        }
+        assert_eq!(per_doc.len(), 30);
+        assert!(per_doc
+            .values()
+            .all(|seqs| seqs.len() == 2 && seqs[0] < seqs[1]));
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_respects_the_cap() {
+        let (url, requests, peak) = concurrency_probe(Duration::from_millis(50)).await;
+        let running = run(UpdateWebhookConfig {
+            max_concurrent_deliveries: 3,
+            batch_window: Duration::from_secs(3600),
+            max_batch_events: 256,
+            ..dispatcher_config(url)
+        });
+        for doc in 0..12 {
+            running.emit(&format!("doc-{doc}"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        running.cancellation_token.cancel();
+        running.task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 12);
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn retry_after_parsing() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let now = UNIX_EPOCH + Duration::from_secs(1_794_312_000);
+        let parse = |value: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            }
+            parse_retry_after(&headers, now)
+        };
+        assert_eq!(parse(Some("120")), Some(Duration::from_secs(120)));
+        assert_eq!(parse(Some(" 0 ")), Some(Duration::ZERO));
+        // 2026-11-10T12:00:30Z, 30 s after `now`.
+        assert_eq!(
+            parse(Some("Tue, 10 Nov 2026 12:00:30 GMT")),
+            Some(Duration::from_secs(30))
+        );
+        // A date in the past means no wait.
+        assert_eq!(
+            parse(Some("Tue, 10 Nov 2026 11:00:00 GMT")),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse(Some("-5")), None);
+        assert_eq!(parse(Some("soon")), None);
+        assert_eq!(parse(None), None);
+    }
+
+    /// A receiver that answers 429 with `Retry-After: {retry_after}` to the first `rejections`
+    /// requests and 200 after, recording when each arrived.
+    async fn throttling_receiver(
+        rejections: usize,
+        retry_after: &'static str,
+    ) -> (Url, Arc<Mutex<Vec<(Instant, u16)>>>) {
+        let seen: Arc<Mutex<Vec<(Instant, u16)>>> = Arc::default();
+        let app = {
+            let seen = seen.clone();
+            Router::new().route(
+                "/updates",
+                post(move || {
+                    let seen = seen.clone();
+                    async move {
+                        let mut seen = seen.lock().unwrap();
+                        let throttle = seen.len() < rejections;
+                        let status = if throttle { 429 } else { 200 };
+                        seen.push((Instant::now(), status));
+                        if throttle {
+                            (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                [("retry-after", retry_after)],
+                            )
+                                .into_response()
+                        } else {
+                            StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/updates", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, seen)
+    }
+
+    #[tokio::test]
+    async fn retry_after_delays_the_retry() {
+        let (url, seen) = throttling_receiver(1, "1").await;
+        // The backoff alone would retry after 10 ms.
+        let running = run(dispatcher_config(url));
+        running.emit("doc");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let seen = loop {
+            let seen = seen.lock().unwrap().clone();
+            if seen.len() >= 2 {
+                break seen;
+            }
+            assert!(Instant::now() < deadline, "the retry never arrived");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!((seen[0].1, seen[1].1), (429, 200));
+        let waited = seen[1].0 - seen[0].0;
+        assert!(
+            waited >= Duration::from_millis(950),
+            "retried after {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_bounded_by_the_retry_age() {
+        let (url, seen) = throttling_receiver(usize::MAX, "3600").await;
+        let deliverer = Deliverer::new(UpdateWebhookConfig {
+            max_retry_age: Duration::from_millis(300),
+            ..dispatcher_config(url)
+        })
+        .unwrap();
+        let batch = prepare("doc", "instance-1", Batch::default(), true);
+
+        let started = Instant::now();
+        assert!(!deliverer.deliver(&batch).await);
+        let took = started.elapsed();
+        // One attempt, one last attempt at the retry age, then dropped; no hour-long wait.
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ca_file_adds_roots_and_rejects_bad_files() {
+        const CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBizCCATGgAwIBAgIUIYVrdJ+QbMDQL9LYjjLN5Uo3FuEwCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPeS1zd2VldCB0ZXN0IENBMCAXDTI2MTExMzE3MDEyOVoYDzIx
+MjYxMDIwMTcwMTI5WjAaMRgwFgYDVQQDDA95LXN3ZWV0IHRlc3QgQ0EwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAATL9sRso32b7wKN4Or88QrqprgiF2s+D0reLlz6
+dmhL5ZXNrwXAWB59nHYB2aXMUNORbzjAQodyDrjsvQEmBKTPo1MwUTAdBgNVHQ4E
+FgQUXwpKRB+MUt+ROtKyI7dXSeiwt3IwHwYDVR0jBBgwFoAUXwpKRB+MUt+ROtKy
+I7dXSeiwt3IwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEA3rus
+Nv3Pj/1aQbUzlTudc5SL6WbHJW6NGeiuxZrrbOYCIBnzzqodPn3zgPEKRRdjJ+9d
+GZuNFD2CfzKu6mHIOnyE
+-----END CERTIFICATE-----
+";
+        let dir = std::env::temp_dir().join(format!("y-sweet-ca-test-{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, contents: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, contents).unwrap();
+            path
+        };
+        let with_ca = |path: PathBuf| {
+            Deliverer::new(UpdateWebhookConfig {
+                ca_file: Some(path),
+                ..test_config()
+            })
+        };
+
+        assert!(with_ca(file("ca.pem", CA)).is_ok());
+        // A bundle of two works too.
+        assert!(with_ca(file("bundle.pem", &format!("{CA}{CA}"))).is_ok());
+
+        let error = |path| with_ca(path).err().expect("expected an error").to_string();
+        assert!(error(dir.join("missing.pem")).contains("Cannot read"));
+        assert!(error(file("empty.pem", "not a certificate\n")).contains("no certificate"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

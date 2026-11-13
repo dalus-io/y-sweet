@@ -23,7 +23,9 @@ Goals:
 - Every update applied by this server carries a server-verified actor: an optional user id and an opaque
   writer kind, both taken from the signed token that authenticated the writer.
 - A configured HTTP endpoint receives attributed updates, batched per doc, in order per doc, with
-  at-least-once delivery, an idempotency key, and an explicit gap signal.
+  at-least-once delivery, an idempotency key, and a gap signal. The gap signal is best-effort in
+  one respect: it lives in memory, and when it is lost the only trace is a new `instance_id`
+  (section 4.3 states what the receiver must do about that).
 - Existing tokens keep working through the deploy. The feature is inert unless configured: no new token
   format is minted and no observer runs until their switches are set.
 
@@ -136,8 +138,9 @@ The callback supplied by the dispatcher does three things, none of which block t
 
 Every drop increments an atomic per-reason counter (oversize, budget, channel full, closed) and inserts the
 doc id into a shared `Mutex<HashSet<String>>` of gapped docs. The dispatcher drains that set on every tick
-and sets the doc's gap flag. The set cannot be full, so a drop is never itself lost; its size is bounded by
-the number of loaded docs.
+and sets the doc's gap flag. The set cannot be full, so recording a drop never fails; its size is bounded by
+the number of loaded docs. (The record is still in memory: a restart or a gap-tracking reset loses it, see
+section 4.3.)
 
 The callback never logs. It runs inside the yrs observer, under the doc write lock, and a log write is
 synchronous IO: a slow stdout during an overflow would stall doc writes. The dispatcher reports the counters
@@ -164,10 +167,12 @@ One kind of state is not bounded by that, nor by the byte budget: a state that h
 flag (or an empty batch carrying it). It lives until a batch carrying the flag is acked, so a receiver that
 rejects everything would leave one per doc written, each with a recurring empty-batch delivery. These
 gap-only states are capped at 4096. When the cap is exceeded the dispatcher discards all of them, aborts
-their in-flight empty batches, and replaces `instance_id` with a fresh random id. An unseen `instance_id`
-already means "resync this doc" (section 4.3), so the discarded flags are not silently lost. The sequence
-counter is not reset. States with events open, queued or in flight are kept; their later batches carry the
-new id.
+their in-flight empty batches, and replaces `instance_id` with a fresh random id. This deliberately drops
+the per-doc gap signal of the discarded docs: none of them is sent `gap_before: true` or an empty gap batch
+afterwards, and one that is never written again is never sent anything. The only trace is the new
+`instance_id` on the next batch sent for any doc, which is why the receiver contract (section 4.3) makes a
+new id mean "resync every doc", not "resync this doc". The sequence counter is not reset. States with events
+open, queued or in flight are kept, with their own gap flags; their later batches carry the new id.
 
 Sequence numbers come from one process-wide counter starting at 1, assigned when the dispatcher takes an
 event off the channel. They are therefore unique per `instance_id` regardless of doc eviction and reload,
@@ -201,12 +206,31 @@ the process.
 when gap tracking is reset (section 4.2); `seq` keeps increasing across that change. The receiver's
 idempotency key is `(instance_id, seq)`.
 `seq_start` and `seq_end` are the first and last `seq` in `events` and are `null` for an empty gap batch;
-they are not contiguous across a doc's batches, so the receiver must not infer gaps from them. A gap is
-exactly one of two things: `gap_before: true`, or an `instance_id` the receiver has not seen for this doc.
-Recovery in both cases is the same: fetch the doc's state from `as-update` and reconcile; attribution for
-the missed span is lost.
+they are not contiguous across a doc's batches, so the receiver must not infer gaps from them.
+
+Receiver contract for gaps:
+
+1. `gap_before: true` means this doc lost updates since the last batch the receiver acknowledged for it.
+   Resync this doc.
+2. An `instance_id` the receiver has not seen before means the server lost its in-memory state (restart, or
+   the gap-tracking reset of section 4.2), and with it possibly the gap flag of any doc. A doc whose flag
+   was lost is not told separately; if it is never written again, it gets no batch at all. So on a new id
+   the receiver must treat every doc it has received batches for under any other `instance_id` as possibly
+   gapped and resync each one, not only the doc in that batch. With several servers the receiver cannot
+   tell which id the new one replaced, so it resyncs every known doc not yet seen under the new id;
+   resyncing a doc that had no gap is harmless.
+
+Resync means: fetch the doc's state from `as-update` and reconcile; attribution for the missed span is lost.
+
+Residual blind spot, accepted: the new `instance_id` arrives only with the next batch the server sends. If
+nothing is written anywhere after a restart or reset, the receiver hears nothing until something is. A
+receiver that needs a bound on detection must also reconcile on its own (on doc open, or on a schedule).
 
 The largest body is one 8 MiB event, about 11 MiB once base64-encoded. The receiver must accept 12 MiB.
+
+Because a batch is serialized (base64 plus JSON, about 1.4 times its update bytes) when its delivery starts,
+and the byte budget counts raw update bytes, real memory held by the pipeline can reach about 1.4 to 1.5
+times `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES`. The operator doc gives sizing guidance.
 
 ### 4.4 Signing and transport
 
@@ -224,23 +248,42 @@ The HTTP client is `reqwest` with rustls and the MAC is `hmac`. Both are already
 S3 store but only as dependencies of other crates; both become direct dependencies of `y-sweet`. Request
 timeout 10 seconds.
 
+The client trusts the bundled webpki roots, not the OS store, so a receiver behind a private CA would fail
+every delivery. `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` names a PEM file whose certificates are added as extra
+roots (`ClientBuilder::add_root_certificate`); no reqwest feature change is needed. The file is read at
+startup; an unreadable file or one with no certificate is a startup error.
+
 ### 4.5 Delivery and failure
 
 A 2xx is the ack. The other outcomes split in two:
 
 - **Retryable:** a timeout, a connection error, 408, 429, or any 5xx. The same batch is retried with
-  exponential backoff from 500 ms capped at 30 s, until it has been in flight for 10 minutes.
+  exponential backoff from 500 ms capped at 30 s, until it has been in flight for 10 minutes. A 429 or 503
+  with `Retry-After` (delta-seconds or HTTP-date) waits that long instead when it is longer than the
+  backoff, but never past the 10 minute limit: the batch then gets a last attempt at the limit.
 - **Terminal:** any other status (a 4xx such as 400, 401 or 413 means this body will never be accepted), or
   a retryable batch that reached the 10 minute limit. The batch is dropped, its bytes released, the doc's
   gap flag set, and delivery moves on to the doc's next batch.
 
 No batch can therefore block its doc indefinitely. The doc's later batches wait in its queue while one is in
-flight. A process restart loses everything in memory, which the receiver sees as a new `instance_id`.
+flight. A process restart loses everything in memory, which the receiver sees as a new `instance_id`
+(section 4.3, rule 2).
+
+Concurrency across docs is capped: at most 16 requests (`Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY`) are open at
+once, through a semaphore taken per attempt. Without it, a receiver coming back from an outage would get one
+POST per backlogged doc at the same moment, each up to 12 MiB. The permit is held for the request only, not
+during a retry delay, so docs that are backing off do not starve the rest; a batch waiting for a permit
+still counts as its doc's in-flight batch, so per-doc ordering is unchanged. The shutdown flush uses the
+same cap.
 
 ### 4.6 Shutdown
 
 On cancellation the dispatcher closes open batches, attempts one delivery per doc with a 5 s budget, and exits.
 Doc persistence to S3 is not delayed by this.
+
+`serve` cancels on `SIGINT` and on `SIGTERM`; the latter is what `docker stop` and an ECS stop or scale-in
+send, so without it the flush (and the existing persist-on-shutdown) would never run in production. The
+handlers are installed before the server starts listening.
 
 ### 4.7 Configuration
 
@@ -250,10 +293,13 @@ Doc persistence to S3 is not delayed by this.
 | `Y_SWEET_UPDATE_WEBHOOK_SECRET` | HMAC secret. Required when the URL is set. |
 | `Y_SWEET_UPDATE_WEBHOOK_BATCH_MS` | Coalescing window per doc, default 1000. |
 | `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | Global budget for held update bytes, default 268435456. |
+| `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | Requests in flight at once across docs, default 16 (section 4.5). |
+| `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` | Extra CA certificates (PEM) to trust for the URL (section 4.4). |
 | `Y_SWEET_ATTRIBUTED_TOKENS` | `true` mints `AttributedDoc` tokens (section 3.1). Default off. Independent of the webhook. |
 
 Each is also a flag on `serve`: `--update-webhook-url`, `--update-webhook-secret`,
-`--update-webhook-batch-ms`, `--update-webhook-max-bytes`, `--attributed-tokens`.
+`--update-webhook-batch-ms`, `--update-webhook-max-bytes`, `--update-webhook-concurrency`,
+`--update-webhook-ca-file`, `--attributed-tokens`.
 
 ### 4.8 Logging
 
@@ -329,8 +375,10 @@ expect `actor: null` and must not read it as an error.
 4. Set the webhook URL and secret on staging. Watch the receiver's log line.
 5. Production follows once staging shows ordered, gap-free delivery under normal load.
 
-Rollback runs the same steps backwards. In particular, unset `Y_SWEET_ATTRIBUTED_TOKENS` and wait out the
-token lifetime (one hour) before rolling the image back, or the old binary rejects outstanding tokens.
+Rollback runs the same steps backwards. In particular: an older image rejects every outstanding attributed
+token with 401 until it expires, so first unset `Y_SWEET_ATTRIBUTED_TOKENS` and deploy that, then wait out
+the longest token lifetime in use (Dalus mints browser tokens for up to 3600 s), and only then roll the image
+back.
 
 ## 8. Testing
 
@@ -354,6 +402,16 @@ Fork, unit:
   verifies against it.
 - Dispatcher, using a local axum test server: retries on 500 and delivers on the next 200, in order; a 400
   drops the batch, gaps the doc and delivers the next batch; a batch past the retry age limit does the same.
+- Concurrency: many docs ready at once never have more requests open than the cap, still one per doc and
+  in order; the shutdown flush respects the cap too. `Retry-After` delays the retry, and is bounded by the
+  retry age.
+- Gap-tracking reset: a doc whose gap state was discarded and that is never written again gets no batch;
+  the only signal is the new `instance_id` on another doc's batch.
+- Through the real server: a websocket update carries the actor of the token it connected with (and none for
+  a plain token); `POST /d/:doc_id/update` with a read-only token is 403 and emits nothing; `serve` waits for
+  the webhook's final flush on cancellation; the real binary flushes on `SIGTERM` and exits cleanly.
+- Observer: loading a non-empty doc from the store emits nothing; a delete-only update emits an event, with
+  GC on and off.
 
 Fork, integration: the existing `tests/` suite runs unchanged against a server with no switches set.
 

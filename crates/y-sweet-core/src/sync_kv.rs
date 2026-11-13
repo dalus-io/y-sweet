@@ -202,7 +202,7 @@ impl<'a> yrs_kvstore::KVStore<'a> for SyncKv {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use crate::store::Result;
     use async_trait::async_trait;
@@ -211,7 +211,7 @@ mod test {
     use tokio;
 
     #[derive(Default, Clone)]
-    struct MemoryStore {
+    pub(crate) struct MemoryStore {
         data: Arc<DashMap<String, Vec<u8>>>,
     }
 

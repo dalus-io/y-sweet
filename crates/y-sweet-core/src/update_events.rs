@@ -341,4 +341,70 @@ mod tests {
         assert_eq!(events[0].actor, Some(bob));
         assert_eq!(replay(&events), "ab");
     }
+
+    #[tokio::test]
+    async fn loading_a_stored_doc_emits_nothing() {
+        use crate::{store::Store, sync_kv::test::MemoryStore};
+
+        let store = MemoryStore::default();
+        let store_handle = || Some(Arc::new(Box::new(store.clone()) as Box<dyn Store>));
+        {
+            let doc = DocWithSyncKv::new("doc123", store_handle(), || {}, false, None)
+                .await
+                .unwrap();
+            doc.apply_update(&Client::new(1).push("hello"), None)
+                .unwrap();
+            doc.sync_kv().persist().await.unwrap();
+        }
+
+        let events = Events::default();
+        let on_update: UpdateCallback = {
+            let events = events.clone();
+            Arc::new(move |event| events.lock().unwrap().push(event))
+        };
+        let doc = DocWithSyncKv::new("doc123", store_handle(), || {}, false, Some(on_update))
+            .await
+            .unwrap();
+        // The stored content is there, and loading it was not reported as an update.
+        assert_eq!(server_text(&doc), "hello");
+        assert!(events.lock().unwrap().is_empty());
+
+        // The observer is live for what comes after.
+        doc.apply_update(&Client::new(2).push("!"), None).unwrap();
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_only_update_emits_an_event_with_and_without_gc() {
+        for skip_gc in [false, true] {
+            let events = Events::default();
+            let on_update: UpdateCallback = {
+                let events = events.clone();
+                Arc::new(move |event| events.lock().unwrap().push(event))
+            };
+            let doc = DocWithSyncKv::new("doc123", None, || {}, skip_gc, Some(on_update))
+                .await
+                .unwrap();
+            let alice = actor("alice", "ui");
+            let client = Client::new(1);
+            doc.apply_update(&client.push("hello"), None).unwrap();
+
+            // An update that only deletes: no new blocks, just a delete set.
+            let delete = {
+                let text = client.doc.get_or_insert_text("t");
+                let mut txn = client.doc.transact_mut();
+                text.remove_range(&mut txn, 0, 5);
+                txn.encode_update_v1()
+            };
+            doc.apply_update(&delete, Some(&alice)).unwrap();
+
+            let events = events.lock().unwrap();
+            assert_eq!(events.len(), 2, "skip_gc={skip_gc}");
+            assert_eq!(events[1].actor, Some(alice), "skip_gc={skip_gc}");
+            assert_eq!(server_text(&doc), "", "skip_gc={skip_gc}");
+            // Replaying the emitted updates reproduces the deletion.
+            assert_eq!(replay(&events), "", "skip_gc={skip_gc}");
+            assert_eq!(replay(&events[..1]), "hello", "skip_gc={skip_gc}");
+        }
+    }
 }

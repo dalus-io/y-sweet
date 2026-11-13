@@ -94,6 +94,16 @@ enum ServSubcommand {
         /// Defaults to 268435456.
         #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES")]
         update_webhook_max_bytes: Option<String>,
+
+        /// How many update webhook requests may be in flight at once, across all docs.
+        /// Defaults to 16.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY")]
+        update_webhook_concurrency: Option<String>,
+
+        /// PEM file of extra CA certificates to trust for the update webhook URL, in addition
+        /// to the bundled public roots.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_CA_FILE")]
+        update_webhook_ca_file: Option<String>,
     },
 
     GenAuth {
@@ -208,6 +218,8 @@ fn update_webhook_config_from_opts(
     secret: &Option<String>,
     batch_ms: &Option<String>,
     max_bytes: &Option<String>,
+    concurrency: &Option<String>,
+    ca_file: &Option<String>,
 ) -> Result<Option<UpdateWebhookConfig>> {
     let Some(url) = non_empty(url) else {
         if non_empty(secret).is_some() {
@@ -238,7 +250,63 @@ fn update_webhook_config_from_opts(
     if let Some(max_bytes) = parse_number::<usize>("Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES", max_bytes)? {
         config.max_held_bytes = max_bytes;
     }
+    if let Some(concurrency) =
+        parse_number::<usize>("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY", concurrency)?
+    {
+        if concurrency == 0 {
+            anyhow::bail!("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY must be at least 1");
+        }
+        config.max_concurrent_deliveries = concurrency;
+    }
+    config.ca_file = non_empty(ca_file).map(PathBuf::from);
     Ok(Some(config))
+}
+
+/// Resolves when the process is asked to stop: on `SIGINT` (Ctrl+C) or, on Unix, `SIGTERM`
+/// (what `docker stop` and ECS send). Returns the signal's name.
+///
+/// The handlers are installed when this is called, not when the future is first polled, so a
+/// signal that arrives between the two is not missed (and does not kill the process outright).
+fn shutdown_signal() -> impl std::future::Future<Output = &'static str> {
+    #[cfg(unix)]
+    let mut handlers = {
+        use tokio::signal::unix::{signal, SignalKind};
+        let install = |kind: SignalKind, name: &str| {
+            signal(kind)
+                .map_err(|e| tracing::error!("Failed to install {name} handler: {e}"))
+                .ok()
+        };
+        (
+            install(SignalKind::interrupt(), "SIGINT"),
+            install(SignalKind::terminate(), "SIGTERM"),
+        )
+    };
+
+    async move {
+        #[cfg(unix)]
+        {
+            async fn recv(signal: &mut Option<tokio::signal::unix::Signal>) {
+                match signal {
+                    Some(signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                _ = recv(&mut handlers.0) => "SIGINT",
+                _ = recv(&mut handlers.1) => "SIGTERM",
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C signal handler");
+            "SIGINT"
+        }
+    }
 }
 
 fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
@@ -286,12 +354,19 @@ async fn main() -> Result<()> {
             update_webhook_secret,
             update_webhook_batch_ms,
             update_webhook_max_bytes,
+            update_webhook_concurrency,
+            update_webhook_ca_file,
         } => {
+            // Before anything else, so a stop request during startup is not lost either.
+            let shutdown = shutdown_signal();
+
             let update_webhook = update_webhook_config_from_opts(
                 update_webhook_url,
                 update_webhook_secret,
                 update_webhook_batch_ms,
                 update_webhook_max_bytes,
+                update_webhook_concurrency,
+                update_webhook_ca_file,
             )?;
 
             let auth = if let Some(auth) = auth {
@@ -352,6 +427,12 @@ async fn main() -> Result<()> {
                 update_webhook_max_bytes = update_webhook
                     .as_ref()
                     .map(|config| config.max_held_bytes as u64),
+                update_webhook_concurrency = update_webhook
+                    .as_ref()
+                    .map(|config| config.max_concurrent_deliveries as u64),
+                update_webhook_ca_file = update_webhook
+                    .as_ref()
+                    .map(|config| config.ca_file.is_some()),
                 "attributed updates configuration"
             );
             if *attributed_tokens && server_has_no_auth {
@@ -372,11 +453,11 @@ async fn main() -> Result<()> {
 
             tracing::info!("Listening on ws://{}", addr);
 
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install CTRL+C signal handler");
+            let signal = shutdown.await;
 
-            tracing::info!("Shutting down.");
+            // Cancelling stops the listener and every doc worker; `serve` returns once docs are
+            // persisted and the update webhook has made its final flush.
+            tracing::info!(signal, "Shutting down.");
             token.cancel();
 
             handle.await?;
@@ -485,26 +566,8 @@ async fn main() -> Result<()> {
 
             tracing::info!("Listening on http://{}", addr);
 
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Received Ctrl+C, shutting down.");
-                },
-                _ = async {
-                    #[cfg(unix)]
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                        Ok(mut signal) => signal.recv().await,
-                        Err(e) => {
-                            tracing::error!("Failed to install SIGTERM handler: {}", e);
-                            std::future::pending::<Option<()>>().await
-                        }
-                    }
-
-                    #[cfg(not(unix))]
-                    std::future::pending::<Option<()>>().await
-                } => {
-                    tracing::info!("Received SIGTERM, shutting down.");
-                }
-            }
+            let signal = shutdown_signal().await;
+            tracing::info!(signal, "Received {signal}, shutting down.");
 
             cancellation_token.cancel();
             tracing::info!("Server shut down.");
@@ -556,18 +619,25 @@ mod tests {
 
     #[test]
     fn webhook_is_off_without_a_url() {
-        assert!(update_webhook_config_from_opts(&None, &None, &None, &None)
-            .unwrap()
-            .is_none());
-        // Variables passed through empty count as unset.
         assert!(
-            update_webhook_config_from_opts(&opt(""), &opt(""), &opt(""), &opt(""))
+            update_webhook_config_from_opts(&None, &None, &None, &None, &None, &None)
                 .unwrap()
                 .is_none()
         );
+        // Variables passed through empty count as unset.
+        assert!(update_webhook_config_from_opts(
+            &opt(""),
+            &opt(""),
+            &opt(""),
+            &opt(""),
+            &opt(""),
+            &opt("")
+        )
+        .unwrap()
+        .is_none());
         // A secret alone does not enable anything.
         assert!(
-            update_webhook_config_from_opts(&None, &opt("secret"), &None, &None)
+            update_webhook_config_from_opts(&None, &opt("secret"), &None, &None, &None, &None)
                 .unwrap()
                 .is_none()
         );
@@ -576,29 +646,44 @@ mod tests {
     #[test]
     fn webhook_defaults_and_overrides() {
         let url = opt("https://app.example.com/api/internal/y-sweet/updates");
-        let config = update_webhook_config_from_opts(&url, &opt("secret"), &None, &opt(""))
-            .unwrap()
-            .unwrap();
+        let config =
+            update_webhook_config_from_opts(&url, &opt("secret"), &None, &opt(""), &None, &None)
+                .unwrap()
+                .unwrap();
         assert_eq!(config.url.host_str(), Some("app.example.com"));
         assert_eq!(config.secret, "secret");
         assert_eq!(config.batch_window, std::time::Duration::from_millis(1000));
         assert_eq!(config.max_held_bytes, 268_435_456);
+        assert_eq!(config.max_concurrent_deliveries, 16);
+        assert_eq!(config.ca_file, None);
 
-        let config =
-            update_webhook_config_from_opts(&url, &opt("secret"), &opt("250"), &opt("1048576"))
-                .unwrap()
-                .unwrap();
+        let config = update_webhook_config_from_opts(
+            &url,
+            &opt("secret"),
+            &opt("250"),
+            &opt("1048576"),
+            &opt("4"),
+            &opt("/etc/ssl/private-ca.pem"),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(config.batch_window, std::time::Duration::from_millis(250));
         assert_eq!(config.max_held_bytes, 1_048_576);
+        assert_eq!(config.max_concurrent_deliveries, 4);
+        assert_eq!(
+            config.ca_file,
+            Some(PathBuf::from("/etc/ssl/private-ca.pem"))
+        );
     }
 
     #[test]
     fn webhook_secret_is_used_exactly_as_given() {
         let url = opt("https://app.example.com/hook");
         for secret in [" padded ", "trailing-newline\n", "\tin ner "] {
-            let config = update_webhook_config_from_opts(&url, &opt(secret), &None, &None)
-                .unwrap()
-                .unwrap();
+            let config =
+                update_webhook_config_from_opts(&url, &opt(secret), &None, &None, &None, &None)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(config.secret, secret);
             // And that exact value is the HMAC key.
             assert_eq!(
@@ -621,7 +706,7 @@ mod tests {
             batch_ms: &Option<String>,
             max_bytes: &Option<String>,
         ) -> String {
-            update_webhook_config_from_opts(url, secret, batch_ms, max_bytes)
+            update_webhook_config_from_opts(url, secret, batch_ms, max_bytes, &None, &None)
                 .err()
                 .expect("expected an error")
                 .to_string()
@@ -632,6 +717,20 @@ mod tests {
         assert!(error(&url, &opt("s"), &opt("soon"), &None).contains("BATCH_MS"));
         assert!(error(&url, &opt("s"), &None, &opt("-1")).contains("MAX_BYTES"));
         assert!(error(&opt("ftp://example.com/x"), &opt("s"), &None, &None).contains("http"));
+        for concurrency in ["0", "-1", "many"] {
+            let message = update_webhook_config_from_opts(
+                &url,
+                &opt("s"),
+                &None,
+                &None,
+                &opt(concurrency),
+                &None,
+            )
+            .err()
+            .expect("expected an error")
+            .to_string();
+            assert!(message.contains("CONCURRENCY"), "{message}");
+        }
 
         // The message does not repeat the URL, which may carry credentials.
         let message = error(
