@@ -300,14 +300,21 @@ ordered, with a budget per stage:
 
 1. The cancelled token stops the listener and tells websockets to close.
 2. In-flight HTTP requests finish (axum's graceful shutdown) and websocket tasks, now tracked, end. Then a
-   write gate closes: every write holds it for reading while it applies, so closing it waits for writes in
-   progress and refuses later ones (`503`, or the websocket message is dropped unapplied). Budget 5 s.
+   write gate closes, in two steps: admission stops at once and unconditionally (later writes get `503`, or
+   the websocket message is dropped unapplied), even if the requests above overran the budget; then it waits,
+   bounded, for writes already admitted. A write is admitted only around applying the update, never across
+   loading its doc or store I/O, so that wait is short. Budget 5 s.
 3. The persistence and GC workers, on their own token, stop; each does a final save. Budget 10 s.
 4. The dispatcher, on its own token, flushes. Budget 7 s (its internal budget is 5 s).
 
 At most about 22 s in all, inside ECS's default 30 s `stopTimeout` (the Dalus y-sweet task definition sets
 none). A stage that overruns is logged with its name and the next one starts. The dirty callback ignores a
 closed or full channel instead of panicking.
+
+One more upstream race undermined the final save: `SyncKv::persist` cleared the doc's dirty flag after the
+store write returned, so an edit applied while a checkpoint was being written lost its flag and the final
+save skipped it. The flag is now cleared atomically with taking the snapshot (under the data lock every
+write holds while marking the doc dirty) and set again if the store write fails.
 
 ### 4.7 Configuration
 

@@ -318,7 +318,7 @@ budget:
 | Stage | What happens | Budget |
 | --- | --- | --- |
 | 1 | Stop accepting connections; tell every websocket to close. | (immediate) |
-| 2 | Let in-flight HTTP requests finish and websockets close, then close the write gate: from here on a write is refused (`503` on HTTP; a websocket is dropped without applying the message, and the client resends on reconnect). No write is acknowledged after this point. | 5 s |
+| 2 | Let in-flight HTTP requests finish and websockets close, then close the write gate, whether or not they did: from here on a write is refused (`503` on HTTP; a websocket is dropped without applying the message, and the client resends on reconnect), including one that was still loading its doc or receiving its body. Writes already applying finish first. No write is acknowledged after this point. | 5 s |
 | 3 | Stop every doc's persistence worker; each makes a final save to the store. | 10 s |
 | 4 | Stop the update webhook; it flushes everything applied above. | 7 s (the flush itself has 5 s) |
 
