@@ -111,11 +111,11 @@ impl SyncKv {
         {
             let mut txn = doc.transact_mut();
             for bytes in state.iter().chain(updates.iter().map(|(_, u)| u)) {
-                let update = Update::decode_v1(bytes).map_err(|e| {
-                    anyhow::anyhow!("{e}").context(format!(
+                let update = Update::decode_v1(bytes).with_context(|| {
+                    format!(
                         "Failed to decode while compacting {} pending updates",
                         updates.len()
-                    ))
+                    )
                 })?;
                 txn.apply_update(update);
             }
@@ -479,8 +479,9 @@ mod test {
         assert_eq!(items(&reload(&store).await), expected);
     }
 
-    #[tokio::test]
-    async fn edit_during_save_is_kept_by_next_save() {
+    /// Saves "a" through a slow store while "b" is edited in mid-save, then runs `before_next_save`
+    /// and the next save as the persistence worker does, and returns the items read back.
+    async fn edit_during_save(before_next_save: impl FnOnce(&SyncKv)) -> Vec<String> {
         let store = MemoryStore {
             set_delay: Duration::from_millis(300),
             ..Default::default()
@@ -495,34 +496,20 @@ mod test {
         });
         saved.unwrap();
 
-        // Next save, as the persistence worker runs it.
+        before_next_save(&sync_kv);
         sync_kv.compact(crate::doc_connection::DOC_NAME).unwrap();
         sync_kv.persist().await.unwrap();
+        items(&reload(&store).await)
+    }
 
-        assert_eq!(items(&reload(&store).await), vec!["a", "b"]);
+    #[tokio::test]
+    async fn edit_during_save_is_kept_by_next_save() {
+        assert_eq!(edit_during_save(|_| ()).await, vec!["a", "b"]);
     }
 
     #[tokio::test]
     async fn edit_during_save_is_kept_by_final_save_after_shutdown() {
-        let store = MemoryStore {
-            set_delay: Duration::from_millis(300),
-            ..Default::default()
-        };
-        let doc = reload(&store).await;
-        let sync_kv = doc.sync_kv();
-
-        push_item(&doc, "a");
-        let (saved, _) = tokio::join!(sync_kv.persist(), async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            push_item(&doc, "b");
-        });
-        saved.unwrap();
-
         // The doc is unloaded before the next tick; the final save still runs.
-        sync_kv.shutdown();
-        sync_kv.compact(crate::doc_connection::DOC_NAME).unwrap();
-        sync_kv.persist().await.unwrap();
-
-        assert_eq!(items(&reload(&store).await), vec!["a", "b"]);
+        assert_eq!(edit_during_save(SyncKv::shutdown).await, vec!["a", "b"]);
     }
 }
