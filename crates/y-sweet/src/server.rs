@@ -21,6 +21,8 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    future::{Future, IntoFuture},
+    pin::Pin,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -54,6 +56,40 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 // If we haven't received a pong in the last 40 seconds, we close the connection.
 // All modern browsers will respond to websocket pings with a pong message.
 const PONG_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// How long each shutdown stage may take (see [Server::serve]). With the defaults the whole
+/// shutdown takes at most about 22 s, inside the 30 s an ECS task gets between `SIGTERM` and
+/// `SIGKILL` when its definition sets no `stopTimeout`.
+#[derive(Clone, Copy, Debug)]
+pub struct ShutdownBudgets {
+    /// Finishing in-flight HTTP requests, closing websockets and closing the write gate.
+    pub connections: Duration,
+    /// The final save of every loaded doc.
+    pub persist: Duration,
+    /// The update webhook's final flush. Its own budget (5 s) applies inside; this bounds the
+    /// stage as a whole.
+    pub webhook: Duration,
+}
+
+impl Default for ShutdownBudgets {
+    fn default() -> Self {
+        Self {
+            connections: Duration::from_secs(5),
+            persist: Duration::from_secs(10),
+            webhook: Duration::from_secs(7),
+        }
+    }
+}
+
+/// The dirty callback of a doc: wakes its persistence worker. It runs inside the doc's update
+/// observer, under the doc write lock, so it must never block or panic. Once the worker has
+/// exited (shutdown, or the doc was collected) the channel is closed; there is no one left to
+/// wake, so the notification is dropped. A full channel means a wake-up is already pending.
+fn dirty_callback(send: tokio::sync::mpsc::Sender<()>) -> impl Fn() + Send + Sync + 'static {
+    move || {
+        let _ = send.try_send(());
+    }
+}
 
 fn current_time_epoch_millis() -> u64 {
     let now = std::time::SystemTime::now();
@@ -103,6 +139,20 @@ pub struct Server {
     attributed_tokens: bool,
     /// Receives every update applied to a doc when the update webhook is configured.
     on_update: Option<UpdateCallback>,
+    /// Websocket connections, which outlive the HTTP request that upgraded them, so the HTTP
+    /// server's graceful shutdown does not wait for them.
+    connection_tracker: TaskTracker,
+    /// Every write to a doc holds this for reading while it applies, and checks that it is
+    /// still `true`. Shutdown sets it to `false`, which waits for writes in progress and
+    /// refuses later ones, so nothing is applied after the final save.
+    write_gate: Arc<tokio::sync::RwLock<bool>>,
+    /// Stops the persistence and GC workers. Cancelled by `serve` only once no write can be
+    /// applied any more, not by `cancellation_token`.
+    doc_workers_token: CancellationToken,
+    /// The update webhook dispatcher, stopped last so it carries every update applied.
+    webhook_tracker: TaskTracker,
+    webhook_token: CancellationToken,
+    shutdown_budgets: ShutdownBudgets,
 }
 
 impl Server {
@@ -129,7 +179,18 @@ impl Server {
             skip_gc,
             attributed_tokens: false,
             on_update: None,
+            connection_tracker: TaskTracker::new(),
+            write_gate: Arc::new(tokio::sync::RwLock::new(true)),
+            doc_workers_token: CancellationToken::new(),
+            webhook_tracker: TaskTracker::new(),
+            webhook_token: CancellationToken::new(),
+            shutdown_budgets: ShutdownBudgets::default(),
         })
+    }
+
+    pub fn with_shutdown_budgets(mut self, shutdown_budgets: ShutdownBudgets) -> Self {
+        self.shutdown_budgets = shutdown_budgets;
+        self
     }
 
     /// Sets whether `POST /doc/:doc_id/auth` mints attributed tokens when the request names a
@@ -141,13 +202,11 @@ impl Server {
 
     /// Delivers every update applied to a doc loaded from now on to the configured webhook.
     ///
-    /// Spawns the dispatcher, so it must be called from within a Tokio runtime. The dispatcher
-    /// stops when the server's cancellation token is cancelled, and `serve` waits for its final
-    /// flush.
+    /// Spawns the dispatcher, so it must be called from within a Tokio runtime. `serve` stops
+    /// it as the last shutdown stage and waits for its final flush.
     pub fn with_update_webhook(mut self, config: UpdateWebhookConfig) -> Result<Self> {
-        let (on_update, dispatcher) =
-            update_webhook::start(config, self.cancellation_token.clone())?;
-        self.doc_worker_tracker
+        let (on_update, dispatcher) = update_webhook::start(config, self.webhook_token.clone())?;
+        self.webhook_tracker
             .spawn(dispatcher.instrument(span!(Level::INFO, "update_webhook")));
         self.on_update = Some(on_update);
         Ok(self)
@@ -180,9 +239,7 @@ impl Server {
         let dwskv = DocWithSyncKv::new(
             doc_id,
             self.store.clone(),
-            move || {
-                send.try_send(()).unwrap();
-            },
+            dirty_callback(send),
             self.skip_gc,
             self.on_update.clone(),
         )
@@ -198,7 +255,8 @@ impl Server {
             let sync_kv = dwskv.sync_kv();
             let checkpoint_freq = self.checkpoint_freq;
             let doc_id = doc_id.to_string();
-            let cancellation_token = self.cancellation_token.clone();
+            // Not the server's cancellation token: these stop only once nothing can write.
+            let cancellation_token = self.doc_workers_token.clone();
 
             // Spawn a task to save the document to the store when it changes.
             self.doc_worker_tracker.spawn(
@@ -422,14 +480,104 @@ impl Server {
             app.layer(middleware::from_fn(Self::redact_error_middleware))
         };
 
-        axum::serve(listener, app.into_make_service())
-            .with_graceful_shutdown(async move { token.cancelled().await })
-            .await?;
-
-        self.doc_worker_tracker.close();
-        self.doc_worker_tracker.wait().await;
-
+        let serve = axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(token.clone().cancelled_owned())
+            .into_future();
+        tokio::pin!(serve);
+        // Runs until the token is cancelled (or the server fails).
+        let mut served = tokio::select! {
+            result = &mut serve => Some(result),
+            _ = token.cancelled() => None,
+        };
+        if let Some(Err(err)) = served.take() {
+            self.shut_down(None).await;
+            return Err(err.into());
+        }
+        self.shut_down(Some(serve)).await;
         Ok(())
+    }
+
+    /// Stops the server in an order that loses no acknowledged write, each stage bounded by
+    /// [ShutdownBudgets]:
+    ///
+    /// 1. (Already done by the cancelled token.) Stop accepting connections and tell every
+    ///    websocket to close.
+    /// 2. Let in-flight HTTP requests finish and websockets close, then close the write gate:
+    ///    from here on a write is refused (`503`, or the websocket is dropped), never applied.
+    /// 3. Stop the persistence workers; each makes a final save of its doc.
+    /// 4. Stop the update webhook, which flushes what the stages above produced.
+    ///
+    /// A stage that does not finish in its budget is logged and the next one starts anyway.
+    async fn shut_down(
+        &self,
+        http: Option<Pin<&mut (dyn Future<Output = std::io::Result<()>> + Send)>>,
+    ) {
+        let started = std::time::Instant::now();
+        let budgets = self.shutdown_budgets;
+        tracing::info!("shutdown started");
+        let stage_timed_out = |stage: &'static str, budget: Duration| {
+            tracing::warn!(
+                stage,
+                budget_ms = budget.as_millis() as u64,
+                "shutdown stage did not finish in time"
+            );
+        };
+
+        // Stage 2. One budget for the whole stage.
+        let deadline = tokio::time::Instant::now() + budgets.connections;
+        if let Some(http) = http {
+            match tokio::time::timeout_at(deadline, http).await {
+                Ok(Err(err)) => tracing::error!(?err, "HTTP server failed while shutting down"),
+                Ok(Ok(())) => {}
+                Err(_) => stage_timed_out("http", budgets.connections),
+            }
+        }
+        self.connection_tracker.close();
+        if tokio::time::timeout_at(deadline, self.connection_tracker.wait())
+            .await
+            .is_err()
+        {
+            stage_timed_out("websockets", budgets.connections);
+        }
+        let gate = self.write_gate.clone();
+        if tokio::time::timeout_at(deadline, async move { *gate.write().await = false })
+            .await
+            .is_err()
+        {
+            // A write still in progress may land after the final save below.
+            stage_timed_out("write_gate", budgets.connections);
+        }
+
+        // Stage 3.
+        self.doc_workers_token.cancel();
+        self.doc_worker_tracker.close();
+        if tokio::time::timeout(budgets.persist, self.doc_worker_tracker.wait())
+            .await
+            .is_err()
+        {
+            // Docs whose save had not completed lose what was not saved before.
+            tracing::warn!(
+                stage = "persist",
+                budget_ms = budgets.persist.as_millis() as u64,
+                workers_left = self.doc_worker_tracker.len(),
+                "shutdown stage did not finish in time"
+            );
+        }
+
+        // Stage 4.
+        self.webhook_token.cancel();
+        self.webhook_tracker.close();
+        if tokio::time::timeout(budgets.webhook, self.webhook_tracker.wait())
+            .await
+            .is_err()
+        {
+            stage_timed_out("webhook", budgets.webhook);
+        }
+
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "shutdown finished"
+        );
     }
 
     pub async fn serve(self, listener: TcpListener, redact_errors: bool) -> Result<()> {
@@ -541,15 +689,25 @@ async fn update_doc_inner(
         return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
     }
 
+    // Held until the update is applied, so shutdown's final save comes after it. Taken before
+    // the doc is fetched: the doc reference must not be held across an await.
+    let gate = server_state.write_gate.read().await;
+    if !*gate {
+        return Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            anyhow!("The server is shutting down."),
+        ));
+    }
     let dwskv = server_state
         .get_or_create_doc(&doc_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
     if let Err(err) = dwskv.apply_update(&body, access.actor.as_ref()) {
         tracing::error!(?err, "Failed to apply update");
         return Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, err));
     }
+    drop(dwskv);
+    drop(gate);
 
     Ok(StatusCode::OK.into_response())
 }
@@ -591,9 +749,18 @@ async fn handle_socket_upgrade(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let awareness = dwskv.awareness();
     let cancellation_token = server_state.cancellation_token.clone();
+    let write_gate = server_state.write_gate.clone();
+    let connection_tracker = server_state.connection_tracker.clone();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, doc_id, awareness, access, cancellation_token)
+        connection_tracker.track_future(handle_socket(
+            socket,
+            doc_id,
+            awareness,
+            access,
+            cancellation_token,
+            write_gate,
+        ))
     }))
 }
 
@@ -656,6 +823,7 @@ async fn handle_socket(
     awareness: Arc<RwLock<Awareness>>,
     access: DocAccess,
     cancellation_token: CancellationToken,
+    write_gate: Arc<tokio::sync::RwLock<bool>>,
 ) {
     let DocAccess {
         authorization,
@@ -730,9 +898,17 @@ async fn handle_socket(
                     }
                 };
 
+                // Held while the message is applied, so shutdown's final save comes after it.
+                // Once shutdown has closed the gate, the message is not applied and the
+                // connection ends; the client keeps the edit and sends it again on reconnect.
+                let gate = write_gate.read().await;
+                if !*gate {
+                    break;
+                }
                 if let Err(e) = connection.send(&msg).await {
                     tracing::warn!(?e, "Error handling message");
                 }
+                drop(gate);
             }
             _ = cancellation_token.cancelled() => {
                 tracing::debug!("Closing doc connection due to server cancel...");
@@ -1472,5 +1648,304 @@ mod test {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0]["doc_id"], DOC_ID);
         assert_eq!(received[0]["events"].as_array().unwrap().len(), 1);
+    }
+
+    // --- Shutdown ---------------------------------------------------------------------------
+
+    /// An in-memory store whose writes can be made to hang.
+    #[derive(Default, Clone)]
+    struct TestStore {
+        data: Arc<DashMap<String, Vec<u8>>>,
+        slow: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Store for TestStore {
+        async fn init(&self) -> y_sweet_core::store::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> y_sweet_core::store::Result<Option<Vec<u8>>> {
+            Ok(self.data.get(key).map(|v| v.clone()))
+        }
+        async fn set(&self, key: &str, value: Vec<u8>) -> y_sweet_core::store::Result<()> {
+            if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+            self.data.insert(key.to_string(), value);
+            Ok(())
+        }
+        async fn remove(&self, key: &str) -> y_sweet_core::store::Result<()> {
+            self.data.remove(key);
+            Ok(())
+        }
+        async fn exists(&self, key: &str) -> y_sweet_core::store::Result<bool> {
+            Ok(self.data.contains_key(key))
+        }
+    }
+
+    async fn server_with_store(store: &TestStore, token: &CancellationToken) -> Server {
+        let server = Server::new(
+            Some(Box::new(store.clone())),
+            // Long enough that only shutdown saves.
+            Duration::from_secs(3600),
+            None,
+            None,
+            token.clone(),
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        server.load_doc(DOC_ID).await.unwrap();
+        server
+    }
+
+    /// An update that sets key `id` in the map `m`, from a client of its own, so that updates
+    /// are independent of each other.
+    fn map_edit(id: u64) -> Vec<u8> {
+        use yrs::{Map, Transact};
+        let client = yrs::Doc::with_client_id(id);
+        let map = client.get_or_insert_map("m");
+        let mut txn = client.transact_mut();
+        map.insert(&mut txn, id.to_string(), true);
+        txn.encode_update_v1()
+    }
+
+    /// The keys of map `m` in the doc as the store holds it.
+    async fn stored_keys(store: &TestStore) -> std::collections::HashSet<String> {
+        use yrs::{Map, ReadTxn, Transact};
+        let doc = DocWithSyncKv::new(
+            DOC_ID,
+            Some(Arc::new(Box::new(store.clone()) as Box<dyn Store>)),
+            || {},
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let awareness = doc.awareness();
+        let awareness = awareness.read().unwrap();
+        let txn = awareness.doc().transact();
+        match txn.get_map("m") {
+            Some(map) => map.keys(&txn).map(str::to_string).collect(),
+            None => Default::default(),
+        }
+    }
+
+    #[test]
+    fn dirty_callback_does_not_panic_on_a_full_or_closed_channel() {
+        let (send, recv) = tokio::sync::mpsc::channel(1);
+        let notify = dirty_callback(send);
+        notify();
+        notify(); // full
+        drop(recv);
+        notify(); // closed
+    }
+
+    #[tokio::test]
+    async fn an_edit_after_the_persistence_worker_stopped_does_not_panic() {
+        let token = CancellationToken::new();
+        let server = server_with_store(&TestStore::default(), &token).await;
+
+        // The doc's persistence worker exits, closing its channel, as at shutdown.
+        server.doc_workers_token.cancel();
+        server.doc_worker_tracker.close();
+        server.doc_worker_tracker.wait().await;
+
+        // The first edit marks the doc dirty and notifies the gone worker, under the doc lock.
+        // That used to panic and poison the lock.
+        let doc = server.docs.get(DOC_ID).unwrap();
+        doc.apply_update(&map_edit(1), None).unwrap();
+        doc.apply_update(&map_edit(2), None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_update_in_flight_when_shutdown_starts_is_saved() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // An update whose body is still arriving when shutdown starts. Before the fix, the
+        // doc's persistence worker made its final save right away and exited; the update was
+        // then applied and acknowledged, and never saved (or the dirty notification to the
+        // gone worker panicked). It must be acknowledged and saved, or refused.
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        let body = map_edit(42);
+        let (first, rest) = body.split_at(body.len() / 2);
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(
+                format!(
+                    "POST /d/{DOC_ID}/update HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(first).await.unwrap();
+        // Let the server take the request in.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        token.cancel();
+        // Give shutdown every chance to run ahead of the request.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        socket.write_all(rest).await.unwrap();
+
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        tokio::time::timeout(Duration::from_secs(30), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+
+        let stored = stored_keys(&store).await;
+        if response.starts_with("HTTP/1.1 200") {
+            assert!(stored.contains("42"), "acknowledged but not saved");
+        } else {
+            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        }
+        // With the in-flight request allowed to finish, it is in fact acknowledged.
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// A stress version of the above: writers posting continuously through the shutdown.
+    #[tokio::test]
+    async fn edits_racing_shutdown_are_persisted_or_rejected() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/d/{DOC_ID}/update",
+            listener.local_addr().unwrap()
+        );
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        // Writers that keep posting through the shutdown, each update from its own client.
+        let next_id = Arc::new(AtomicU64::new(1));
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let (url, next_id) = (url.clone(), next_id.clone());
+                tokio::spawn(async move {
+                    let http = reqwest::Client::new();
+                    let mut outcomes = Vec::new();
+                    loop {
+                        let id = next_id.fetch_add(1, Ordering::SeqCst);
+                        let status = http
+                            .post(&url)
+                            .body(map_edit(id))
+                            .send()
+                            .await
+                            .map(|r| r.status().as_u16())
+                            .ok();
+                        outcomes.push((id, status));
+                        if status != Some(200) {
+                            return outcomes;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(30), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+
+        let mut acked = Vec::new();
+        for writer in writers {
+            let outcomes = tokio::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .expect("a writer kept going after shutdown")
+                .unwrap();
+            for (id, status) in outcomes {
+                match status {
+                    Some(200) => acked.push(id),
+                    // Refused at the write gate, or no connection: rejected, not acknowledged.
+                    Some(503) | None => {}
+                    Some(other) => panic!("unexpected status {other}"),
+                }
+            }
+        }
+        assert!(!acked.is_empty());
+
+        let stored = stored_keys(&store).await;
+        let lost: Vec<_> = acked
+            .iter()
+            .filter(|id| !stored.contains(&id.to_string()))
+            .collect();
+        assert!(lost.is_empty(), "acknowledged but not persisted: {lost:?}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_store_does_not_push_shutdown_past_its_budget() {
+        let store = TestStore::default();
+        store.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let token = CancellationToken::new();
+        let budgets = ShutdownBudgets {
+            connections: Duration::from_secs(1),
+            persist: Duration::from_millis(300),
+            webhook: Duration::from_secs(1),
+        };
+        let server = server_with_store(&store, &token)
+            .await
+            .with_shutdown_budgets(budgets);
+        // A pending edit, so the final save has something to write, and hangs on it.
+        server
+            .docs
+            .get(DOC_ID)
+            .unwrap()
+            .apply_update(&map_edit(1), None)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+        let took = started.elapsed();
+        assert!(took >= budgets.persist, "{took:?}");
+        assert!(took < Duration::from_secs(3), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_saves_pending_edits_before_returning() {
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token).await;
+        server
+            .docs
+            .get(DOC_ID)
+            .unwrap()
+            .apply_update(&map_edit(7), None)
+            .unwrap();
+        // The checkpoint interval is an hour, so nothing has been saved yet.
+        assert!(stored_keys(&store).await.is_empty());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+        token.cancel();
+        serving.await.unwrap().unwrap();
+
+        assert!(stored_keys(&store).await.contains("7"));
     }
 }

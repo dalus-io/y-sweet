@@ -27,7 +27,9 @@ Goals:
   one respect: it lives in memory, and when it is lost the only trace is a new `instance_id`
   (section 4.3 states what the receiver must do about that).
 - Existing tokens keep working through the deploy. The feature is inert unless configured: no new token
-  format is minted and no observer runs until their switches are set.
+  format is minted and no observer runs until their switches are set. "Inert" is not "identical to
+  upstream": the operator doc lists the remaining differences (attributed tokens verify, graceful and
+  ordered shutdown on `SIGTERM`, new log lines, new flags).
 
 Non-goals:
 
@@ -72,8 +74,9 @@ step that must precede rolling back the binary.
 ### 3.2 Mint endpoint
 
 `POST /doc/:doc_id/auth` honours the `user_id` it already accepts and gains `writer: Option<String>`.
-A `writer` longer than 64 bytes or a `user_id` longer than 128 bytes is rejected with 400, whether or not
-the switch is on. The token travels in the websocket query string, so both stay small. The `ClientToken`
+A `writer` longer than 64 bytes or a `user_id` longer than 128 bytes is rejected with 400 when the switch is
+on. With the switch off the fields are ignored, as upstream ignores them, and the request succeeds; a warning
+with the lengths (never the values) flags the request that would start failing once the switch is turned on. The token travels in the websocket query string, so both stay small. The `ClientToken`
 response is unchanged, so no SDK change is needed.
 
 ### 3.3 Verification
@@ -155,8 +158,9 @@ The dispatcher owns one state per doc:
   batch and travels alone in its own;
 - a queue of closed batches awaiting delivery, bounded at 64. Overflow drops the oldest queued batch and
   sets the gap flag;
-- a gap flag, carried as `gap_before: true` on the next batch delivered for the doc and cleared when that
-  batch is acked. If the flag is set and the doc has nothing open or queued when the window elapses, an
+- a gap flag, carried as `gap_before: true` on the first batch whose delivery starts after the loss (the
+  batch carrying the doc's next updates, if any) and cleared when that batch is acked; if it is not acked
+  the flag passes to the next batch. If the flag is set and the doc has nothing open or queued when the window elapses, an
   empty batch (`events: []`) is queued so the receiver learns of the gap without waiting for the next edit;
 - the in-flight delivery, if any. Batches for one doc are delivered strictly in order.
 
@@ -288,6 +292,23 @@ send, so without it the flush (and the existing persist-on-shutdown) would never
 handlers are installed before startup and startup races them, so a signal during a hung store init exits
 cleanly instead of being held until init returns.
 
+Upstream cancelled everything at once from one token: each doc's persistence worker saved and exited while
+in-flight HTTP requests and websocket messages were still being applied. An edit applied after that save was
+acknowledged and never stored, and its dirty notification `unwrap`ped a send on the closed channel, panicking
+under the doc lock. With `SIGTERM` routing every deploy and scale-in through this path, the shutdown is now
+ordered, with a budget per stage:
+
+1. The cancelled token stops the listener and tells websockets to close.
+2. In-flight HTTP requests finish (axum's graceful shutdown) and websocket tasks, now tracked, end. Then a
+   write gate closes: every write holds it for reading while it applies, so closing it waits for writes in
+   progress and refuses later ones (`503`, or the websocket message is dropped unapplied). Budget 5 s.
+3. The persistence and GC workers, on their own token, stop; each does a final save. Budget 10 s.
+4. The dispatcher, on its own token, flushes. Budget 7 s (its internal budget is 5 s).
+
+At most about 22 s in all, inside ECS's default 30 s `stopTimeout` (the Dalus y-sweet task definition sets
+none). A stage that overruns is logged with its name and the next one starts. The dirty callback ignores a
+closed or full channel instead of panicking.
+
 ### 4.7 Configuration
 
 | Variable | Meaning |
@@ -298,7 +319,7 @@ cleanly instead of being held until init returns.
 | `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | Global budget for held update bytes, default 268435456. |
 | `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | Requests in flight at once across docs, default 16 (section 4.5). |
 | `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` | Extra CA certificates (PEM) to trust for the URL (section 4.4). |
-| `Y_SWEET_ATTRIBUTED_TOKENS` | `true` mints `AttributedDoc` tokens (section 3.1). Default off. Independent of the webhook. |
+| `Y_SWEET_ATTRIBUTED_TOKENS` | `true` mints `AttributedDoc` tokens (section 3.1). Default off. Independent of the webhook. As a flag, `--attributed-tokens <true\|false>` reads the next argument as its value, so `--attributed-tokens false` is off and a path there is an error. |
 
 Each is also a flag on `serve`: `--update-webhook-url`, `--update-webhook-secret`,
 `--update-webhook-batch-ms`, `--update-webhook-max-bytes`, `--update-webhook-concurrency`,
@@ -410,6 +431,15 @@ Fork, unit:
   retry age.
 - Gap-tracking reset: a doc whose gap state was discarded and that is never written again gets no batch;
   the only signal is the new `instance_id` on another doc's batch.
+- Shutdown: an update whose body is still arriving when shutdown starts is acknowledged and saved (this
+  fails against the old ordering); writers posting through a shutdown never get an acknowledged-but-unsaved
+  update; pending edits are saved before `serve` returns, and by the real binary on `SIGTERM` with a
+  filesystem store; an edit after the persistence worker stopped does not panic; a store whose writes hang
+  does not push shutdown past its budget.
+- Mint: oversize actor fields get 400 with the switch on and a plain token with it off.
+- CLI: `--attributed-tokens false` is off and never a store path; `--attributed-tokens /data` is an error.
+- TLS: a receiver on a certificate from a private CA fails the handshake with the bundled roots only and is
+  delivered to once `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` names the CA.
 - Through the real server: a websocket update carries the actor of the token it connected with (and none for
   a plain token); `POST /d/:doc_id/update` with a read-only token is 403 and emits nothing; `serve` waits for
   the webhook's final flush on cancellation; the real binary flushes on `SIGTERM` and exits cleanly.

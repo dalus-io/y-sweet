@@ -191,3 +191,100 @@ async fn sigterm_during_a_hung_store_init_exits_promptly() {
     };
     assert!(status.success(), "{status:?}");
 }
+
+#[tokio::test]
+async fn sigterm_saves_pending_edits_to_the_store() {
+    use std::sync::Arc;
+    use y_sweet::stores::filesystem::FileSystemStore;
+    use y_sweet_core::{doc_sync::DocWithSyncKv, store::Store};
+    use yrs::{GetString, ReadTxn};
+
+    let dir = std::env::temp_dir().join(format!("y-sweet-sigterm-{}", nanoid::nanoid!()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_y-sweet"))
+        .args([
+            "serve",
+            dir.to_str().unwrap(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--prod",
+            // Far longer than the test: only the shutdown can save the edit.
+            "--checkpoint-freq-seconds",
+            "3600",
+        ])
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let base = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) = http.get(format!("{base}/ready")).send().await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "server never became ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let update = {
+        let doc = yrs::Doc::with_client_id(1);
+        let text = doc.get_or_insert_text("t");
+        let mut txn = doc.transact_mut();
+        text.push(&mut txn, "saved on SIGTERM");
+        txn.encode_update_v1()
+    };
+    let response = http
+        .post(format!("{base}/d/doc1/update"))
+        .body(update)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let killed = Command::new("sh")
+        .args(["-c", &format!("kill -TERM {}", child.id())])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("server did not exit after SIGTERM");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(status.success(), "{status:?}");
+
+    // Read the doc back from the directory the server used.
+    let store: Box<dyn Store> = Box::new(FileSystemStore::new(dir.clone()).unwrap());
+    let doc = DocWithSyncKv::new("doc1", Some(Arc::new(store)), || {}, false, None)
+        .await
+        .unwrap();
+    let text = {
+        let awareness = doc.awareness();
+        let awareness = awareness.read().unwrap();
+        let txn = awareness.doc().transact();
+        txn.get_text("t")
+            .map(|t| t.get_string(&txn))
+            .unwrap_or_default()
+    };
+    assert_eq!(text, "saved on SIGTERM");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

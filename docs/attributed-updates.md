@@ -8,8 +8,32 @@ This fork of Y-Sweet can do two things upstream cannot:
    its actor, batched per doc, in order per doc, signed, with at-least-once delivery and a signal
    when something was lost (see [Gaps](#gaps) for what the receiver must do with it).
 
-The two are independent and both are off by default. With no switches set the server behaves
-exactly like the version before it, except that it can already *verify* attributed tokens.
+The two are independent and both are off by default.
+
+### Differences from upstream with both switches off
+
+With `Y_SWEET_ATTRIBUTED_TOKENS` off and no webhook URL, no attributed token is minted, no update
+observer runs and nothing is sent anywhere. The binary still differs from upstream Y-Sweet in
+these ways:
+
+- **It verifies attributed tokens.** A token minted by a server with the switch on is accepted
+  (upstream rejects it with `401`). This is what makes a rolling deploy safe.
+- **Graceful shutdown on `SIGTERM`.** Upstream `serve` handles only Ctrl+C (`SIGINT`); `SIGTERM`
+  kills it at once. Here both run the ordered, time-bounded shutdown described under
+  [Shutdown](#shutdown), which also changes what happens on `SIGINT`: requests in flight are
+  finished before docs are saved, writes arriving after that are refused with `503`, and the
+  whole shutdown is bounded at about 22 s. A stop signal during startup exits cleanly.
+- **New log lines.** `minted doc token` (info) on every mint when auth is set, and, when an auth
+  request carries an oversize `userId` or `writer`, `auth request actor too long` (warn). The
+  debug line for `as-update` logs the size of the update instead of its contents.
+- **New CLI flags** (`--attributed-tokens`, `--update-webhook-*`). An upstream binary refuses to
+  start with them; the environment-variable forms are simply ignored by it.
+- **A doc edit no longer panics** when its persistence worker has already stopped (upstream
+  `unwrap`s a send on the closed channel, under the doc lock).
+
+The request and response formats of every endpoint are unchanged. `userId` and `writer` in the
+auth request are accepted and ignored, as upstream does (upstream ignores `writer` as an unknown
+field), whatever their length.
 
 The design and its rationale are in [attributed-updates-design.md](attributed-updates-design.md).
 This page is for whoever runs the server or writes the receiver.
@@ -20,7 +44,7 @@ All of these apply to `y-sweet serve` only. `serve-doc` has neither feature.
 
 | Variable | Flag | Default | Meaning |
 | --- | --- | --- | --- |
-| `Y_SWEET_ATTRIBUTED_TOKENS` | `--attributed-tokens[=true\|false]` | `false` | Mint tokens that carry the actor of the auth request. |
+| `Y_SWEET_ATTRIBUTED_TOKENS` | `--attributed-tokens [true\|false]` | `false` | Mint tokens that carry the actor of the auth request. |
 | `Y_SWEET_UPDATE_WEBHOOK_URL` | `--update-webhook-url` | unset | Where update batches are POSTed. Unset means no observer and no dispatcher. Must be `http` or `https`. |
 | `Y_SWEET_UPDATE_WEBHOOK_SECRET` | `--update-webhook-secret` | unset | HMAC secret. Required when the URL is set; the server refuses to start without it. |
 | `Y_SWEET_UPDATE_WEBHOOK_BATCH_MS` | `--update-webhook-batch-ms` | `1000` | How long one doc's updates are collected before a batch is sent. |
@@ -31,7 +55,11 @@ All of these apply to `y-sweet serve` only. `serve-doc` has neither feature.
 A variable that is set but empty counts as unset, so passing the variables through an environment
 that does not define them is safe. `Y_SWEET_ATTRIBUTED_TOKENS` accepts `true`/`false`
 (also `1`/`0`, `yes`/`no`, `on`/`off`); anything else is a startup error. Prefer the environment
-variable for the secret: a flag is visible in the process list. The secret is used as the HMAC key
+variable for the secret: a flag is visible in the process list. On the command line,
+`--attributed-tokens` reads the next argument as its value: `--attributed-tokens false` is off,
+`--attributed-tokens=true` and `--attributed-tokens true` are on, and a bare `--attributed-tokens`
+is on only as the last argument. `--attributed-tokens /data` is an error (it would otherwise be
+ambiguous between "on, store `/data`" and a typo); write `--attributed-tokens=true /data`. The secret is used as the HMAC key
 exactly as given, including any leading or trailing whitespace; whitespace only decides whether
 it counts as set.
 
@@ -76,8 +104,10 @@ is read once, at startup.
 - `userId`: opaque, at most 128 bytes.
 - `writer`: opaque, at most 64 bytes. The application owns the taxonomy (`ui`, `agent`, ...).
 
-A longer value is rejected with `400`, whether or not the switch is on. The response
-(`ClientToken`) is unchanged.
+A longer value is rejected with `400` when the switch is on. With the switch off the fields are
+ignored, as upstream does, and the request succeeds with a plain token; the server logs
+`auth request actor too long` (warn, with the lengths only, never the values) so that the
+problem shows up before the switch is turned on. The response (`ClientToken`) is unchanged.
 
 What gets minted:
 
@@ -222,6 +252,13 @@ lost with everything else. There are two signals, and they mean different things
   **any** doc, not just the one in this batch. A doc whose gap was lost is not told about it
   separately, and if it is never written again it gets no batch at all.
 
+Where `gap_before` lands: on the **first batch delivered for that doc after the loss**, whatever
+that batch is. If the doc has later updates, that is the batch carrying them (its own events were
+not lost; the loss was before them). If it has nothing else to send, the server sends an **empty
+batch** (`"events": []`) just to carry the flag, after one batch window (below). Either way the
+flag rides on exactly one acknowledged batch; if that batch is rejected or dropped, the flag moves
+on to the next one.
+
 So the receiver contract is:
 
 1. On `gap_before: true`, resync that doc.
@@ -275,15 +312,30 @@ and an `instance_id` it has never seen.
 ### Shutdown
 
 `y-sweet serve` shuts down gracefully on `SIGINT` (Ctrl+C) and on `SIGTERM` (what `docker stop`
-and an ECS task stop or scale-in send). Either one stops the listener, saves the loaded docs to
-the store and runs the webhook's final flush; the process exits once both are done.
+and an ECS task stop or scale-in send). Either one runs these stages, in order, each with a time
+budget:
+
+| Stage | What happens | Budget |
+| --- | --- | --- |
+| 1 | Stop accepting connections; tell every websocket to close. | (immediate) |
+| 2 | Let in-flight HTTP requests finish and websockets close, then close the write gate: from here on a write is refused (`503` on HTTP; a websocket is dropped without applying the message, and the client resends on reconnect). No write is acknowledged after this point. | 5 s |
+| 3 | Stop every doc's persistence worker; each makes a final save to the store. | 10 s |
+| 4 | Stop the update webhook; it flushes everything applied above. | 7 s (the flush itself has 5 s) |
+
+The whole shutdown therefore takes at most about 22 s, inside the 30 s an ECS task gets between
+`SIGTERM` and `SIGKILL` when its definition sets no `stopTimeout` (the Dalus y-sweet task sets
+none). A stage that runs out of time logs `shutdown stage did not finish in time` (warn) with
+`stage` (`http`, `websockets`, `write_gate`, `persist` or `webhook`) and `budget_ms`, and the next
+stage starts anyway. A `persist` timeout (a slow or unreachable store) means docs that were still
+saving lose what was not saved before; `workers_left` says how many. `shutdown started` and
+`shutdown finished` (with `elapsed_ms`) bracket the whole thing.
 
 The flush stops accepting new updates into the pipeline, stops retrying, closes every open batch
 and makes one delivery attempt per undelivered batch, in order per doc, within the concurrency
 cap. The whole flush, including serializing the batches, has five seconds, well inside the
 default 30 s ECS stop timeout. Whatever does not make it is lost; the receiver learns of it only
-through the new `instance_id` after the restart (rule 2 under [Gaps](#gaps)). Saving docs to the
-store is not delayed by this.
+through the new `instance_id` after the restart (rule 2 under [Gaps](#gaps)). It runs after the
+docs are saved, so it does not delay them.
 
 A signal that arrives during startup, for example while the store is still being initialised,
 abandons startup and exits at once; nothing has been served yet, so there is nothing to save or
@@ -318,6 +370,9 @@ level; the webhook URL appears only as its host.
 | warn | `update webhook batch dropped` | `doc_id`, `reason`, `seq_start`, `seq_end`, `events`, `bytes`, `attempt`, `status`, `age_ms` |
 | warn | `update webhook events dropped` | `oversize`, `budget`, `channel_full`, `closed`, `dropped_events_total`, `held_bytes` |
 | warn | `update webhook gap tracking reset` | `discarded_docs`, `instance_id` (the new one) |
+| warn | `auth request actor too long` (full message: `auth request actor too long; ignored, would be rejected with attributed tokens on`) | `doc_id`, `user_id_bytes`, `writer_bytes`, `max_user_id_bytes`, `max_writer_bytes`. Only with the switch off. |
+| info | `shutdown started` / `shutdown finished` | `elapsed_ms` on the second |
+| warn | `shutdown stage did not finish in time` | `stage`, `budget_ms`, `workers_left` (for `persist`) |
 | info | `update webhook shutdown: nothing to flush` / `update webhook shutdown flush done` | `docs`, `batches`, `delivered` |
 | warn | `update webhook shutdown flush incomplete` | `docs`, `batches`, `delivered`, `timed_out` |
 
