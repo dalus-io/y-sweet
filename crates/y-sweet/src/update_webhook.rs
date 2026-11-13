@@ -2846,4 +2846,111 @@ GZuNFD2CfzKu6mHIOnyE
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// The private CA, and a receiver certificate it signed for `127.0.0.1`. Test-only keys,
+    /// generated once with openssl (P-256, valid until 2126); see `testdata/private-ca`.
+    const PRIVATE_CA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/private-ca/ca.pem");
+    const RECEIVER_CERT: &str = include_str!("../testdata/private-ca/leaf.pem");
+    const RECEIVER_KEY: &str = include_str!("../testdata/private-ca/leaf.key");
+
+    /// An HTTPS receiver on a certificate signed by [PRIVATE_CA]. Answers every request with
+    /// 204 and counts the requests it got (handshakes that fail are not requests).
+    fn tls_receiver() -> (Url, Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+
+        let certs = rustls_pemfile::certs(&mut RECEIVER_CERT.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut RECEIVER_KEY.as_bytes())
+            .unwrap()
+            .unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}/updates", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let (config, counter) = (config.clone(), counter.clone());
+                std::thread::spawn(move || {
+                    let Ok(stream) = stream else { return };
+                    let connection = rustls::ServerConnection::new(config).unwrap();
+                    let mut tls = rustls::StreamOwned::new(connection, stream);
+                    // Read the head, then as much body as it announces.
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        match tls.read(&mut chunk) {
+                            // A failed handshake ends up here.
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map(|v| v.trim().parse().unwrap())
+                        .unwrap_or(0);
+                    while request.len() < head_end + length {
+                        match tls.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = tls.write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                });
+            }
+        });
+        (url, served)
+    }
+
+    #[tokio::test]
+    async fn a_receiver_behind_a_private_ca_is_trusted_only_with_the_ca_file() {
+        let (url, served) = tls_receiver();
+        let batch = prepare("doc", "instance-1", Batch::default(), true);
+
+        // Bundled public roots only: the handshake fails, nothing reaches the receiver.
+        let without =
+            Deliverer::new(UpdateWebhookConfig::new(url.clone(), SECRET.to_string())).unwrap();
+        let _permit = without.permits.acquire().await.unwrap();
+        assert!(matches!(
+            without.attempt(&batch).await,
+            Attempt::Retryable { status: None, .. }
+        ));
+        assert_eq!(served.load(Ordering::SeqCst), 0);
+
+        // With the private CA added, the same receiver is trusted and the batch delivered.
+        let with = Deliverer::new(UpdateWebhookConfig {
+            ca_file: Some(PathBuf::from(PRIVATE_CA)),
+            ..UpdateWebhookConfig::new(url, SECRET.to_string())
+        })
+        .unwrap();
+        let _permit = with.permits.acquire().await.unwrap();
+        assert!(matches!(
+            with.attempt(&batch).await,
+            Attempt::Acked { status: 204 }
+        ));
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+    }
 }
