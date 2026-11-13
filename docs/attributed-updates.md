@@ -34,8 +34,10 @@ these ways:
   doc while an HTTP write to it is being applied (the write is then acknowledged and never
   saved), and a checkpoint that is still writing can clear the unsaved mark of an edit made
   meanwhile. Here an unloaded doc is saved before it is dropped, and kept (and retried) if that
-  save fails or takes over 10 s; a doc being written to is not unloaded; a write that finds a doc
-  being unloaded waits for it (up to 15 s, else `503`) and goes to a fresh load. Two requests
+  save fails; a save already sent is never abandoned, so an older snapshot cannot land over a
+  newer one. A doc being written to is not unloaded. A writer waits at most 15 s for its doc
+  (loading it, or waiting for one being unloaded), else `503`, so a hung store makes writes to
+  that doc fail fast rather than hang. Two requests
   that load the same doc at once share one load; upstream could let the second replace the
   first while it was being written to, losing those writes.
 
