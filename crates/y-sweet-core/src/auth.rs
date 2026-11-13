@@ -5,6 +5,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Display;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 pub const DEFAULT_EXPIRATION_SECONDS: u64 = 60 * 60; // 60 minutes
@@ -360,7 +361,9 @@ impl Authenticator {
 
         let expected_token = hash(&payload);
 
-        if expected_token != auth_req.token {
+        // Constant time, so the comparison does not reveal how much of a forged signature is
+        // right. (`ct_eq` on slices of different lengths is false without comparing contents.)
+        if !bool::from(expected_token.as_slice().ct_eq(auth_req.token.as_slice())) {
             Err(AuthError::InvalidSignature)
         } else if auth_req
             .payload
