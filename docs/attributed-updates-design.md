@@ -316,6 +316,19 @@ store write returned, so an edit applied while a checkpoint was being written lo
 save skipped it. The flag is now cleared atomically with taking the snapshot (under the data lock every
 write holds while marking the doc dirty) and set again if the store write fails.
 
+Doc GC had a similar upstream race. It retired an idle doc (`SyncKv::shutdown`, after which writes are no
+longer marked dirty) based on the awareness reference count, which an HTTP write does not raise, so a write
+being applied at that moment was acknowledged and never saved. Now:
+
+- GC retires a doc only through `DocWithSyncKv::retire_if_unused`, which re-checks under the doc's write
+  lock that nothing but the map holds its awareness.
+- A writer (HTTP update or websocket upgrade) takes the doc with `Server::live_doc`: it holds the awareness
+  and checks, under the doc lock, that the doc is not retired. From then on GC cannot retire it, and the
+  write is applied to that doc without any lookup or load under write admission.
+- A retired doc's persistence worker saves at once and exits; GC removes the doc from the map only after
+  that save. A writer that finds a retired doc waits for the removal and loads it afresh, so the reload reads
+  what was saved.
+
 ### 4.7 Configuration
 
 | Variable | Meaning |

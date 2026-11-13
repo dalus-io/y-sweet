@@ -30,6 +30,11 @@ these ways:
   start with them; the environment-variable forms are simply ignored by it.
 - **A doc edit no longer panics** when its persistence worker has already stopped (upstream
   `unwrap`s a send on the closed channel, under the doc lock).
+- **Edits are not lost to doc garbage collection or checkpoints.** Upstream can unload an idle
+  doc while an HTTP write to it is being applied (the write is then acknowledged and never
+  saved), and a checkpoint that is still writing can clear the unsaved mark of an edit made
+  meanwhile. Here an unloaded doc is saved before it is dropped, a doc being written to is not
+  unloaded, and a write that finds a doc being unloaded waits for it and goes to a fresh load.
 
 The request and response formats of every endpoint are unchanged. `userId` and `writer` in the
 auth request are accepted and ignored, as upstream does (upstream ignores `writer` as an unknown
