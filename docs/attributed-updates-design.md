@@ -348,6 +348,21 @@ store write returned, so an edit applied while a checkpoint was being written lo
 save skipped it. The flag is now cleared atomically with taking the snapshot (under the data lock every
 write holds while marking the doc dirty) and set again if the store write fails.
 
+Saving and the update log. Since the merge of `fix/compact-on-save`, an edit only appends to the doc's
+update log; `SyncKv::compact` merges the log into the stored state before a save, on a blocking thread.
+`SyncKv::persist` writes the whole key-value map, pending log entries included, and loading a doc applies
+them, so compaction is an optimisation (a small stored form, a fast load) and not what makes a save
+complete: a save without it loses nothing, and a compaction that fails is logged and the save goes ahead.
+All the same, every save path makes the same save, `compact_and_persist`: the periodic checkpoint, the
+final save at shutdown and each of its retries, and GC's save of a doc it retires. Compaction and the write
+run under the doc's save lock, so they never interleave with another save or compaction of the doc, and
+neither is skipped because a token was cancelled. `compact` sets the dirty flag under the map lock, the same
+lock under which `persist` clears it and takes its snapshot, so a compaction or an edit during a save always
+leaves the doc dirty for the next one. A persistence worker whose doc GC has saved and dropped stops without
+saving again; its copy is no longer the doc and a fresh load may hold newer state. A compaction still
+running when the shutdown timeout is reached does not hold the exit: the runtime is given one second to
+stop, not left to wait for blocking work.
+
 Doc GC had a similar upstream race. It retired an idle doc (`SyncKv::shutdown`, after which writes are no
 longer marked dirty) based on the awareness reference count, which an HTTP write does not raise, so a write
 being applied at that moment was acknowledged and never saved. Now:

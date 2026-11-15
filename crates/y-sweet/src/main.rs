@@ -357,8 +357,19 @@ fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // Dropping the runtime would wait for blocking work that is still running, with no limit:
+    // a compaction of a large doc that outlived the shutdown budget, say. Everything that
+    // could be saved within the budget has been; do not let that hold the exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
+
+async fn run() -> Result<()> {
     let opts = Opts::parse();
 
     let filter = EnvFilter::builder()

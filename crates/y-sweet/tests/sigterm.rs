@@ -12,8 +12,16 @@ use std::{
 };
 use yrs::{Text, Transact};
 
+/// Held by each test from before it binds anything until its server has bound its port.
+///
+/// A test finds a free port by binding one and releasing it, then starts the server on it.
+/// The tests of this file run in parallel, and in that window another test could be handed
+/// the same port, for its own server or for a listener; one server would then fail to start.
+static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn sigterm_flushes_the_update_webhook_before_exit() {
+    let starting = STARTING.lock().await;
     let received: Arc<Mutex<Vec<Value>>> = Arc::default();
     let receiver = {
         let received = received.clone();
@@ -74,6 +82,7 @@ async fn sigterm_flushes_the_update_webhook_before_exit() {
         assert!(Instant::now() < deadline, "server never became ready");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    drop(starting);
 
     let update = {
         let doc = yrs::Doc::with_client_id(1);
@@ -121,6 +130,7 @@ async fn sigterm_flushes_the_update_webhook_before_exit() {
 
 #[tokio::test]
 async fn sigterm_during_a_hung_store_init_exits_promptly() {
+    let starting = STARTING.lock().await;
     use tokio::io::AsyncReadExt;
 
     // An S3 endpoint that accepts the connection, reads the request and never answers. The S3
@@ -171,6 +181,8 @@ async fn sigterm_during_a_hung_store_init_exits_promptly() {
         .await
         .expect("the server never reached the store")
         .unwrap();
+    // The server binds its port before it initialises the store.
+    drop(starting);
 
     let killed = Command::new("sh")
         .args(["-c", &format!("kill -TERM {}", child.id())])
@@ -226,6 +238,7 @@ async fn a_broken_webhook_configuration_does_not_stop_the_server() {
 }
 
 async fn stop_signal_saves_pending_edits(signal: &str, env: &[(&str, &str)]) {
+    let starting = STARTING.lock().await;
     use std::sync::Arc;
     use y_sweet::stores::filesystem::FileSystemStore;
     use y_sweet_core::{doc_sync::DocWithSyncKv, store::Store};
@@ -275,6 +288,7 @@ async fn stop_signal_saves_pending_edits(signal: &str, env: &[(&str, &str)]) {
         assert!(Instant::now() < deadline, "server never became ready");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    drop(starting);
 
     let update = {
         let doc = yrs::Doc::with_client_id(1);

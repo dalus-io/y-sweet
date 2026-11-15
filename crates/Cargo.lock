@@ -2067,6 +2067,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-extra",
+ "bincode",
  "clap",
  "colored",
  "dashmap",

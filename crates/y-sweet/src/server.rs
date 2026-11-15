@@ -41,7 +41,7 @@ use y_sweet_core::{
     auth::{
         Actor, Authenticator, DocAccess, ExpirationTimeEpochMillis, DEFAULT_EXPIRATION_SECONDS,
     },
-    doc_connection::DocConnection,
+    doc_connection::{DocConnection, DOC_NAME},
     doc_sync::{apply_update_to, is_live, DocWithSyncKv},
     store::Store,
     sync::awareness::Awareness,
@@ -386,6 +386,8 @@ impl Server {
             // Saves of this doc run one at a time, so GC's save cannot report "nothing to
             // save" while the worker's save of the same changes is still being written.
             let persist_lock = Arc::new(tokio::sync::Mutex::new(()));
+            // Set by GC when it has saved and dropped the doc: its worker must not save again.
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Spawn a task to save the document to the store when it changes.
             self.doc_worker_tracker.spawn(
@@ -396,6 +398,7 @@ impl Server {
                     doc_id.clone(),
                     cancellation_token.clone(),
                     persist_lock.clone(),
+                    dropped.clone(),
                 )
                 .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
             );
@@ -408,6 +411,7 @@ impl Server {
                         checkpoint_freq,
                         cancellation_token,
                         persist_lock,
+                        dropped,
                     )
                     .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
                 );
@@ -428,6 +432,7 @@ impl Server {
         // dropped the doc.
         cancellation_token: CancellationToken,
         persist_lock: Arc<tokio::sync::Mutex<()>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
     ) {
         let mut checkpoints_without_refs = 0;
 
@@ -464,15 +469,15 @@ impl Server {
                     // after a newer save would overwrite it. A store that hangs therefore holds
                     // up this doc's GC; writers stop waiting for the doc after `doc_wait` (503),
                     // and shutdown after its stage budget.
-                    let saved = {
-                        let _saving = persist_lock.lock().await;
-                        sync_kv.persist().await.map_err(|e| e.to_string())
-                    };
+                    let saved = Self::compact_and_persist(&sync_kv, &persist_lock).await;
                     match saved {
                         Ok(()) => {
                             tracing::info!("GCing doc");
                             docs.remove_if(&doc_id, |_, doc| doc.sync_kv().is_shutdown());
-                            // The doc is gone: its persistence worker has nothing left to do.
+                            // The doc is gone, saved in full: its persistence worker has
+                            // nothing left to do, and must not write this copy again (a fresh
+                            // load may already hold newer state).
+                            dropped.store(true, std::sync::atomic::Ordering::SeqCst);
                             cancellation_token.cancel();
                             break;
                         }
@@ -493,6 +498,32 @@ impl Server {
         tracing::info!("Exiting gc_loop");
     }
 
+    /// One save of a doc, as every save path makes it (the periodic checkpoint, the final save
+    /// at shutdown and each retry of it, GC's save of a doc it retires): merge the doc's
+    /// pending update log into its state, then write the doc to the store.
+    ///
+    /// Both steps run under the doc's save lock, so two saves of a doc, or a save and a
+    /// compaction, never interleave. Nothing here looks at a cancellation token: a save that
+    /// was asked for is made in full.
+    ///
+    /// The merge is an optimisation, not what makes the save complete: `SyncKv::persist`
+    /// writes the whole map, pending log included. So a merge that fails is logged and the save
+    /// goes ahead. It runs on a blocking thread because it takes time in proportion to the doc.
+    async fn compact_and_persist(
+        sync_kv: &Arc<SyncKv>,
+        persist_lock: &tokio::sync::Mutex<()>,
+    ) -> Result<(), String> {
+        let _saving = persist_lock.lock().await;
+        let kv = sync_kv.clone();
+        match tokio::task::spawn_blocking(move || kv.compact(DOC_NAME)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(?e, "Error compacting."),
+            Err(e) => tracing::error!(?e, "Compaction task failed."),
+        }
+        // As text: the error cannot be held across an await by the callers.
+        sync_kv.persist().await.map_err(|e| format!("{e:?}"))
+    }
+
     async fn doc_persistence_worker(
         mut recv: Receiver<()>,
         sync_kv: Arc<SyncKv>,
@@ -503,6 +534,7 @@ impl Server {
         // retrying the save.
         cancellation_token: CancellationToken,
         persist_lock: Arc<tokio::sync::Mutex<()>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
     ) {
         let mut last_save = std::time::Instant::now();
 
@@ -540,13 +572,14 @@ impl Server {
                     tracing::info!("Done throttling.");
                 }
             }
+            if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                // GC saved this doc and dropped it; this copy is no longer the doc.
+                break;
+            }
             tracing::info!("Persisting.");
             let mut retry_in = Duration::from_millis(250);
             loop {
-                let saving = persist_lock.lock().await;
-                // As text: the error itself cannot be held across the retry delay below.
-                let result = sync_kv.persist().await.map_err(|e| format!("{e:?}"));
-                drop(saving);
+                let result = Self::compact_and_persist(&sync_kv, &persist_lock).await;
                 match result {
                     Ok(()) => {
                         tracing::info!("Done persisting.");
@@ -2586,14 +2619,22 @@ mod test {
         assert!(!response.is_finished());
 
         // ...until GC has saved it and dropped it; then it goes to a fresh load.
-        let sync_kv = docs.get(DOC_ID).unwrap().sync_kv();
-        sync_kv.persist().await.unwrap();
-        docs.remove_if(DOC_ID, |_, doc| doc.sync_kv().is_shutdown());
+        save_and_drop_retired(&docs, DOC_ID).await;
         assert_eq!(response.await.unwrap(), Some(200));
         token.cancel();
         serving.await.unwrap().unwrap();
         let stored = stored_keys(&store).await;
         assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
+    }
+
+    /// What GC does once it has retired a doc: save it the way every save is made, then drop
+    /// it from the map.
+    async fn save_and_drop_retired(docs: &DashMap<String, DocWithSyncKv>, doc_id: &str) {
+        let sync_kv = docs.get(doc_id).unwrap().sync_kv();
+        Server::compact_and_persist(&sync_kv, &tokio::sync::Mutex::new(()))
+            .await
+            .unwrap();
+        docs.remove_if(doc_id, |_, doc| doc.sync_kv().is_shutdown());
     }
 
     /// Waits until `condition` holds, for up to 10 s.
@@ -2773,6 +2814,7 @@ mod test {
             Duration::from_millis(50),
             gc_token.clone(),
             Arc::new(tokio::sync::Mutex::new(())),
+            Arc::default(),
         ));
         // GC has retired the doc and sent snapshot {1}, which has not landed.
         store.set_entered.notified().await;
@@ -3264,9 +3306,7 @@ mod test {
         assert!(!connecting.is_finished());
 
         // Saved and dropped: the connection gets a fresh load, with what was saved.
-        let sync_kv = docs.get(DOC_ID).unwrap().sync_kv();
-        sync_kv.persist().await.unwrap();
-        docs.remove_if(DOC_ID, |_, doc| doc.sync_kv().is_shutdown());
+        save_and_drop_retired(&docs, DOC_ID).await;
         let mut socket = connecting.await.unwrap().unwrap();
         socket.send(ws_update(map_edit(2))).await.unwrap();
         eventually("the edit is applied to the fresh doc", || {
@@ -3289,5 +3329,131 @@ mod test {
 
         token.cancel();
         serving.await.unwrap().unwrap();
+    }
+
+    // --- Compaction on every save path --------------------------------------------------------
+
+    /// How many updates wait un-merged in the doc's log, in memory.
+    fn pending_log_len(docs: &DashMap<String, DocWithSyncKv>, doc_id: &str) -> usize {
+        use yrs_kvstore::{
+            keys::{key_oid, key_update},
+            KVStore,
+        };
+        let sync_kv = docs.get(doc_id).unwrap().sync_kv();
+        let oid_key: Vec<u8> = key_oid(DOC_NAME.as_bytes()).into();
+        let Some(oid) = sync_kv.get(&oid_key).unwrap() else {
+            return 0;
+        };
+        let oid = u32::from_be_bytes(oid.as_slice().try_into().unwrap());
+        let from: Vec<u8> = key_update(oid, 0).into();
+        let to: Vec<u8> = key_update(oid, u32::MAX).into();
+        sync_kv.iter_range(&from, &to).unwrap().count()
+    }
+
+    #[tokio::test]
+    async fn every_save_path_compacts_the_update_log() {
+        // The final save at shutdown.
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token).await;
+        let docs = server.docs.clone();
+        for id in 1..=3 {
+            docs.get(DOC_ID)
+                .unwrap()
+                .apply_update(&map_edit(id), None)
+                .unwrap();
+        }
+        assert_eq!(pending_log_len(&docs, DOC_ID), 3);
+        token.cancel();
+        server.shut_down(None).await;
+        assert_eq!(pending_log_len(&docs, DOC_ID), 0);
+        assert_eq!(stored_keys(&store).await.len(), 3);
+
+        // The periodic checkpoint, and then GC's save of the doc it retires.
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_checkpoints(&store, &token, Duration::from_millis(50)).await;
+        let docs = server.docs.clone();
+        // Held, so GC leaves the doc alone for now.
+        let (held, sync_kv) = server.live_doc(DOC_ID).await.unwrap();
+        apply_update_to(&held, &map_edit(1), None).unwrap();
+        eventually("the checkpoint saves and compacts", || {
+            !sync_kv.has_unsaved_changes() && pending_log_len(&docs, DOC_ID) == 0
+        })
+        .await;
+        assert!(stored_keys(&store).await.contains("1"));
+
+        apply_update_to(&held, &map_edit(2), None).unwrap();
+        drop(held);
+        eventually("GC drops the doc", || !docs.contains_key(DOC_ID)).await;
+        assert_eq!(stored_keys(&store).await.len(), 2);
+        // What GC wrote was compacted: the stored map holds no pending updates.
+        let stored: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = bincode_stored(&store);
+        let oid_key: Vec<u8> = yrs_kvstore::keys::key_oid(DOC_NAME.as_bytes()).into();
+        let oid = u32::from_be_bytes(stored[&oid_key].as_slice().try_into().unwrap());
+        let from: Vec<u8> = yrs_kvstore::keys::key_update(oid, 0).into();
+        let to: Vec<u8> = yrs_kvstore::keys::key_update(oid, u32::MAX).into();
+        assert_eq!(stored.range(from..to).count(), 0);
+        token.cancel();
+        server.shut_down(None).await;
+    }
+
+    #[tokio::test]
+    async fn a_dropped_docs_worker_does_not_save_over_its_successor() {
+        // GC saved and dropped a doc; a fresh load of it then took newer edits and saved them.
+        // The dropped copy's worker, stopping, must not write its older state on top.
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token).await;
+        let docs = server.docs.clone();
+        docs.get(DOC_ID)
+            .unwrap()
+            .apply_update(&map_edit(1), None)
+            .unwrap();
+        let old = docs.get(DOC_ID).unwrap().sync_kv();
+
+        let (send, recv) = channel(1);
+        let worker_token = CancellationToken::new();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = tokio::spawn(Server::doc_persistence_worker(
+            recv,
+            old.clone(),
+            Duration::from_secs(3600),
+            DOC_ID.to_string(),
+            worker_token.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            dropped.clone(),
+        ));
+
+        // GC: retire, save (here without merging the log, as when the merge failed), drop.
+        assert!(try_retire(&docs, DOC_ID));
+        old.persist().await.unwrap();
+        docs.remove_if(DOC_ID, |_, doc| doc.sync_kv().is_shutdown());
+
+        // The successor takes an edit and saves it.
+        let (awareness, sync_kv) = server.live_doc(DOC_ID).await.unwrap();
+        apply_update_to(&awareness, &map_edit(2), None).unwrap();
+        Server::compact_and_persist(&sync_kv, &tokio::sync::Mutex::new(()))
+            .await
+            .unwrap();
+
+        // Now the dropped copy's worker is stopped, as GC stops it.
+        dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        worker_token.cancel();
+        worker.await.unwrap();
+        drop(send);
+
+        let stored = stored_keys(&store).await;
+        assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
+    }
+
+    /// The doc's kv map as the store holds it.
+    fn bincode_stored(store: &TestStore) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        let snapshot = store
+            .data
+            .get(&format!("{DOC_ID}/data.ysweet"))
+            .unwrap()
+            .clone();
+        bincode::deserialize(&snapshot).unwrap()
     }
 }
