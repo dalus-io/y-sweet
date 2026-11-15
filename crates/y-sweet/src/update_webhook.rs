@@ -76,7 +76,8 @@ pub struct UpdateWebhookConfig {
     pub secret: String,
     /// How long a doc's batch stays open collecting events.
     pub batch_window: Duration,
-    /// The global budget for update bytes held anywhere in the pipeline.
+    /// The global budget for memory held by the pipeline, in bytes of estimated cost (see
+    /// [event_cost]), not raw update bytes.
     pub max_held_bytes: usize,
     /// How many requests may be in flight at once, across all docs (each doc has at most one).
     /// Bounds the burst when the receiver comes back after an outage. Values below 1 count as 1.
@@ -138,7 +139,8 @@ impl UpdateWebhookConfig {
 /// State shared between the doc observers (any thread, under a doc lock) and the dispatcher.
 struct Shared {
     max_held_bytes: usize,
-    /// Update bytes currently held in the channel, in batches, in queues or in flight.
+    /// Estimated memory ([event_cost]) of the events currently held in the channel, in
+    /// batches, in queues or in flight.
     held_bytes: AtomicUsize,
     /// Docs that lost an event since the dispatcher last looked. A set cannot be full, so
     /// recording a drop never fails; it is bounded by the number of loaded docs.
@@ -213,6 +215,25 @@ impl Shared {
     }
 }
 
+/// What every event is charged on top of its payload: the structs that hold it while it waits
+/// (the event, its strings' headers, its slot in a queue) or, once its batch is serialized, its
+/// JSON framing (keys, sequence number, timestamp). Either is well under this.
+const EVENT_OVERHEAD_BYTES: usize = 256;
+
+/// The memory an event is charged against the budget: an estimate of the most it occupies at
+/// any point in the pipeline. Waiting, it is held raw; in flight, as base64 inside a JSON body
+/// (4/3 of the update). So the charge is the base64 size plus the strings that travel with it
+/// and a fixed overhead. Without the overhead, a long outage with many tiny edits would hold
+/// hundreds of bytes per event while being charged one or two.
+///
+/// Called by the observer under the doc lock: a few additions, no allocation.
+fn event_cost(event: &AttributedUpdate) -> usize {
+    let actor = event.actor.as_ref().map_or(0, |actor| {
+        actor.user_id.as_ref().map_or(0, String::len) + actor.writer.as_ref().map_or(0, String::len)
+    });
+    event.update.len().div_ceil(3) * 4 + event.doc_id.len() + actor + EVENT_OVERHEAD_BYTES
+}
+
 /// The observer side of the pipeline: accepts or drops each event without ever blocking.
 struct UpdateSink {
     tx: mpsc::Sender<AttributedUpdate>,
@@ -224,11 +245,11 @@ impl UpdateSink {
     /// Runs inside the yrs observer, under the doc write lock: no IO, no logging, no waiting.
     /// The dispatcher reports the drops recorded here on its next tick.
     fn offer(&self, event: AttributedUpdate) {
-        let bytes = event.update.len();
-        if bytes > self.max_event_bytes {
+        if event.update.len() > self.max_event_bytes {
             return self.shared.record_drop(&event.doc_id, DropReason::Oversize);
         }
-        if !self.shared.try_reserve(bytes) {
+        let cost = event_cost(&event);
+        if !self.shared.try_reserve(cost) {
             return self.shared.record_drop(&event.doc_id, DropReason::Budget);
         }
         let (event, reason) = match self.tx.try_send(event) {
@@ -237,13 +258,15 @@ impl UpdateSink {
             // The dispatcher is gone: the server is shutting down.
             Err(TrySendError::Closed(event)) => (event, DropReason::Closed),
         };
-        self.shared.release(bytes);
+        self.shared.release(cost);
         self.shared.record_drop(&event.doc_id, reason);
     }
 }
 
 struct SeqEvent {
     seq: u64,
+    /// What the event holds against the budget ([event_cost]).
+    cost: usize,
     actor: Option<Actor>,
     update: Vec<u8>,
     occurred_at: SystemTime,
@@ -254,12 +277,16 @@ struct SeqEvent {
 #[derive(Default)]
 struct Batch {
     events: Vec<SeqEvent>,
+    /// Update bytes, the unit of the batch and event caps and of the logs.
     bytes: usize,
+    /// What the batch holds against the budget.
+    cost: usize,
 }
 
 impl Batch {
     fn push(&mut self, event: SeqEvent) {
         self.bytes += event.update.len();
+        self.cost += event.cost;
         self.events.push(event);
     }
 
@@ -283,8 +310,10 @@ struct PreparedBatch {
     seq_start: Option<u64>,
     seq_end: Option<u64>,
     events: usize,
-    /// Update bytes the batch holds against the global budget.
+    /// Update bytes in the batch.
     bytes: usize,
+    /// What the batch holds against the global budget.
+    cost: usize,
     gap_before: bool,
     body: Bytes,
 }
@@ -333,6 +362,7 @@ fn prepare(doc_id: &str, instance_id: &str, batch: Batch, gap_before: bool) -> P
         seq_end: payload.seq_end,
         events: batch.events.len(),
         bytes: batch.bytes,
+        cost: batch.cost,
         gap_before,
         body: Bytes::from(body),
     }
@@ -437,6 +467,7 @@ impl Batcher {
 
     /// Takes an event off the channel into its doc's open batch.
     fn push(&mut self, event: AttributedUpdate, now: Instant) {
+        let cost = event_cost(&event);
         let AttributedUpdate {
             doc_id,
             actor,
@@ -448,6 +479,7 @@ impl Batcher {
         let bytes = update.len();
         let event = SeqEvent {
             seq,
+            cost,
             actor,
             update,
             occurred_at,
@@ -500,7 +532,7 @@ impl Batcher {
             let Some(batch) = state.queue.pop_front() else {
                 break;
             };
-            shared.release(batch.bytes);
+            shared.release(batch.cost);
             state.mark_gap(now);
             tracing::warn!(
                 doc_id = %doc_id,
@@ -677,7 +709,7 @@ impl Batcher {
             return;
         };
         if let Some(batch) = state.in_flight.take() {
-            self.shared.release(batch.bytes);
+            self.shared.release(batch.cost);
         }
         if acked {
             state.consecutive_failures = 0;
@@ -1268,6 +1300,11 @@ mod tests {
         }
     }
 
+    /// What `event(doc_id, size)` is charged against the budget.
+    fn cost(doc_id: &str, size: usize) -> usize {
+        event_cost(&event(doc_id, size))
+    }
+
     fn body(batch: &PreparedBatch) -> Value {
         serde_json::from_slice(&batch.body).unwrap()
     }
@@ -1488,7 +1525,8 @@ mod tests {
         p.emit("doc", 10);
         p.emit("doc", 10);
         p.emit("doc", 10);
-        assert_eq!(p.shared.held_bytes(), 30); // in flight + two queued; seq 2 was released
+        // In flight + two queued; seq 2 was released.
+        assert_eq!(p.shared.held_bytes(), 3 * cost("doc", 10));
 
         assert!(!in_flight.gap_before);
         p.ack(&in_flight);
@@ -1516,7 +1554,7 @@ mod tests {
         p.offer("doc", 10);
         p.offer("doc", 10);
         p.offer("doc", 10);
-        assert_eq!(p.shared.held_bytes(), 20);
+        assert_eq!(p.shared.held_bytes(), 2 * cost("doc", 10));
         assert_eq!(p.shared.drop_counts(), [0, 0, 1, 0]);
 
         p.pump();
@@ -1546,25 +1584,26 @@ mod tests {
 
     #[test]
     fn exhausted_byte_budget_drops_and_gaps_then_recovers() {
+        let budget = cost("a", 60) + cost("a", 40);
         let mut p = Pipeline::new(UpdateWebhookConfig {
-            max_held_bytes: 100,
+            max_held_bytes: budget,
             max_batch_events: 1,
             ..test_config()
         });
         p.emit("a", 60);
-        p.emit("b", 60); // 120 > 100: dropped
+        p.emit("b", 60); // over the budget: dropped
         p.emit("a", 40); // exactly at the budget: accepted
         p.emit("b", 1); // dropped
-        assert_eq!(p.shared.held_bytes(), 100);
+        assert_eq!(p.shared.held_bytes(), budget);
         assert_eq!(p.shared.drop_counts(), [0, 2, 0, 0]);
 
         // Acking releases the bytes, and the budget is usable again.
         let first = p.start_one();
         assert_eq!((first.doc_id.as_str(), first.bytes), ("a", 60));
         p.ack(&first);
-        assert_eq!(p.shared.held_bytes(), 40);
+        assert_eq!(p.shared.held_bytes(), cost("a", 40));
         p.emit("b", 60);
-        assert_eq!(p.shared.held_bytes(), 100);
+        assert_eq!(p.shared.held_bytes(), budget);
 
         // b lost updates, so its first delivered batch says so. a lost nothing.
         p.advance(Duration::ZERO);
@@ -1594,7 +1633,7 @@ mod tests {
         p.emit("doc", 10);
         let first = p.start_one();
         p.fail(&first);
-        assert_eq!(p.shared.held_bytes(), 10);
+        assert_eq!(p.shared.held_bytes(), cost("doc", 10));
 
         let second = p.start_one();
         assert_eq!(seqs(&second), vec![2]);
@@ -1863,13 +1902,13 @@ mod tests {
     fn observer_drops_are_counted_per_reason_without_logging() {
         let mut p = Pipeline::new(UpdateWebhookConfig {
             max_event_bytes: 100,
-            max_held_bytes: 150,
+            max_held_bytes: cost("a", 100) + cost("c", 10),
             channel_capacity: 1,
             ..test_config()
         });
         p.offer("a", 101); // oversize
         p.offer("a", 100); // accepted, fills the channel
-        p.offer("b", 60); // budget: 160 > 150
+        p.offer("b", 60); // over the budget
         p.offer("c", 10); // channel full
         assert_eq!(p.shared.drop_counts(), [1, 1, 1, 0]);
 
@@ -1882,7 +1921,8 @@ mod tests {
         while p.rx.try_recv().is_ok() {}
         p.offer("a", 10);
         assert_eq!(p.shared.drop_counts(), [1, 1, 1, 1]);
-        assert_eq!(p.shared.held_bytes(), 100); // only the event the dispatcher never took
+        // Only the event the dispatcher never took.
+        assert_eq!(p.shared.held_bytes(), cost("a", 100));
     }
 
     #[test]
@@ -2952,5 +2992,70 @@ GZuNFD2CfzKu6mHIOnyE
             Attempt::Acked { status: 204 }
         ));
         assert_eq!(served.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn event_cost_covers_base64_strings_and_a_fixed_overhead() {
+        assert_eq!(cost("doc", 0), 3 + EVENT_OVERHEAD_BYTES);
+        assert_eq!(cost("doc", 1), 4 + 3 + EVENT_OVERHEAD_BYTES);
+        assert_eq!(cost("doc", 3000), 4000 + 3 + EVENT_OVERHEAD_BYTES);
+        let attributed = AttributedUpdate {
+            actor: Some(Actor {
+                user_id: Some("u".repeat(128)),
+                writer: Some("w".repeat(64)),
+            }),
+            ..event("doc", 3)
+        };
+        assert_eq!(
+            event_cost(&attributed),
+            4 + 3 + 128 + 64 + EVENT_OVERHEAD_BYTES
+        );
+
+        // The charge is at least what the event occupies once serialized.
+        let batch = {
+            let mut p = Pipeline::new(test_config());
+            p.sink.offer(attributed.clone());
+            p.pump();
+            p.advance(WINDOW);
+            p.start_one()
+        };
+        let envelope = body(&prepare("doc", "instance-1", Batch::default(), false))
+            .to_string()
+            .len();
+        assert!(batch.body.len() - envelope <= batch.cost);
+    }
+
+    #[test]
+    fn many_tiny_events_fill_the_budget_at_about_the_memory_they_hold() {
+        // A receiver that is down while a doc gets a stream of one-byte edits. Charged by
+        // update bytes alone, a 1 MiB budget would admit a million events, hundreds of
+        // megabytes of structs; charged by cost it admits what fits in about 1 MiB.
+        let budget = MIB;
+        let p = Pipeline::new(UpdateWebhookConfig {
+            max_held_bytes: budget,
+            channel_capacity: 1 << 20,
+            ..test_config()
+        });
+        let mut accepted = 0usize;
+        while p.shared.drop_counts() == [0; DropReason::COUNT] {
+            p.offer("doc", 1);
+            accepted += 1;
+        }
+        accepted -= 1; // the last one was the drop
+        assert_eq!(p.shared.drop_counts(), [0, 1, 0, 0]);
+
+        assert_eq!(accepted, budget / cost("doc", 1));
+        // Between 250 and 300 bytes each, so the budget is the memory to within the estimate.
+        assert!(
+            (budget / 300..=budget / 250).contains(&accepted),
+            "{accepted}"
+        );
+        // What an event really holds while it waits: the struct plus its heap blocks.
+        let held = std::mem::size_of::<AttributedUpdate>() + "doc".len() + 1;
+        assert!(
+            held <= cost("doc", 1),
+            "{held} bytes held, {} charged",
+            cost("doc", 1)
+        );
     }
 }
