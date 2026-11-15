@@ -266,8 +266,9 @@ fn update_webhook_config_from_opts(
     if let Some(concurrency) =
         parse_number::<usize>("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY", concurrency)?
     {
-        if concurrency == 0 {
-            anyhow::bail!("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY must be at least 1");
+        let max = y_sweet::update_webhook::MAX_CONCURRENT_DELIVERIES;
+        if !(1..=max).contains(&concurrency) {
+            anyhow::bail!("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY must be between 1 and {max}");
         }
         config.max_concurrent_deliveries = concurrency;
     }
@@ -792,6 +793,13 @@ mod tests {
             (url.clone(), opt("s"), opt("soon"), None, None),
             (url.clone(), opt("s"), None, opt("-1"), None),
             (url.clone(), opt("s"), None, None, opt("0")),
+            (
+                url.clone(),
+                opt("s"),
+                None,
+                None,
+                opt("18446744073709551615"),
+            ),
         ] {
             let config = update_webhook_or_disabled(update_webhook_config_from_opts(
                 &url,
@@ -835,7 +843,7 @@ mod tests {
         assert!(error(&url, &opt("s"), &opt("soon"), &None).contains("BATCH_MS"));
         assert!(error(&url, &opt("s"), &None, &opt("-1")).contains("MAX_BYTES"));
         assert!(error(&opt("ftp://example.com/x"), &opt("s"), &None, &None).contains("http"));
-        for concurrency in ["0", "-1", "many"] {
+        for concurrency in ["0", "-1", "many", "1025", "18446744073709551615"] {
             let message = update_webhook_config_from_opts(
                 &url,
                 &opt("s"),

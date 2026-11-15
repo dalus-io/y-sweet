@@ -70,7 +70,7 @@ All of these apply to `y-sweet serve` only. `serve-doc` has neither feature.
 | `Y_SWEET_UPDATE_WEBHOOK_SECRET` | `--update-webhook-secret` | unset | HMAC secret. Required when the URL is set; without it the webhook stays off (see below). |
 | `Y_SWEET_UPDATE_WEBHOOK_BATCH_MS` | `--update-webhook-batch-ms` | `1000` | How long one doc's updates are collected before a batch is sent. |
 | `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | `--update-webhook-max-bytes` | `268435456` | Upper bound on the memory held by updates awaiting delivery, across all docs, as estimated per update; see [Sizing](#sizing). |
-| `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | `--update-webhook-concurrency` | `16` | How many webhook requests may be in flight at once, across all docs. At least 1. |
+| `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | `--update-webhook-concurrency` | `16` | How many webhook requests may be in flight at once, across all docs. From 1 to 1024. |
 | `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` | `--update-webhook-ca-file` | unset | PEM file of extra CA certificates to trust for the webhook URL, in addition to the bundled public roots. For a receiver behind a private CA. If the file cannot be read or holds no certificate the webhook stays off (see below). |
 
 A variable that is set but empty counts as unset, so passing the variables through an environment

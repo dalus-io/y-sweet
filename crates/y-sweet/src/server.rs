@@ -827,8 +827,10 @@ impl Server {
         // complete even while saves are still running.
         self.webhook_token.cancel();
         self.webhook_tracker.close();
+        // Its own budget, but never past the end of the whole shutdown, however late it starts.
+        let flush_deadline = (tokio::time::Instant::now() + budgets.webhook).min(total_deadline);
         let flush = async {
-            if tokio::time::timeout(budgets.webhook, self.webhook_tracker.wait())
+            if tokio::time::timeout_at(flush_deadline, self.webhook_tracker.wait())
                 .await
                 .is_err()
             {
@@ -3042,6 +3044,32 @@ mod test {
         assert!(stored_keys(&store).await.contains("1"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_late_webhook_flush_ends_with_the_shutdown_deadline() {
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let budgets = ShutdownBudgets {
+            connections: Duration::from_secs(10),
+            total: Duration::from_secs(12),
+            webhook: Duration::from_secs(7),
+        };
+        let server = server_with_store(&store, &token)
+            .await
+            .with_shutdown_budgets(budgets);
+        // A write that never finishes applying keeps the connection stage busy to its limit,
+        // so the flush starts with 2 s left; and the webhook never finishes flushing.
+        let gate = server.write_gate.clone();
+        let _applying = gate.enter().await.unwrap();
+        server.webhook_tracker.spawn(std::future::pending::<()>());
+
+        let started = tokio::time::Instant::now();
+        token.cancel();
+        server.shut_down(None).await;
+        let took = started.elapsed();
+        assert!(took >= Duration::from_secs(10), "{took:?}");
+        assert!(took <= budgets.total, "{took:?}");
+    }
+
     // --- Websockets through shutdown, GC and the write gate -----------------------------------
 
     type TestSocket = tokio_tungstenite::WebSocketStream<
@@ -3095,11 +3123,13 @@ mod test {
 
         // Clients that keep sending edits until the server closes their socket.
         let next_id = Arc::new(AtomicU64::new(1));
+        let (connected_tx, mut connected) = tokio::sync::mpsc::channel(6);
         let clients: Vec<_> = (0..6)
             .map(|_| {
-                let next_id = next_id.clone();
+                let (next_id, connected_tx) = (next_id.clone(), connected_tx.clone());
                 tokio::spawn(async move {
                     let mut socket = ws_connect(addr, DOC_ID).await.unwrap();
+                    connected_tx.send(()).await.unwrap();
                     loop {
                         let id = next_id.fetch_add(1, Ordering::SeqCst);
                         if socket.send(ws_update(map_edit(id))).await.is_err() {
@@ -3111,7 +3141,19 @@ mod test {
             })
             .collect();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Shutdown starts only once every client is connected and edits are landing, however
+        // slow the machine.
+        for _ in 0..6 {
+            tokio::time::timeout(Duration::from_secs(30), connected.recv())
+                .await
+                .expect("a client never connected")
+                .unwrap();
+        }
+        eventually("the first edit is applied", || {
+            !memory_keys(&docs, DOC_ID).is_empty()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         token.cancel();
         tokio::time::timeout(Duration::from_secs(30), serving)
             .await

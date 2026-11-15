@@ -59,6 +59,9 @@ const MIB: usize = 1024 * 1024;
 pub const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(1000);
 pub const DEFAULT_MAX_HELD_BYTES: usize = 256 * MIB;
 pub const DEFAULT_MAX_CONCURRENT_DELIVERIES: usize = 16;
+/// The most [UpdateWebhookConfig::max_concurrent_deliveries] may be. Far above any useful
+/// value, and far below what the semaphore behind it accepts.
+pub const MAX_CONCURRENT_DELIVERIES: usize = 1024;
 
 pub const TIMESTAMP_HEADER: &str = "X-Y-Sweet-Timestamp";
 pub const SIGNATURE_HEADER: &str = "X-Y-Sweet-Signature";
@@ -80,7 +83,8 @@ pub struct UpdateWebhookConfig {
     /// [event_cost]), not raw update bytes.
     pub max_held_bytes: usize,
     /// How many requests may be in flight at once, across all docs (each doc has at most one).
-    /// Bounds the burst when the receiver comes back after an outage. Values below 1 count as 1.
+    /// Bounds the burst when the receiver comes back after an outage. Clamped to
+    /// 1..=[MAX_CONCURRENT_DELIVERIES].
     pub max_concurrent_deliveries: usize,
     /// A PEM file of extra CA certificates to trust for the webhook URL, on top of the bundled
     /// public roots. For a receiver behind a private CA.
@@ -901,7 +905,11 @@ impl Deliverer {
             }
         }
         let client = builder.build()?;
-        let permits = Semaphore::new(config.max_concurrent_deliveries.max(1));
+        let permits = Semaphore::new(
+            config
+                .max_concurrent_deliveries
+                .clamp(1, MAX_CONCURRENT_DELIVERIES),
+        );
         Ok(Self {
             client,
             config,
@@ -1203,7 +1211,11 @@ impl Dispatcher {
         let instance_id = self.batcher.instance_id.clone();
         // The deliveries that were retrying are gone, so every permit is free again; the cap
         // still applies, inside each attempt.
-        let concurrency = self.batcher.config.max_concurrent_deliveries.max(1);
+        let concurrency = self
+            .batcher
+            .config
+            .max_concurrent_deliveries
+            .clamp(1, MAX_CONCURRENT_DELIVERIES);
         let flush = stream::iter(plan).for_each_concurrent(concurrency, |doc| {
             let deliverer = &self.deliverer;
             let delivered = &delivered;
@@ -2684,6 +2696,20 @@ mod tests {
         running.task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 12);
         assert_eq!(peak.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn an_absurd_concurrency_is_clamped_instead_of_panicking() {
+        for max_concurrent_deliveries in [0, usize::MAX] {
+            let deliverer = Deliverer::new(UpdateWebhookConfig {
+                max_concurrent_deliveries,
+                ..test_config()
+            })
+            .unwrap();
+            assert!(
+                (1..=MAX_CONCURRENT_DELIVERIES).contains(&deliverer.permits.available_permits())
+            );
+        }
     }
 
     #[test]
