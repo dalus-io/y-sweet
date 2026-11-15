@@ -99,8 +99,21 @@ actor, so any observer on the doc can read the actor from the transaction it is 
 - The origin encoding is `b"actor:" + serde_json(Actor)`. Observers that find any other origin, or none,
   emit the update as unattributed. Nothing is dropped.
 
-Sync-step-2 catch-up replays a reconnecting client's offline edits and is attributed to that client, which is
-correct. Edits the server already holds apply as no-ops and emit nothing.
+Sync-step-2 catch-up replays a reconnecting client's offline edits and is attributed to that client. Edits
+the server already holds apply as no-ops and emit nothing.
+
+That is right only while the server holds everything it acknowledged. The actor is, precisely, the token
+that delivered the update to this server process, and this is a limitation, not a property to rely on:
+
+- After an unclean restart (crash, `SIGKILL`, a shutdown that ran out of time) the server has lost
+  acknowledged edits that clients still hold. The first client to reconnect re-uploads all of them in its
+  `SyncStep2`, other users' edits included, and they are emitted under that client's actor. If they had
+  already been delivered before the restart, they are emitted again as new events with a different actor.
+- An HTTP fallback that pushes a writer's full state is the actor of everything in it the server lacked.
+- The missing-dependency case below.
+
+The receiver must therefore treat `actor` as the deliverer, and treat content it already has as a duplicate
+rather than a new write.
 
 One known inexactness: an update whose dependencies are missing is parked by yrs as pending and integrated
 by whichever later transaction supplies them. Its content is then emitted under that later transaction's
@@ -232,9 +245,14 @@ receiver that needs a bound on detection must also reconcile on its own (on doc 
 
 The largest body is one 8 MiB event, about 11 MiB once base64-encoded. The receiver must accept 12 MiB.
 
-Because a batch is serialized (base64 plus JSON, about 1.4 times its update bytes) when its delivery starts,
-and the byte budget counts raw update bytes, real memory held by the pipeline can reach about 1.4 to 1.5
-times `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES`. The operator doc gives sizing guidance.
+The budget counts estimated memory, not raw update bytes. Each event is charged 4/3 of its update size
+(its base64 form, the larger of how it is held waiting and in flight), the lengths of its doc id and actor
+strings, and a fixed 256 bytes for the structs and JSON framing around it. Counting raw bytes alone
+undercounted badly in the case the budget exists for: with the receiver down for hours and many tiny edits,
+each event was charged a byte or two while holding a few hundred. The charge is computed by the observer
+with a few additions and no allocation. With the budget full, real memory is about the budget; allocator
+overhead and the one batch being serialized at a time are outside the estimate. The operator doc gives
+sizing guidance.
 
 ### 4.4 Signing and transport
 
@@ -255,7 +273,7 @@ timeout 10 seconds.
 The client trusts the bundled webpki roots, not the OS store, so a receiver behind a private CA would fail
 every delivery. `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` names a PEM file whose certificates are added as extra
 roots (`ClientBuilder::add_root_certificate`); no reqwest feature change is needed. The file is read at
-startup; an unreadable file or one with no certificate is a startup error.
+startup; an unreadable file or one with no certificate disables the webhook (section 4.7).
 
 ### 4.5 Delivery and failure
 
@@ -304,12 +322,26 @@ ordered, with a budget per stage:
    the websocket message is dropped unapplied), even if the requests above overran the budget; then it waits,
    bounded, for writes already admitted. A write is admitted only around applying the update, never across
    loading its doc or store I/O, so that wait is short. Budget 5 s.
-3. The persistence and GC workers, on their own token, stop; each does a final save. Budget 10 s.
-4. The dispatcher, on its own token, flushes. Budget 7 s (its internal budget is 5 s).
+3. The persistence and GC workers, on their own token, stop; each does a final save, and retries it with
+   backoff (0.25 s doubling to 5 s) if it fails. The saves have until the shutdown timeout.
+4. The dispatcher, on its own token, flushes. Budget 7 s (its internal budget is 5 s). It starts when the
+   saves are done, or beside them when only its 7 s are left of the shutdown timeout.
 
-At most about 22 s in all, inside ECS's default 30 s `stopTimeout` (the Dalus y-sweet task definition sets
-none). A stage that overruns is logged with its name and the next one starts. The dirty callback ignores a
-closed or full channel instead of panicking.
+The shutdown timeout is `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS`, default 110 s. The Dalus deployments stop
+Y-Sweet with `SIGINT`, so before this change a deploy already ran upstream's shutdown, which waited for the
+final saves without limit; the platform's stop timeout was the only bound. A fixed 10 s save stage (an
+earlier revision of this design) was a regression: on a deploy with a slow store or many dirty docs it
+abandoned saves and lost everything since the last checkpoint. So the saves are the one stage that is never
+cut short in favour of another: they run until the total timeout, the connection stage and the webhook
+flush are bounded so they cannot use that time up, and the flush, which is expendable, overlaps the saves
+rather than replacing them. The default is sized against the Dalus ECS task's `stopTimeout` of 120 s,
+leaving 10 s to exit. A platform with a shorter grace period (the on-prem compose file: 30 s) kills the
+process at its own limit; until then the saves run as upstream's did, so the default loses nothing there,
+and the operator doc tells such deployments to lower the setting to get the flush and the logs in. When the
+timeout is reached with saves unfinished, each unsaved doc is logged by id.
+
+A stage that overruns is logged with its name and the next one starts. The dirty callback ignores a closed
+or full channel instead of panicking.
 
 One more upstream race undermined the final save: `SyncKv::persist` cleared the doc's dirty flag after the
 store write returned, so an edit applied while a checkpoint was being written lost its flag and the final
@@ -343,6 +375,10 @@ being applied at that moment was acknowledged and never saved. Now:
   its persistence subscription while the first request's writer held it. Each user of the lock removes it
   from the lock map on the way out (also when cancelled) once no one else holds it.
 
+This trades data loss for a narrower availability risk, which the operator doc lists: while the save of a
+retired doc is stalled, that one doc answers `503` (after the 15 s wait) until the write completes or
+fails, or the process restarts. Upstream dropped the doc immediately and lost the unsaved edits instead.
+
 The S3 client still has no request timeout of its own (the store module is also built for wasm, where
 reqwest has no timeout setting, so it is not a one-line change). The waits that writers and shutdown depend
 on are bounded instead, as above.
@@ -353,11 +389,18 @@ on are bounded instead, as above.
 | --- | --- |
 | `Y_SWEET_UPDATE_WEBHOOK_URL` | Target URL. Unset means no observer and no dispatcher. |
 | `Y_SWEET_UPDATE_WEBHOOK_SECRET` | HMAC secret. Required when the URL is set. |
+| `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` | Total time a graceful shutdown may take, default 110 (section 4.6). Not a webhook setting: it applies with everything off. |
 | `Y_SWEET_UPDATE_WEBHOOK_BATCH_MS` | Coalescing window per doc, default 1000. |
-| `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | Global budget for held update bytes, default 268435456. |
+| `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | Global budget for the estimated memory of held updates, default 268435456. |
 | `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | Requests in flight at once across docs, default 16 (section 4.5). |
 | `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` | Extra CA certificates (PEM) to trust for the URL (section 4.4). |
 | `Y_SWEET_ATTRIBUTED_TOKENS` | `true` mints `AttributedDoc` tokens (section 3.1). Default off. Independent of the webhook. As a flag, `--attributed-tokens <true\|false>` reads the next argument as its value, so `--attributed-tokens false` is off and a path there is an error. |
+
+A webhook setting that is invalid (malformed URL, URL without a secret, a number that does not parse, an
+unusable CA file) does not stop the server: it logs one error, without the URL or the secret, and starts
+with the webhook disabled. The service is a singleton whose old task is stopped before the new one starts,
+so refusing to start over an optional feature would be a full sync outage. Settings that are not optional
+features (the store, auth, `Y_SWEET_ATTRIBUTED_TOKENS`, the shutdown timeout) remain hard errors.
 
 Each is also a flag on `serve`: `--update-webhook-url`, `--update-webhook-secret`,
 `--update-webhook-batch-ms`, `--update-webhook-max-bytes`, `--update-webhook-concurrency`,
@@ -476,6 +519,17 @@ Fork, unit:
   does not push shutdown past its budget.
 - Mint: oversize actor fields get 400 with the switch on and a plain token with it off.
 - CLI: `--attributed-tokens false` is off and never a store path; `--attributed-tokens /data` is an error.
+- Shutdown budget: with the default timeout, 50 dirty docs whose saves take 30 s each are all saved (a
+  paused clock); a final save that fails for 20 s is retried and succeeds; saves that need nearly the whole
+  timeout are not cut short by the flush stage; the real binary saves pending edits on `SIGINT`.
+- Webhook settings: each kind of mistake yields no webhook rather than an error exit, and the real binary
+  starts, serves and saves with each of them.
+- Budget: an event's charge covers its serialized size; one-byte events fill a 1 MiB budget after about
+  four thousand, not a million.
+- Websockets: edits racing a shutdown leave nothing applied in memory that is not in the store; a message
+  after the gate closed is not applied and the connection ends; GC does not retire a doc with an open
+  websocket, and drops it once the socket closes; a connection to a doc being retired waits for a fresh
+  load, or gets 503 if the doc stays retired.
 - TLS: a receiver on a certificate from a private CA fails the handshake with the bundled roots only and is
   delivered to once `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` names the CA.
 - Through the real server: a websocket update carries the actor of the token it connected with (and none for

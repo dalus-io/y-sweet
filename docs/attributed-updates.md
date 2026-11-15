@@ -19,10 +19,13 @@ these ways:
 - **It verifies attributed tokens.** A token minted by a server with the switch on is accepted
   (upstream rejects it with `401`). This is what makes a rolling deploy safe.
 - **Graceful shutdown on `SIGTERM`.** Upstream `serve` handles only Ctrl+C (`SIGINT`); `SIGTERM`
-  kills it at once. Here both run the ordered, time-bounded shutdown described under
-  [Shutdown](#shutdown), which also changes what happens on `SIGINT`: requests in flight are
-  finished before docs are saved, writes arriving after that are refused with `503`, and the
-  whole shutdown is bounded at about 22 s. A stop signal during startup exits cleanly.
+  kills it at once. Here both run the ordered shutdown described under [Shutdown](#shutdown).
+  That also changes what happens on `SIGINT`, the signal the Dalus deployments stop Y-Sweet
+  with: requests in flight are finished before docs are saved, writes arriving after that are
+  refused with `503`, and a final save that fails is retried. Upstream waited for the final
+  saves without limit; here they have until `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` (default 110)
+  after the signal, and docs still unsaved then are named in the log. A stop signal during
+  startup exits cleanly.
 - **New log lines.** `minted doc token` (info) on every mint when auth is set, and, when an auth
   request carries an oversize `userId` or `writer`, `auth request actor too long` (warn). The
   debug line for `as-update` logs the size of the update instead of its contents.
@@ -41,6 +44,13 @@ these ways:
   that load the same doc at once share one load; upstream could let the second replace the
   first while it was being written to, losing those writes.
 
+- **A new way for one doc to be unavailable.** The price of the point above: if the store
+  write that saves an idle doc before it is unloaded stalls (the S3 client has no request
+  timeout), that doc stays "being unloaded". Every HTTP update and websocket connection for
+  it is answered `503` after a 15 s wait, until the write completes or fails (the doc is then
+  usable again) or the process is restarted. Other docs are unaffected. Upstream never
+  waited: it dropped the doc at once, losing whatever was not saved.
+
 The request and response formats of every endpoint are unchanged. `userId` and `writer` in the
 auth request are accepted and ignored, as upstream does (upstream ignores `writer` as an unknown
 field), whatever their length.
@@ -54,17 +64,28 @@ All of these apply to `y-sweet serve` only. `serve-doc` has neither feature.
 
 | Variable | Flag | Default | Meaning |
 | --- | --- | --- | --- |
+| `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` | `--shutdown-timeout-seconds` | `110` | How long a graceful shutdown may take in all; docs are saved until then. Applies whether or not the two features are on. See [Shutdown](#shutdown). |
 | `Y_SWEET_ATTRIBUTED_TOKENS` | `--attributed-tokens [true\|false]` | `false` | Mint tokens that carry the actor of the auth request. |
 | `Y_SWEET_UPDATE_WEBHOOK_URL` | `--update-webhook-url` | unset | Where update batches are POSTed. Unset means no observer and no dispatcher. Must be `http` or `https`. |
-| `Y_SWEET_UPDATE_WEBHOOK_SECRET` | `--update-webhook-secret` | unset | HMAC secret. Required when the URL is set; the server refuses to start without it. |
+| `Y_SWEET_UPDATE_WEBHOOK_SECRET` | `--update-webhook-secret` | unset | HMAC secret. Required when the URL is set; without it the webhook stays off (see below). |
 | `Y_SWEET_UPDATE_WEBHOOK_BATCH_MS` | `--update-webhook-batch-ms` | `1000` | How long one doc's updates are collected before a batch is sent. |
-| `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | `--update-webhook-max-bytes` | `268435456` | Upper bound on update bytes held in memory awaiting delivery, across all docs. Actual memory use can reach about 1.5 times this; see [Sizing](#sizing). |
+| `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | `--update-webhook-max-bytes` | `268435456` | Upper bound on the memory held by updates awaiting delivery, across all docs, as estimated per update; see [Sizing](#sizing). |
 | `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | `--update-webhook-concurrency` | `16` | How many webhook requests may be in flight at once, across all docs. At least 1. |
-| `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` | `--update-webhook-ca-file` | unset | PEM file of extra CA certificates to trust for the webhook URL, in addition to the bundled public roots. For a receiver behind a private CA. The server refuses to start if the file cannot be read or holds no certificate. |
+| `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` | `--update-webhook-ca-file` | unset | PEM file of extra CA certificates to trust for the webhook URL, in addition to the bundled public roots. For a receiver behind a private CA. If the file cannot be read or holds no certificate the webhook stays off (see below). |
 
 A variable that is set but empty counts as unset, so passing the variables through an environment
 that does not define them is safe. `Y_SWEET_ATTRIBUTED_TOKENS` accepts `true`/`false`
-(also `1`/`0`, `yes`/`no`, `on`/`off`); anything else is a startup error. Prefer the environment
+(also `1`/`0`, `yes`/`no`, `on`/`off`); anything else is a startup error, as is a
+`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` that is not a number.
+
+**A mistake in the webhook settings does not stop the server.** The webhook is optional, and
+this server is the only copy of the sync service, so a malformed URL, a URL without a secret, a
+`..._BATCH_MS`, `..._MAX_BYTES` or `..._CONCURRENCY` that is not a valid number, or a CA file
+that cannot be used makes the server log one error,
+`update webhook configuration is invalid; starting with the update webhook DISABLED` (with the
+reason, never the URL or the secret), and start without the webhook. Check for that line, or for
+`update_webhook_enabled=false` on the `attributed updates configuration` line, after changing
+these settings. Prefer the environment
 variable for the secret: a flag is visible in the process list. On the command line,
 `--attributed-tokens` reads the next argument as its value: `--attributed-tokens false` is off,
 `--attributed-tokens=true` and `--attributed-tokens true` are on, and a bare `--attributed-tokens`
@@ -87,13 +108,26 @@ docker run --rm -p 8080:8080 \
 
 ### Sizing
 
-`Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` counts raw update bytes. A batch is serialized when its
-delivery starts, and the request body is base64 plus JSON, about 1.4 times the update bytes it
-carries. So with the budget full and much of it in flight, the pipeline can hold about **1.4 to
-1.5 times** the configured value. Size the container for that on top of what the server needs for
-its docs: the default 256 MiB budget needs about 384 MiB of headroom. To fit a smaller container,
-lower the budget; a receiver outage then turns into gaps sooner, which costs attribution, not
-correctness, as long as the receiver resyncs (see [Gaps](#gaps)).
+`Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` is a budget for memory, not for update bytes. Every update
+held anywhere in the pipeline is charged an estimate of the most it occupies there:
+
+- 4/3 of its size, because it is sent as base64 (while it waits it is held raw, which is less);
+- the lengths of its doc id and of its actor's `user_id` and `writer`;
+- a fixed 256 bytes for the structures around it and its JSON framing.
+
+So a 1-byte edit is charged about 260 bytes and a 1 MiB update about 1.33 MiB, and the budget
+tracks real memory whether the receiver is behind on a few large updates or on hours of tiny
+ones. With the budget full, the pipeline holds about the configured value. Two things are not in
+the estimate: allocator overhead, and one batch at a time being serialized (its raw and encoded
+forms coexist for a moment, at most about 19 MiB for an 8 MiB update). Give the container the
+budget plus about 15% on top of what the server needs for its docs: roughly 300 MiB for the
+default 256 MiB. The default holds about 190 MiB of large updates, or about a million small
+edits. To fit a smaller container, lower the budget; a receiver outage then turns into gaps
+sooner, which costs attribution, not correctness, as long as the receiver resyncs (see
+[Gaps](#gaps)).
+
+The other limits (8 MiB per update, 1 MiB per batch) and the `bytes` field in the logs remain in
+update bytes; `held_bytes` in the logs is in budget units.
 
 ### Private CA
 
@@ -321,47 +355,76 @@ and an `instance_id` it has never seen.
 
 ### Shutdown
 
-`y-sweet serve` shuts down gracefully on `SIGINT` (Ctrl+C) and on `SIGTERM` (what `docker stop`
-and an ECS task stop or scale-in send). Either one runs these stages, in order, each with a time
-budget:
+`y-sweet serve` shuts down gracefully on `SIGINT` (Ctrl+C; also what the Dalus images and the
+on-prem compose file set as the stop signal) and on `SIGTERM` (what `docker stop` and ECS send by
+default). Either one runs these stages:
 
-| Stage | What happens | Budget |
+| Stage | What happens | Time limit |
 | --- | --- | --- |
 | 1 | Stop accepting connections; tell every websocket to close. | (immediate) |
 | 2 | Let in-flight HTTP requests finish and websockets close, then close the write gate, whether or not they did: from here on a write is refused (`503` on HTTP; a websocket is dropped without applying the message, and the client resends on reconnect), including one that was still loading its doc or receiving its body. Writes already applying finish first. No write is acknowledged after this point. | 5 s |
-| 3 | Stop every doc's persistence worker; each makes a final save to the store. | 10 s |
-| 4 | Stop the update webhook; it flushes everything applied above. | 7 s (the flush itself has 5 s) |
+| 3 | Stop every doc's persistence worker; each makes a final save to the store, retrying a save that fails (after 0.25 s, 0.5 s, ... up to every 5 s). | until the shutdown timeout |
+| 4 | Stop the update webhook; it flushes everything applied above. Starts when the saves are done, or beside them once only 7 s of the shutdown timeout are left. | 7 s (the flush itself has 5 s) |
 
-The whole shutdown therefore takes at most about 22 s, inside the 30 s an ECS task gets between
-`SIGTERM` and `SIGKILL` when its definition sets no `stopTimeout` (the Dalus y-sweet task sets
-none). A stage that runs out of time logs `shutdown stage did not finish in time` (warn) with
-`stage` (`http`, `websockets`, `write_gate`, `persist` or `webhook`) and `budget_ms`, and the next
-stage starts anyway. A `persist` timeout (a slow or unreachable store) means docs that were still
-saving lose what was not saved before; `workers_left` says how many. `shutdown started` and
-`shutdown finished` (with `elapsed_ms`) bracket the whole thing.
+**The shutdown timeout** is `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS`, default **110 s**, counted from
+the stop signal. Saving docs is the stage that must not be cut short, so it gets all of it; the
+connection stage and the webhook flush are the bounded, expendable ones and never take time from
+the saves. Set the timeout a little below what the platform allows between the stop signal and
+killing the process:
+
+- The default fits the Dalus ECS task, whose `stopTimeout` is 120 s: 110 s for the saves, 10 s
+  to exit.
+- Where the platform allows less (Docker's default is 10 s; the on-prem compose file sets
+  `stop_grace_period: 30s`), the platform kills the process at its own limit whatever this
+  setting says. Until then the saves keep running, exactly as upstream's did, so the default
+  loses nothing there; but lower the setting (to 25 for a 30 s grace period) to get the webhook
+  flush and the log lines below before the kill. Better still, raise the platform's limit.
+- With stages 2 and 4 at their limits, the short timeouts leave little for saving: at 30 s the
+  saves have the whole 30 s, the flush runs in the last 7 s of it.
+
+If the timeout is reached with saves unfinished (a store that is down or very slow), the server
+logs one error per doc, `doc not saved before the shutdown deadline; its changes since the last
+save are lost` with its `doc_id`, then `shutdown stage did not finish in time` with
+`stage=persist` and `unsaved_docs`, and exits. A failed attempt logs `final save failed;
+retrying`. The other stages log `shutdown stage did not finish in time` (warn) with their `stage`
+(`http`, `websockets`, `write_gate` or `webhook`) and `budget_ms` when they overrun, and the next
+stage starts anyway. `shutdown started` (with `budget_ms`) and `shutdown finished` (with
+`elapsed_ms`) bracket the whole thing.
 
 The flush stops accepting new updates into the pipeline, stops retrying, closes every open batch
 and makes one delivery attempt per undelivered batch, in order per doc, within the concurrency
-cap. The whole flush, including serializing the batches, has five seconds, well inside the
-default 30 s ECS stop timeout. Whatever does not make it is lost; the receiver learns of it only
-through the new `instance_id` after the restart (rule 2 under [Gaps](#gaps)). It runs after the
-docs are saved, so it does not delay them.
+cap. The whole flush, including serializing the batches, has five seconds. Whatever does not
+make it is lost; the receiver learns of it only through the new `instance_id` after the restart
+(rule 2 under [Gaps](#gaps)). It never delays or shortens the doc saves.
 
 A signal that arrives during startup, for example while the store is still being initialised,
 abandons startup and exits at once; nothing has been served yet, so there is nothing to save or
 flush. A `SIGKILL`, or a stop timeout shorter than the flush, skips all of this.
 
-### Attribution is "who made it visible"
+### What `actor` means, and where it is not the author
 
-Two properties of the underlying CRDT are worth knowing when reading `actor`:
+`actor` is **the token that delivered the update to this server process**. That is usually the
+author. It is not proof of authorship, and in these cases it differs:
 
-- An update that depends on something the server has not received yet is held back, and is
-  integrated by whichever later write supplies the missing piece. It is then reported in *that*
-  write's event, under *that* write's actor. This needs out-of-order delivery across writers and
-  is rare, but `actor` is "the writer whose write made this content visible", not proof of
-  authorship.
-- A reconnecting client replays its offline edits in a `SyncStep2`; those are attributed to that
-  client, correctly. The parts the server already had produce nothing.
+- **After an unclean restart.** If the server stopped without saving (a crash, a `SIGKILL`, a
+  shutdown that ran out of time), edits it had acknowledged are gone from it but still held by
+  the clients that saw them. Whichever client reconnects first sends everything the server
+  lacks in its `SyncStep2`, including other users' edits it had received before the restart.
+  The server reports all of it under that client's actor. And if those updates had already
+  been delivered to the receiver before the restart, they are delivered again, as new events
+  (new `instance_id`, new `seq`) with a different actor. A receiver that keeps attribution
+  should treat an event whose content it already has as a duplicate, not as a new write by the
+  new actor.
+- **An update with a missing dependency.** An update that depends on something the server has
+  not received yet is held back, and is integrated by whichever later write supplies the
+  missing piece. It is then reported in *that* write's event, under *that* write's actor. This
+  needs out-of-order delivery across writers and is rare.
+- **A full-state push over HTTP.** A writer that falls back to `POST /d/:doc_id/update` with
+  its whole doc state (as the Dalus server connection does for unacknowledged updates) is
+  reported as the actor of everything in that state the server did not have yet, whoever made
+  it.
+- **A reconnecting client's own offline edits** are attributed to it, which is right; they are
+  the ordinary case of the first point. The parts the server already had produce nothing.
 
 ## Logs
 
@@ -371,7 +434,7 @@ level; the webhook URL appears only as its host.
 
 | Level | Message | Fields |
 | --- | --- | --- |
-| info | `attributed updates configuration` | `attributed_tokens`, `update_webhook_enabled`, `update_webhook_host`, `update_webhook_batch_ms`, `update_webhook_max_bytes`, `update_webhook_concurrency`, `update_webhook_ca_file` (whether one is set; the last five only when enabled). Once, at startup. |
+| info | `attributed updates configuration` | `attributed_tokens`, `shutdown_timeout_seconds`, `update_webhook_enabled`, `update_webhook_host`, `update_webhook_batch_ms`, `update_webhook_max_bytes`, `update_webhook_concurrency`, `update_webhook_ca_file` (whether one is set; the last five only when enabled). Once, at startup. |
 | info | `update webhook dispatcher starting` | `instance_id` |
 | info | `minted doc token` | `doc_id`, `attributed`, `actor_requested`, `writer` |
 | debug | `websocket opened with actor` | `doc_id`, `writer`, `has_user_id` |
@@ -381,8 +444,11 @@ level; the webhook URL appears only as its host.
 | warn | `update webhook events dropped` | `oversize`, `budget`, `channel_full`, `closed`, `dropped_events_total`, `held_bytes` |
 | warn | `update webhook gap tracking reset` | `discarded_docs`, `instance_id` (the new one) |
 | warn | `auth request actor too long` (full message: `auth request actor too long; ignored, would be rejected with attributed tokens on`) | `doc_id`, `user_id_bytes`, `writer_bytes`, `max_user_id_bytes`, `max_writer_bytes`. Only with the switch off. |
-| info | `shutdown started` / `shutdown finished` | `elapsed_ms` on the second |
-| warn | `shutdown stage did not finish in time` | `stage`, `budget_ms`, `workers_left` (for `persist`) |
+| info | `shutdown started` / `shutdown finished` | `budget_ms` on the first, `elapsed_ms` on the second |
+| warn / error | `shutdown stage did not finish in time` | `stage`, `budget_ms`; for `persist` (error): `unsaved_docs`, `workers_left` |
+| error | `doc not saved before the shutdown deadline` (full message continues `; its changes since the last save are lost`) | `doc_id`. One per unsaved doc. |
+| warn | `final save failed; retrying` | `retry_in_ms`; in the `save_loop` span, which carries the `doc_id` |
+| error | `update webhook configuration is invalid; starting with the update webhook DISABLED` | `error` (the reason; never the URL or the secret) |
 | info | `update webhook shutdown: nothing to flush` / `update webhook shutdown flush done` | `docs`, `batches`, `delivered` |
 | warn | `update webhook shutdown flush incomplete` | `docs`, `batches`, `delivered`, `timed_out` |
 

@@ -194,6 +194,38 @@ async fn sigterm_during_a_hung_store_init_exits_promptly() {
 
 #[tokio::test]
 async fn sigterm_saves_pending_edits_to_the_store() {
+    stop_signal_saves_pending_edits("TERM", &[]).await;
+}
+
+/// `SIGINT` is what the Dalus deployments send (`STOPSIGNAL SIGINT`, `stop_signal: SIGINT`).
+#[tokio::test]
+async fn sigint_saves_pending_edits_to_the_store() {
+    stop_signal_saves_pending_edits("INT", &[]).await;
+}
+
+/// A mistake in the optional webhook's settings must not keep the sync server from starting
+/// (or from saving docs when it stops).
+#[tokio::test]
+async fn a_broken_webhook_configuration_does_not_stop_the_server() {
+    for broken in [
+        &[("Y_SWEET_UPDATE_WEBHOOK_URL", "not a url")][..],
+        &[("Y_SWEET_UPDATE_WEBHOOK_URL", "https://example.com/hook")],
+        &[
+            ("Y_SWEET_UPDATE_WEBHOOK_URL", "https://example.com/hook"),
+            ("Y_SWEET_UPDATE_WEBHOOK_SECRET", "s"),
+            ("Y_SWEET_UPDATE_WEBHOOK_BATCH_MS", "soon"),
+        ],
+        &[
+            ("Y_SWEET_UPDATE_WEBHOOK_URL", "https://example.com/hook"),
+            ("Y_SWEET_UPDATE_WEBHOOK_SECRET", "s"),
+            ("Y_SWEET_UPDATE_WEBHOOK_CA_FILE", "/nonexistent/ca.pem"),
+        ],
+    ] {
+        stop_signal_saves_pending_edits("INT", broken).await;
+    }
+}
+
+async fn stop_signal_saves_pending_edits(signal: &str, env: &[(&str, &str)]) {
     use std::sync::Arc;
     use y_sweet::stores::filesystem::FileSystemStore;
     use y_sweet_core::{doc_sync::DocWithSyncKv, store::Store};
@@ -221,6 +253,7 @@ async fn sigterm_saves_pending_edits_to_the_store() {
             "3600",
         ])
         .env_clear()
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -235,6 +268,10 @@ async fn sigterm_saves_pending_edits_to_the_store() {
                 break;
             }
         }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the server exited during startup"
+        );
         assert!(Instant::now() < deadline, "server never became ready");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -243,7 +280,7 @@ async fn sigterm_saves_pending_edits_to_the_store() {
         let doc = yrs::Doc::with_client_id(1);
         let text = doc.get_or_insert_text("t");
         let mut txn = doc.transact_mut();
-        text.push(&mut txn, "saved on SIGTERM");
+        text.push(&mut txn, "saved on stop");
         txn.encode_update_v1()
     };
     let response = http
@@ -255,7 +292,7 @@ async fn sigterm_saves_pending_edits_to_the_store() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
     let killed = Command::new("sh")
-        .args(["-c", &format!("kill -TERM {}", child.id())])
+        .args(["-c", &format!("kill -{signal} {}", child.id())])
         .status()
         .unwrap();
     assert!(killed.success());
@@ -266,7 +303,7 @@ async fn sigterm_saves_pending_edits_to_the_store() {
         }
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            panic!("server did not exit after SIGTERM");
+            panic!("server did not exit after SIG{signal}");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
@@ -285,6 +322,6 @@ async fn sigterm_saves_pending_edits_to_the_store() {
             .map(|t| t.get_string(&txn))
             .unwrap_or_default()
     };
-    assert_eq!(text, "saved on SIGTERM");
+    assert_eq!(text, "saved on stop");
     std::fs::remove_dir_all(&dir).unwrap();
 }

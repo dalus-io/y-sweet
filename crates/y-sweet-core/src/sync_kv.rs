@@ -16,6 +16,8 @@ pub struct SyncKv {
     store: Option<Arc<Box<dyn Store>>>,
     key: String,
     dirty: AtomicBool,
+    /// True while a snapshot is being written to the store.
+    saving: AtomicBool,
     dirty_callback: Box<dyn Fn() + Send + Sync>,
     shutdown: AtomicBool,
 }
@@ -44,6 +46,7 @@ impl SyncKv {
             store,
             key,
             dirty: AtomicBool::new(false),
+            saving: AtomicBool::new(false),
             dirty_callback: Box::new(callback),
             shutdown: AtomicBool::new(false),
         })
@@ -61,12 +64,17 @@ impl SyncKv {
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
         /// Marks the doc dirty again unless disarmed: a save that fails, or is abandoned
         /// mid-write (its future dropped, e.g. by a timeout), has not saved anything.
-        struct StillDirty<'a>(&'a AtomicBool, bool);
+        struct StillDirty<'a> {
+            dirty: &'a AtomicBool,
+            saving: &'a AtomicBool,
+            armed: bool,
+        }
         impl Drop for StillDirty<'_> {
             fn drop(&mut self) {
-                if self.1 {
-                    self.0.store(true, Ordering::SeqCst);
+                if self.armed {
+                    self.dirty.store(true, Ordering::SeqCst);
                 }
+                self.saving.store(false, Ordering::SeqCst);
             }
         }
 
@@ -83,7 +91,11 @@ impl SyncKv {
             }
             match &self.store {
                 Some(_) => match bincode::serialize(&*data) {
-                    Ok(snapshot) => Some(snapshot),
+                    Ok(snapshot) => {
+                        // Set under the data lock, so the doc never looks saved in between.
+                        self.saving.store(true, Ordering::SeqCst);
+                        Some(snapshot)
+                    }
                     Err(err) => {
                         self.dirty.store(true, Ordering::SeqCst);
                         return Err(err.into());
@@ -96,10 +108,14 @@ impl SyncKv {
         if let (Some(store), Some(snapshot)) = (&self.store, snapshot) {
             // Not saved until the write returns Ok: stay dirty so the next persist tries
             // again. No callback: the persistence worker retries on its own schedule.
-            let mut still_dirty = StillDirty(&self.dirty, true);
+            let mut still_dirty = StillDirty {
+                dirty: &self.dirty,
+                saving: &self.saving,
+                armed: true,
+            };
             tracing::info!(size=?snapshot.len(), "Persisting snapshot");
             store.set(&self.key, snapshot).await?;
-            still_dirty.1 = false;
+            still_dirty.armed = false;
         }
         Ok(())
     }
@@ -127,6 +143,12 @@ impl SyncKv {
 
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Whether the store may not hold the doc's latest state: it has changes not yet saved, or
+    /// a save of them is still being written.
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.dirty.load(Ordering::SeqCst) || self.saving.load(Ordering::SeqCst)
     }
 
     /// Undoes [SyncKv::shutdown]: writes are marked dirty again. For a doc that GC retired but

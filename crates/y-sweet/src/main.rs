@@ -62,6 +62,12 @@ enum ServSubcommand {
         #[clap(long, default_value = "false", env = "Y_SWEET_SKIP_GC")]
         skip_gc: bool,
 
+        /// How long a graceful shutdown may take in all, in seconds. Docs are saved until
+        /// then; set it a little below the time the platform allows between the stop signal
+        /// and killing the process.
+        #[clap(long, default_value = "110", env = "Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS")]
+        shutdown_timeout_seconds: u64,
+
         /// Mint doc tokens that carry the `userId` and `writer` of the auth request, so that
         /// updates can be attributed. Only turn this on once every server that verifies the
         /// tokens runs a version that understands them. Accepts `true` or `false`, either as
@@ -316,6 +322,23 @@ fn shutdown_signal() -> impl std::future::Future<Output = &'static str> {
     }
 }
 
+/// The webhook configuration to run with: none if it could not be built. The error is logged
+/// once; it never contains the URL or the secret (see [update_webhook_config_from_opts]).
+fn update_webhook_or_disabled(
+    config: Result<Option<UpdateWebhookConfig>>,
+) -> Option<UpdateWebhookConfig> {
+    match config {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "update webhook configuration is invalid; starting with the update webhook DISABLED"
+            );
+            None
+        }
+    }
+}
+
 fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
     if store_path.starts_with("s3://") {
         let url = url::Url::parse(store_path)?;
@@ -356,6 +379,7 @@ async fn main() -> Result<()> {
             prod,
             max_body_size,
             skip_gc,
+            shutdown_timeout_seconds,
             attributed_tokens,
             update_webhook_url,
             update_webhook_secret,
@@ -371,14 +395,17 @@ async fn main() -> Result<()> {
             let mut shutdown = Box::pin(shutdown_signal());
 
             let startup = async {
-                let update_webhook = update_webhook_config_from_opts(
+                // The webhook is an optional feature and this server is the only copy of the
+                // sync service: a mistake in the webhook's settings disables the webhook, with
+                // an error in the log, rather than keeping the server from starting.
+                let update_webhook = update_webhook_or_disabled(update_webhook_config_from_opts(
                     update_webhook_url,
                     update_webhook_secret,
                     update_webhook_batch_ms,
                     update_webhook_max_bytes,
                     update_webhook_concurrency,
                     update_webhook_ca_file,
-                )?;
+                ));
 
                 let auth = if let Some(auth) = auth {
                     Some(Authenticator::new(auth)?)
@@ -422,12 +449,26 @@ async fn main() -> Result<()> {
                     *skip_gc,
                 )
                 .await?
+                .with_shutdown_budgets(y_sweet::server::ShutdownBudgets::with_total(
+                    std::time::Duration::from_secs((*shutdown_timeout_seconds).max(1)),
+                ))
                 .with_attributed_tokens(*attributed_tokens);
+                let mut server = server;
+                // Set up here, before the configuration line below, so that the line reports
+                // what is actually running. Fails on an unreadable or empty CA file, for one.
+                let update_webhook = update_webhook.and_then(|config| {
+                    update_webhook_or_disabled(
+                        server
+                            .enable_update_webhook(config.clone())
+                            .map(|()| Some(config)),
+                    )
+                });
 
                 // One line that says what this process will do about attribution. The host only:
                 // the rest of the URL and the secret are never logged.
                 tracing::info!(
                     attributed_tokens = *attributed_tokens,
+                    shutdown_timeout_seconds = *shutdown_timeout_seconds,
                     update_webhook_enabled = update_webhook.is_some(),
                     update_webhook_host = update_webhook
                         .as_ref()
@@ -452,10 +493,6 @@ async fn main() -> Result<()> {
                 );
                 }
 
-                let server = match update_webhook {
-                    Some(config) => server.with_update_webhook(config)?,
-                    None => server,
-                };
                 Ok::<_, anyhow::Error>((server, listener, addr, token))
             };
 
@@ -746,7 +783,40 @@ mod tests {
     }
 
     #[test]
-    fn webhook_misconfiguration_is_an_error() {
+    fn webhook_misconfiguration_disables_the_webhook_instead_of_failing() {
+        let url = opt("https://app.example.com/hook");
+        for (url, secret, batch_ms, max_bytes, concurrency) in [
+            (opt("not a url"), opt("s"), None, None, None),
+            (opt("ftp://example.com/x"), opt("s"), None, None, None),
+            (url.clone(), None, None, None, None),
+            (url.clone(), opt("s"), opt("soon"), None, None),
+            (url.clone(), opt("s"), None, opt("-1"), None),
+            (url.clone(), opt("s"), None, None, opt("0")),
+        ] {
+            let config = update_webhook_or_disabled(update_webhook_config_from_opts(
+                &url,
+                &secret,
+                &batch_ms,
+                &max_bytes,
+                &concurrency,
+                &None,
+            ));
+            assert!(config.is_none());
+        }
+        // A good configuration passes through.
+        let config = update_webhook_or_disabled(update_webhook_config_from_opts(
+            &url,
+            &opt("s"),
+            &None,
+            &None,
+            &None,
+            &None,
+        ));
+        assert!(config.is_some());
+    }
+
+    #[test]
+    fn webhook_misconfiguration_is_reported() {
         let url = opt("https://app.example.com/hook");
         fn error(
             url: &Option<String>,
