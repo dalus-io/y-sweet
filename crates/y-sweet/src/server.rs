@@ -3369,12 +3369,12 @@ mod test {
         assert_eq!(pending_log_len(&docs, DOC_ID), 0);
         assert_eq!(stored_keys(&store).await.len(), 3);
 
-        // The periodic checkpoint, and then GC's save of the doc it retires.
+        // The periodic checkpoint.
         let store = TestStore::default();
         let token = CancellationToken::new();
         let server = server_with_checkpoints(&store, &token, Duration::from_millis(50)).await;
         let docs = server.docs.clone();
-        // Held, so GC leaves the doc alone for now.
+        // Held, so GC leaves the doc alone.
         let (held, sync_kv) = server.live_doc(DOC_ID).await.unwrap();
         apply_update_to(&held, &map_edit(1), None).unwrap();
         eventually("the checkpoint saves and compacts", || {
@@ -3382,20 +3382,52 @@ mod test {
         })
         .await;
         assert!(stored_keys(&store).await.contains("1"));
-
-        apply_update_to(&held, &map_edit(2), None).unwrap();
         drop(held);
-        eventually("GC drops the doc", || !docs.contains_key(DOC_ID)).await;
+        token.cancel();
+        server.shut_down(None).await;
+
+        // GC's save of the doc it retires, with nothing else saving the doc: the server's own
+        // workers checkpoint once an hour, so the doc's persistence worker stays throttled and
+        // the only save is the one made by the GC worker run here.
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token).await;
+        let docs = server.docs.clone();
+        for id in 1..=2 {
+            docs.get(DOC_ID)
+                .unwrap()
+                .apply_update(&map_edit(id), None)
+                .unwrap();
+        }
+        assert_eq!(pending_log_len(&docs, DOC_ID), 2);
+        assert!(!store.data.contains_key(&format!("{DOC_ID}/data.ysweet")));
+
+        let gc = tokio::spawn(Server::doc_gc_worker(
+            docs.clone(),
+            DOC_ID.to_string(),
+            Duration::from_millis(50),
+            CancellationToken::new(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::default(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), gc)
+            .await
+            .expect("GC never dropped the doc")
+            .unwrap();
+        assert!(!docs.contains_key(DOC_ID));
+
+        // What GC wrote holds both edits, merged: no pending updates in the stored map.
         assert_eq!(stored_keys(&store).await.len(), 2);
-        // What GC wrote was compacted: the stored map holds no pending updates.
         let stored: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = bincode_stored(&store);
         let oid_key: Vec<u8> = yrs_kvstore::keys::key_oid(DOC_NAME.as_bytes()).into();
         let oid = u32::from_be_bytes(stored[&oid_key].as_slice().try_into().unwrap());
         let from: Vec<u8> = yrs_kvstore::keys::key_update(oid, 0).into();
         let to: Vec<u8> = yrs_kvstore::keys::key_update(oid, u32::MAX).into();
-        assert_eq!(stored.range(from..to).count(), 0);
-        token.cancel();
-        server.shut_down(None).await;
+        assert_eq!(
+            stored.range(from..to).count(),
+            0,
+            "GC saved the doc without merging its update log"
+        );
     }
 
     #[tokio::test]
