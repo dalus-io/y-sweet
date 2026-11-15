@@ -36,7 +36,7 @@ use y_sweet_core::{
         NewDocResponse,
     },
     auth::{Authenticator, ExpirationTimeEpochMillis, DEFAULT_EXPIRATION_SECONDS},
-    doc_connection::DocConnection,
+    doc_connection::{DocConnection, DOC_NAME},
     doc_sync::DocWithSyncKv,
     store::Store,
     sync::awareness::Awareness,
@@ -282,6 +282,13 @@ impl Server {
                     }
                     tracing::info!("Done throttling.");
                 }
+            }
+            tracing::info!("Compacting.");
+            let kv = sync_kv.clone();
+            match tokio::task::spawn_blocking(move || kv.compact(DOC_NAME)).await {
+                Ok(Ok(())) => tracing::info!("Done compacting."),
+                Ok(Err(e)) => tracing::error!(?e, "Error compacting."),
+                Err(e) => tracing::error!(?e, "Compaction task failed."),
             }
             tracing::info!("Persisting.");
             if let Err(e) = sync_kv.persist().await {

@@ -78,6 +78,71 @@ impl SyncKv {
         Ok(())
     }
 
+    /// Merge the pending update log into the stored document state.
+    /// Copies the state and the log under the map lock, but decodes, merges and encodes
+    /// with no lock held, so edits keep flowing. Removes only the updates it merged:
+    /// updates pushed meanwhile have higher keys and stay for the next run.
+    pub fn compact(&self, name: &str) -> Result<()> {
+        use yrs::updates::{decoder::Decode, encoder::Encode};
+        use yrs::{ReadTxn, StateVector, Transact, Update};
+        use yrs_kvstore::keys::{key_doc, key_oid, key_state_vector, key_update};
+
+        let (oid, state, updates) = {
+            let map = self.data.lock().unwrap();
+            let oid_key: Vec<u8> = key_oid(name.as_bytes()).into();
+            let Some(v) = map.get(&oid_key) else {
+                return Ok(());
+            };
+            let oid = u32::from_be_bytes(v.as_slice().try_into().context("bad oid")?);
+            let start: Vec<u8> = key_update(oid, 0).into();
+            let end: Vec<u8> = key_update(oid, u32::MAX).into();
+            let updates: Vec<(Vec<u8>, Vec<u8>)> = map
+                .range(start..end)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if updates.is_empty() {
+                return Ok(());
+            }
+            let doc_key: Vec<u8> = key_doc(oid).into();
+            (oid, map.get(&doc_key).cloned(), updates)
+        };
+
+        let doc = yrs::Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            for bytes in state.iter().chain(updates.iter().map(|(_, u)| u)) {
+                let update = Update::decode_v1(bytes).with_context(|| {
+                    format!(
+                        "Failed to decode while compacting {} pending updates",
+                        updates.len()
+                    )
+                })?;
+                txn.apply_update(update);
+            }
+        }
+        let (new_state, sv) = {
+            let txn = doc.transact();
+            (
+                txn.encode_state_as_update_v1(&StateVector::default()),
+                txn.state_vector().encode_v1(),
+            )
+        };
+
+        {
+            let mut map = self.data.lock().unwrap();
+            map.insert(key_doc(oid).into(), new_state);
+            map.insert(key_state_vector(oid).into(), sv);
+            for (k, _) in updates {
+                map.remove(&k);
+            }
+        }
+        // Set directly rather than through mark_dirty: after shutdown the final save
+        // must still write the updates merged here. The caller persists right after,
+        // so the dirty callback is not needed.
+        self.dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     #[cfg(test)]
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let map = self.data.lock().unwrap();
@@ -208,11 +273,13 @@ mod test {
     use async_trait::async_trait;
     use dashmap::DashMap;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use tokio;
 
     #[derive(Default, Clone)]
     struct MemoryStore {
         data: Arc<DashMap<String, Vec<u8>>>,
+        set_delay: Duration,
     }
 
     #[cfg_attr(not(feature = "single-threaded"), async_trait)]
@@ -227,6 +294,7 @@ mod test {
         }
 
         async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
+            tokio::time::sleep(self.set_delay).await;
             self.data.insert(key.to_owned(), value);
             Ok(())
         }
@@ -331,5 +399,117 @@ mod test {
 
         // Should not persist when not dirty
         assert!(store.data.is_empty());
+    }
+
+    fn update_log_len(sync_kv: &SyncKv) -> usize {
+        use yrs_kvstore::keys::{key_oid, key_update};
+        let map = sync_kv.data.lock().unwrap();
+        let oid_key: Vec<u8> = key_oid(crate::doc_connection::DOC_NAME.as_bytes()).into();
+        let oid = u32::from_be_bytes(map[&oid_key].as_slice().try_into().unwrap());
+        let start: Vec<u8> = key_update(oid, 0).into();
+        let end: Vec<u8> = key_update(oid, u32::MAX).into();
+        map.range(start..end).count()
+    }
+
+    fn push_item(doc: &crate::doc_sync::DocWithSyncKv, item: &str) {
+        use yrs::{Array, Transact};
+        let awareness = doc.awareness();
+        let guard = awareness.write().unwrap();
+        let list = guard.doc.get_or_insert_array("list");
+        let mut txn = guard.doc.transact_mut();
+        list.push_back(&mut txn, item);
+    }
+
+    fn items(doc: &crate::doc_sync::DocWithSyncKv) -> Vec<String> {
+        use yrs::{Array, Transact};
+        let awareness = doc.awareness();
+        let guard = awareness.read().unwrap();
+        let list = guard.doc.get_or_insert_array("list");
+        let txn = guard.doc.transact();
+        list.iter(&txn).map(|v| v.to_string(&txn)).collect()
+    }
+
+    async fn reload(store: &MemoryStore) -> crate::doc_sync::DocWithSyncKv {
+        crate::doc_sync::DocWithSyncKv::new(
+            "doc",
+            Some(Arc::new(Box::new(store.clone()))),
+            || (),
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compact_while_editing_keeps_every_edit_once() {
+        let store = MemoryStore::default();
+        let doc = reload(&store).await;
+        let sync_kv = doc.sync_kv();
+
+        for i in 0..2000 {
+            push_item(&doc, &format!("seed{i}"));
+        }
+        // Edits are appended to the log; merging waits for compaction.
+        assert_eq!(update_log_len(&sync_kv), 2000);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let compactor = {
+            let (sync_kv, stop) = (sync_kv.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    sync_kv.compact(crate::doc_connection::DOC_NAME).unwrap();
+                }
+            })
+        };
+        for i in 0..2000 {
+            push_item(&doc, &format!("edit{i}"));
+            if i % 50 == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        compactor.join().unwrap();
+
+        sync_kv.compact(crate::doc_connection::DOC_NAME).unwrap();
+        assert_eq!(update_log_len(&sync_kv), 0);
+        sync_kv.persist().await.unwrap();
+
+        let expected = items(&doc);
+        assert_eq!(expected.len(), 4000);
+        assert_eq!(items(&reload(&store).await), expected);
+    }
+
+    /// Saves "a" through a slow store while "b" is edited in mid-save, then runs `before_next_save`
+    /// and the next save as the persistence worker does, and returns the items read back.
+    async fn edit_during_save(before_next_save: impl FnOnce(&SyncKv)) -> Vec<String> {
+        let store = MemoryStore {
+            set_delay: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let doc = reload(&store).await;
+        let sync_kv = doc.sync_kv();
+
+        push_item(&doc, "a");
+        let (saved, _) = tokio::join!(sync_kv.persist(), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            push_item(&doc, "b");
+        });
+        saved.unwrap();
+
+        before_next_save(&sync_kv);
+        sync_kv.compact(crate::doc_connection::DOC_NAME).unwrap();
+        sync_kv.persist().await.unwrap();
+        items(&reload(&store).await)
+    }
+
+    #[tokio::test]
+    async fn edit_during_save_is_kept_by_next_save() {
+        assert_eq!(edit_during_save(|_| ()).await, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn edit_during_save_is_kept_by_final_save_after_shutdown() {
+        // The doc is unloaded before the next tick; the final save still runs.
+        assert_eq!(edit_during_save(SyncKv::shutdown).await, vec!["a", "b"]);
     }
 }
