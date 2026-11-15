@@ -1,0 +1,6 @@
+{
+  "batch": "sha256=3af873f5087e3f54d6ce287b5fc4a92598bd2c2fdf785d03001861db4a79c82a",
+  "emptyGapBatch": "sha256=fabbce34e45bc99abe537630c5516716be5aa8a72091e6449ac25548e7489152",
+  "secret": "contract-secret",
+  "timestamp": "1794312000"
+}

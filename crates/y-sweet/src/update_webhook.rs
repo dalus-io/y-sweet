@@ -3084,4 +3084,77 @@ GZuNFD2CfzKu6mHIOnyE
             cost("doc", 1)
         );
     }
+
+    /// The wire contract shared with the receiver: see `testdata/update-webhook-contract`.
+    /// Fails when the sender's output differs from the fixture files by a byte. After an
+    /// intended format change, `UPDATE_CONTRACT_FIXTURES=1` rewrites them (then update the
+    /// receiver's copy).
+    #[test]
+    fn contract_fixtures_match_what_the_sender_produces() {
+        const DOC_ID: &str = "contract-doc";
+        const INSTANCE_ID: &str = "contract-instance";
+        const CONTRACT_SECRET: &str = "contract-secret";
+        const TIMESTAMP: u64 = 1_794_312_000;
+
+        let at = |millis: u64| UNIX_EPOCH + Duration::from_millis(1_794_312_000_000 + millis);
+        let event = |seq, actor, update: &[u8], millis| SeqEvent {
+            seq,
+            cost: 0,
+            actor,
+            update: update.to_vec(),
+            occurred_at: at(millis),
+        };
+        let mut batch = Batch::default();
+        batch.push(event(
+            41,
+            Some(Actor {
+                user_id: Some("user-1".to_string()),
+                writer: Some("ui".to_string()),
+            }),
+            &[0, 1, 2, 250, 251, 252],
+            0,
+        ));
+        batch.push(event(
+            42,
+            Some(Actor {
+                user_id: None,
+                writer: Some("integration-pull".to_string()),
+            }),
+            &[3],
+            250,
+        ));
+        batch.push(event(43, None, &[7, 7], 1_500));
+
+        let batch = prepare(DOC_ID, INSTANCE_ID, batch, true);
+        let empty = prepare(DOC_ID, INSTANCE_ID, Batch::default(), true);
+        let mut signature = serde_json::to_string_pretty(&serde_json::json!({
+            "secret": CONTRACT_SECRET,
+            "timestamp": TIMESTAMP.to_string(),
+            "batch": sign(CONTRACT_SECRET.as_bytes(), TIMESTAMP, &batch.body),
+            "emptyGapBatch": sign(CONTRACT_SECRET.as_bytes(), TIMESTAMP, &empty.body),
+        }))
+        .unwrap();
+        signature.push('\n');
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/update-webhook-contract");
+        let regenerate = std::env::var("UPDATE_CONTRACT_FIXTURES").is_ok_and(|v| v == "1");
+        for (name, produced) in [
+            ("batch.json", &batch.body[..]),
+            ("empty-gap-batch.json", &empty.body[..]),
+            ("signature.json", signature.as_bytes()),
+        ] {
+            let path = dir.join(name);
+            if regenerate {
+                std::fs::write(&path, produced).unwrap();
+            }
+            let fixture = std::fs::read(&path).unwrap();
+            assert!(
+                fixture == produced,
+                "{name} differs from what the sender produces:\n fixture: {}\nproduced: {}",
+                String::from_utf8_lossy(&fixture),
+                String::from_utf8_lossy(produced),
+            );
+        }
+    }
 }
