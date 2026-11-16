@@ -44,12 +44,17 @@ these ways:
   that load the same doc at once share one load; upstream could let the second replace the
   first while it was being written to, losing those writes.
 
-- **A new way for one doc to be unavailable.** The price of the point above: if the store
-  write that saves an idle doc before it is unloaded stalls (the S3 client has no request
-  timeout), that doc stays "being unloaded". Every HTTP update and websocket connection for
-  it is answered `503` after a 15 s wait, until the write completes or fails (the doc is then
-  usable again) or the process is restarted. Other docs are unaffected. Upstream never
-  waited: it dropped the doc at once, losing whatever was not saved.
+- **A new way for one doc to be unavailable, for a while.** The price of the point above:
+  while the store write that saves an idle doc before it is unloaded is stalled, that doc
+  stays "being unloaded", and every HTTP update and websocket connection for it is answered
+  `503` after a 15 s wait. It ends when the write completes or fails; the doc is then usable
+  again. With an S3 store a stalled write fails after the request timeout (60 s by default,
+  see [Store timeouts](#store-timeouts)), so this lasts about a minute, not until a restart.
+  Other docs are unaffected. Upstream never waited: it dropped the doc at once, losing
+  whatever was not saved.
+- **S3 requests time out.** Upstream's S3 client waits on a request without limit. Here a
+  request the endpoint does not answer fails, and whatever made it retries (see
+  [Store timeouts](#store-timeouts)).
 
 The request and response formats of every endpoint are unchanged. `userId` and `writer` in the
 auth request are accepted and ignored, as upstream does (upstream ignores `writer` as an unknown
@@ -65,6 +70,7 @@ All of these apply to `y-sweet serve` only. `serve-doc` has neither feature.
 | Variable | Flag | Default | Meaning |
 | --- | --- | --- | --- |
 | `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` | `--shutdown-timeout-seconds` | `110` | How long a graceful shutdown may take in all; docs are saved until then. Applies whether or not the two features are on. See [Shutdown](#shutdown). |
+| `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS` | (none) | `60` | How long the S3 store waits on a request before failing it. Applies to every command that uses an S3 store, whether or not the two features are on. See [Store timeouts](#store-timeouts). |
 | `Y_SWEET_ATTRIBUTED_TOKENS` | `--attributed-tokens [true\|false]` | `false` | Mint tokens that carry the actor of the auth request. |
 | `Y_SWEET_UPDATE_WEBHOOK_URL` | `--update-webhook-url` | unset | Where update batches are POSTed. Unset means no observer and no dispatcher. Must be `http` or `https`. |
 | `Y_SWEET_UPDATE_WEBHOOK_SECRET` | `--update-webhook-secret` | unset | HMAC secret. Required when the URL is set; without it the webhook stays off (see below). |
@@ -82,10 +88,11 @@ env file, a compose file) is safe. Whitespace around a value is ignored, except 
 `yes`, `on` for on; `false`, `0`, `no`, `off` for off. Anything else is a startup error: the
 switch decides what tokens are minted, so a typo must not silently pick one.
 
-`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` is a whole number of seconds, kept within 1 and 86400. A
-value that is not a number does not stop the server: it logs one error,
-`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS is not a whole number of seconds; using the default`, and
-runs with 110. The `attributed updates configuration` line shows the value in use.
+`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` and `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS` are whole numbers
+of seconds, kept within 1 and 86400. A value that is not a number does not stop the server: it
+logs one error, `timeout setting is not a whole number of seconds; using the default` (with
+the variable's name as `setting`), and runs with the default. For the shutdown timeout, the
+`attributed updates configuration` line shows the value in use.
 
 **A mistake in the webhook settings does not stop the server.** The webhook is optional, and
 this server is the only copy of the sync service, so a malformed URL, a URL without a secret, a
@@ -114,6 +121,39 @@ docker run --rm -p 8080:8080 \
   y-sweet-fork:dev-1839 \
   y-sweet serve --host 0.0.0.0 --prod /data
 ```
+
+### Store timeouts
+
+The S3 store gives up on a request the endpoint does not answer, so that a stalled connection
+turns into an error that is retried instead of a save or a load that never ends:
+
+- **Connecting** (TCP and TLS): 10 s.
+- **Until the response starts**: `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS` (default 60), plus one
+  second for every MiB of request body. A save of a 200 MiB doc therefore has 260 s; a link
+  to the store slower than 1 MiB/s needs a higher setting to save docs larger than it can
+  upload in the base time.
+- **Reading a response** (loading a doc): the same setting for each chunk, so a download may
+  take any time as long as it keeps moving.
+
+A request that times out fails like any other store error: a checkpoint save is tried again at
+the next checkpoint, the final save at shutdown is retried within the shutdown timeout, a doc
+that could not be saved before being unloaded stays loaded and writable, and a load answers
+`500` and is started afresh by the next request. The log line is the usual one for a failed
+save (`Error persisting.`, or `could not save the doc being collected; keeping it loaded`),
+with `Timed out after ... ms waiting for the S3-compatible API.` as the error.
+
+Timing out closes the request's connection, so nothing of an abandoned save is still being
+sent when the next one starts, and saves of one doc never overlap: each begins only when the
+one before has succeeded or failed, and holds a newer copy of the whole doc. One case cannot
+be excluded from this side: a store that had already received a save in full when the
+connection was closed, and applies it only after a later save of the same doc has been
+applied. The older copy would then be the stored one until the doc is saved again. S3 applies
+a write before it answers, so for this the answer has to be more than the timeout late while
+the retry overtakes it. The same exposure exists, as upstream, for any save whose connection
+breaks after the body was sent.
+
+The filesystem store has no timeout. Neither has the Cloudflare worker build, where the
+platform bounds requests.
 
 ### Sizing
 
@@ -458,7 +498,7 @@ level; the webhook URL appears only as its host.
 | error | `doc not saved before the shutdown deadline` (full message continues `; its changes since the last save are lost`) | `doc_id`. One per unsaved doc. |
 | warn | `final save failed; retrying` | `retry_in_ms`; in the `save_loop` span, which carries the `doc_id` |
 | error | `update webhook configuration is invalid; starting with the update webhook DISABLED` | `error` (the reason; never the URL or the secret) |
-| error | `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS is not a whole number of seconds; using the default` | `default_seconds`. The rejected value is not logged. |
+| error | `timeout setting is not a whole number of seconds; using the default` | `setting` (the variable's name), `default_seconds`. The rejected value is not logged. |
 | info | `update webhook shutdown: nothing to flush` / `update webhook shutdown flush done` | `docs`, `batches`, `delivered` |
 | warn | `update webhook shutdown flush incomplete` | `docs`, `batches`, `delivered`, `timed_out` |
 

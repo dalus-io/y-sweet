@@ -227,33 +227,56 @@ fn parse_number<T: std::str::FromStr>(name: &str, value: &Option<String>) -> Res
         .transpose()
 }
 
-/// The longest shutdown timeout accepted, in seconds: one day. Far beyond any platform's stop
-/// timeout, and small enough that deadlines computed from it cannot overflow.
-const MAX_SHUTDOWN_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+/// The longest timeout accepted, in seconds: one day. Far beyond any useful value, and small
+/// enough that deadlines computed from it cannot overflow.
+const MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 
-/// The shutdown timeout to run with. Unset or empty means the default. A value that is not a
-/// whole number of seconds is reported and replaced by the default rather than keeping the
+/// A timeout setting given in seconds. Unset or empty means the default. A value that is not
+/// a whole number of seconds is reported and replaced by the default rather than keeping the
 /// server from starting: this server is the only copy of the sync service, and the default is
 /// a safe value. A number is kept within 1 s and one day.
-fn shutdown_timeout_from_opt(value: &Option<String>) -> std::time::Duration {
-    let default = y_sweet::server::DEFAULT_SHUTDOWN_TIMEOUT;
-    let Some(value) = non_empty(value) else {
+fn seconds_or_default(
+    setting: &'static str,
+    value: Option<&str>,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
         return default;
     };
     match value.parse::<u64>() {
-        Ok(seconds) => {
-            std::time::Duration::from_secs(seconds.clamp(1, MAX_SHUTDOWN_TIMEOUT_SECONDS))
-        }
+        Ok(seconds) => std::time::Duration::from_secs(seconds.clamp(1, MAX_TIMEOUT_SECONDS)),
         Err(_) => {
             // The value is not echoed: nothing read from the environment is, in case the
             // wrong variable ended up here.
             tracing::error!(
+                setting,
                 default_seconds = default.as_secs(),
-                "Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS is not a whole number of seconds; using the default"
+                "timeout setting is not a whole number of seconds; using the default"
             );
             default
         }
     }
+}
+
+/// The shutdown timeout to run with (`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS`).
+fn shutdown_timeout_from_opt(value: &Option<String>) -> std::time::Duration {
+    seconds_or_default(
+        "Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS",
+        value.as_deref(),
+        y_sweet::server::DEFAULT_SHUTDOWN_TIMEOUT,
+    )
+}
+
+const S3_REQUEST_TIMEOUT: &str = "Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS";
+
+/// The S3 store's request timeout (`Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS`), read from the
+/// environment like the rest of the S3 settings.
+fn s3_request_timeout_from_env() -> std::time::Duration {
+    seconds_or_default(
+        S3_REQUEST_TIMEOUT,
+        env::var(S3_REQUEST_TIMEOUT).ok().as_deref(),
+        y_sweet_core::store::s3::DEFAULT_REQUEST_TIMEOUT,
+    )
 }
 
 /// Builds the update webhook configuration from the `serve` options. `Ok(None)` means the
@@ -382,7 +405,7 @@ fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
         let bucket_prefix = url.path().trim_start_matches('/').to_owned();
         let bucket_prefix = (!bucket_prefix.is_empty()).then_some(bucket_prefix); // "" => None
         let config = parse_s3_config_from_env_and_args(bucket, bucket_prefix)?;
-        let store = S3Store::new(config);
+        let store = S3Store::new(config).with_request_timeout(s3_request_timeout_from_env());
         Ok(Box::new(store))
     } else {
         Ok(Box::new(FileSystemStore::new(PathBuf::from(store_path))?))
@@ -627,7 +650,8 @@ async fn run() -> Result<()> {
                 };
 
                 let s3_config = parse_s3_config_from_env_and_args(bucket, prefix)?;
-                let store = S3Store::new(s3_config);
+                let store =
+                    S3Store::new(s3_config).with_request_timeout(s3_request_timeout_from_env());
                 let store: Box<dyn Store> = Box::new(store);
                 store.init().await?;
                 Some(store)
@@ -733,8 +757,21 @@ mod tests {
         assert_eq!(shutdown_timeout_from_opt(&opt("0")), seconds(1));
         assert_eq!(
             shutdown_timeout_from_opt(&opt("18446744073709551615")),
-            seconds(MAX_SHUTDOWN_TIMEOUT_SECONDS)
+            seconds(MAX_TIMEOUT_SECONDS)
         );
+    }
+
+    #[test]
+    fn s3_request_timeout_parsing() {
+        let default = y_sweet_core::store::s3::DEFAULT_REQUEST_TIMEOUT;
+        let parsed = |value| seconds_or_default(S3_REQUEST_TIMEOUT, value, default);
+        assert_eq!(default, std::time::Duration::from_secs(60));
+        for unset in [None, Some(""), Some(" ")] {
+            assert_eq!(parsed(unset), default);
+        }
+        assert_eq!(parsed(Some("15")), std::time::Duration::from_secs(15));
+        assert_eq!(parsed(Some("fast")), default);
+        assert_eq!(parsed(Some("0")), std::time::Duration::from_secs(1));
     }
 
     /// Every setting this fork adds, given as an empty or blank flag value (which is what clap

@@ -379,7 +379,9 @@ being applied at that moment was acknowledged and never saved. Now:
   tries again later. A save that fails leaves the doc dirty.
 - GC never abandons that save, however long it takes. A write already sent to the store cannot be recalled
   (S3 has no fencing here); abandoning it, letting the doc be written and saved again, would let the old
-  write land last and overwrite newer state.
+  write land last and overwrite newer state. The S3 store's own request timeout (below) is not such an
+  abandonment: it closes the request's connection and returns an error, GC un-retires the doc, and the
+  next save starts only after that.
 - A writer takes its doc with `Server::live_doc`, and all of that is bounded by 15 s and by shutdown
   (`503` either way): loading the doc, waiting behind another load of it, and waiting for a retired doc to be
   dropped and loading it again. A doc that is there at once is taken even during shutdown, so in-flight
@@ -394,9 +396,16 @@ This trades data loss for a narrower availability risk, which the operator doc l
 retired doc is stalled, that one doc answers `503` (after the 15 s wait) until the write completes or
 fails, or the process restarts. Upstream dropped the doc immediately and lost the unsaved edits instead.
 
-The S3 client still has no request timeout of its own (the store module is also built for wasm, where
-reqwest has no timeout setting, so it is not a one-line change). The waits that writers and shutdown depend
-on are bounded instead, as above.
+The S3 client has a request timeout (`Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS`, default 60 s, plus 1 s per MiB
+of request body so that it puts no ceiling on doc size; 10 s to connect; the same 60 s per chunk when
+reading a response). A stalled write therefore fails, GC un-retires the doc and its persistence worker
+retries, so the "being unloaded" state ends after about a minute instead of lasting until a restart. The
+timeout is applied with a timer around the request, not through reqwest, whose wasm build has no timeout
+setting; the wasm build (the Cloudflare worker) applies none. Timing out drops the request, which closes
+its connection, before the error is returned, so the rule that a doc's saves never overlap holds for a
+timed-out save as it does for one that failed any other way. What it cannot rule out is a store that
+applies a fully received write after the connection is gone and after a later save; see the operator
+page. The waits that writers and shutdown depend on stay bounded independently of this, as above.
 
 ### 4.7 Configuration
 
@@ -405,6 +414,7 @@ on are bounded instead, as above.
 | `Y_SWEET_UPDATE_WEBHOOK_URL` | Target URL. Unset means no observer and no dispatcher. |
 | `Y_SWEET_UPDATE_WEBHOOK_SECRET` | HMAC secret. Required when the URL is set. |
 | `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` | Total time a graceful shutdown may take, default 110 (section 4.6). Not a webhook setting: it applies with everything off. Empty counts as unset; a value that is not a number is logged as an error and replaced by the default, so it cannot keep the server from starting. |
+| `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS` | Request timeout of the S3 store, default 60 (section 4.6). Environment only, like the other S3 settings. Empty and invalid values are handled like the shutdown timeout's. |
 | `Y_SWEET_UPDATE_WEBHOOK_BATCH_MS` | Coalescing window per doc, default 1000. |
 | `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | Global budget for the estimated memory of held updates, default 268435456. |
 | `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | Requests in flight at once across docs, default 16 (section 4.5). |
