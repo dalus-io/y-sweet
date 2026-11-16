@@ -232,7 +232,7 @@ impl SyncKv {
     }
 }
 
-impl<'d> DocOps<'d> for SyncKv {}
+impl DocOps<'_> for SyncKv {}
 
 pub struct SyncKvEntry {
     key: Vec<u8>,
@@ -271,7 +271,7 @@ impl Iterator for SyncKvCursor {
     }
 }
 
-impl<'a> yrs_kvstore::KVStore<'a> for SyncKv {
+impl yrs_kvstore::KVStore<'_> for SyncKv {
     type Error = std::convert::Infallible;
     type Cursor = SyncKvCursor;
     type Entry = SyncKvEntry;

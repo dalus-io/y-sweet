@@ -260,6 +260,8 @@ pub struct Server {
 }
 
 impl Server {
+    // The signature is upstream's; kept so the fork stays easy to merge.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         store: Option<Box<dyn Store>>,
         checkpoint_freq: Duration,
