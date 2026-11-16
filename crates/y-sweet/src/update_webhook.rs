@@ -3320,5 +3320,67 @@ GZuNFD2CfzKu6mHIOnyE
                 String::from_utf8_lossy(produced),
             );
         }
+        if regenerate {
+            std::fs::write(dir.join(CONTRACT_CHECKSUMS), contract_checksums(&dir)).unwrap();
+        }
+        assert_contract_checksums(&dir);
+    }
+
+    const CONTRACT_CHECKSUMS: &str = "CHECKSUMS.sha256";
+
+    /// The fixture files of the contract: every `.json` file in the directory, by name.
+    fn contract_fixture_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What `CHECKSUMS.sha256` must contain: the output of `sha256sum *.json` in the fixture
+    /// directory (hex digest, two spaces, file name, one line per file, sorted by name).
+    fn contract_checksums(dir: &std::path::Path) -> String {
+        use sha2::Digest;
+        contract_fixture_names(dir)
+            .iter()
+            .map(|name| {
+                let digest = Sha256::digest(std::fs::read(dir.join(name)).unwrap());
+                format!("{}  {name}\n", HEXLOWER.encode(&digest))
+            })
+            .collect()
+    }
+
+    fn assert_contract_checksums(dir: &std::path::Path) {
+        let recorded = std::fs::read_to_string(dir.join(CONTRACT_CHECKSUMS)).unwrap();
+        assert_eq!(
+            recorded,
+            contract_checksums(dir),
+            "{CONTRACT_CHECKSUMS} does not match the fixture files. If the change to the wire \
+             format is intended, regenerate (see the README beside the fixtures) and make the \
+             same change to the receiver repo's copy of the fixtures and of {CONTRACT_CHECKSUMS}."
+        );
+    }
+
+    /// The fixtures are kept in two repos, this one and the receiver's. `CHECKSUMS.sha256`
+    /// is what ties the copies together: each repo has the same file and a test like this
+    /// one, so a fixture edited in either repo fails that repo's test until the checksums
+    /// are updated, and the checksum file then differs between the repos until the other
+    /// copy follows.
+    #[test]
+    fn contract_fixtures_match_their_checksums() {
+        if std::env::var("UPDATE_CONTRACT_FIXTURES").is_ok_and(|v| v == "1") {
+            // Being regenerated, and checked, by the test above.
+            return;
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/update-webhook-contract");
+        assert_eq!(
+            contract_fixture_names(&dir),
+            ["batch.json", "empty-gap-batch.json", "signature.json"],
+            "a fixture was added or removed: update this list, the README and the receiver repo"
+        );
+        assert_contract_checksums(&dir);
     }
 }
