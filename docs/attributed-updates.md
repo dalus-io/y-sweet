@@ -169,14 +169,34 @@ held anywhere in the pipeline is charged an estimate of the most it occupies the
 
 So a 1-byte edit is charged about 260 bytes and a 1 MiB update about 1.33 MiB, and the budget
 tracks real memory whether the receiver is behind on a few large updates or on hours of tiny
-ones. With the budget full, the pipeline holds about the configured value. Two things are not in
-the estimate: allocator overhead, and one batch at a time being serialized (its raw and encoded
-forms coexist for a moment, at most about 19 MiB for an 8 MiB update). Give the container the
-budget plus about 15% on top of what the server needs for its docs: roughly 300 MiB for the
-default 256 MiB. The default holds about 190 MiB of large updates, or about a million small
-edits. To fit a smaller container, lower the budget; a receiver outage then turns into gaps
-sooner, which costs attribution, not correctness, as long as the receiver resyncs (see
-[Gaps](#gaps)).
+ones.
+
+The charge is a bound on what is kept, in each form an update takes:
+
+- **Waiting** (in the channel, in an open or queued batch): the raw update, its strings and
+  about 110 bytes of structure. Less than the charge.
+- **In flight** (its batch serialized, being sent or waiting to be retried, for up to
+  10 minutes with the receiver down): only the request body, allocated at exactly its
+  length. The body of a batch is at most the sum of its events' charges; where it is not,
+  because a `userId`, `writer` or doc id needs JSON escaping, the charge is raised to the
+  body's length when the batch is serialized (this can take the total over the budget by up
+  to about 1 KiB per such event).
+
+**Worst case.** With the budget full and the receiver down, the pipeline keeps at most the
+configured value, plus:
+
+- one batch being serialized: its raw and encoded forms coexist for that moment, at most
+  about 19 MiB (an 8 MiB update and its 10.7 MiB body). One at a time, whatever the
+  concurrency setting;
+- empty gap batches in flight, which carry no events and are not charged: at most 4096 of
+  about 150 bytes, 0.6 MiB;
+- allocator overhead, about 15% in practice.
+
+So give the container the budget plus about 15% plus 20 MiB, on top of what the server needs
+for its docs: roughly 320 MiB for the default 256 MiB. The default holds about 190 MiB of
+large updates, or about a million small edits. To fit a smaller container, lower the budget; a
+receiver outage then turns into gaps sooner, which costs attribution, not correctness, as long
+as the receiver resyncs (see [Gaps](#gaps)).
 
 The other limits (8 MiB per update, 1 MiB per batch) and the `bytes` field in the logs remain in
 update bytes; `held_bytes` in the logs is in budget units.

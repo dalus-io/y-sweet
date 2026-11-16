@@ -199,6 +199,12 @@ impl Shared {
             .is_ok()
     }
 
+    /// Adds to what is held without asking: for bytes that are held already, whatever the
+    /// budget says (see [Batcher::start_delivery]).
+    fn charge(&self, bytes: usize) {
+        self.held_bytes.fetch_add(bytes, Ordering::SeqCst);
+    }
+
     fn release(&self, bytes: usize) {
         self.held_bytes.fetch_sub(bytes, Ordering::SeqCst);
     }
@@ -229,6 +235,11 @@ const EVENT_OVERHEAD_BYTES: usize = 256;
 /// (4/3 of the update). So the charge is the base64 size plus the strings that travel with it
 /// and a fixed overhead. Without the overhead, a long outage with many tiny edits would hold
 /// hundreds of bytes per event while being charged one or two.
+///
+/// The estimate only bounds memory if each form keeps no more than its size: a closed batch
+/// drops its spare event slots ([DocState::close_open]), and a body is allocated at exactly
+/// its length ([prepare]) and its charge raised to that length should it be larger
+/// ([Batcher::start_delivery]).
 ///
 /// Called by the observer under the doc lock: a few additions, no allocation.
 fn event_cost(event: &AttributedUpdate) -> usize {
@@ -322,12 +333,43 @@ struct PreparedBatch {
     body: Bytes,
 }
 
+/// An update as it appears in the payload: standard base64. It is encoded straight into the
+/// output, a piece at a time, so the encoded form never exists as a string of its own beside
+/// the body.
+struct Base64<'a>(&'a [u8]);
+
+impl std::fmt::Display for Base64<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        BASE64.encode_write(self.0, f)
+    }
+}
+
+impl Serialize for Base64<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 #[derive(Serialize)]
 struct PayloadEvent<'a> {
     seq: u64,
     actor: Option<&'a Actor>,
-    update: String,
+    update: Base64<'a>,
     occurred_at: String,
+}
+
+/// Counts what is written to it.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -353,12 +395,21 @@ fn prepare(doc_id: &str, instance_id: &str, batch: Batch, gap_before: bool) -> P
             .map(|event| PayloadEvent {
                 seq: event.seq,
                 actor: event.actor.as_ref(),
-                update: BASE64.encode(&event.update),
+                update: Base64(&event.update),
                 occurred_at: rfc3339_millis(event.occurred_at),
             })
             .collect(),
     };
-    let body = serde_json::to_vec(&payload).expect("Serializing a batch to JSON cannot fail.");
+    // Measured first, then written into a buffer of exactly that size. A buffer left to grow
+    // as it is appended to ends up with up to twice the capacity it needs, and the body
+    // keeps that capacity for as long as the batch is in flight (ten minutes of retries with
+    // the receiver down), which the budget would not know about.
+    const INFALLIBLE: &str = "Serializing a batch to JSON cannot fail.";
+    let mut size = ByteCount(0);
+    serde_json::to_writer(&mut size, &payload).expect(INFALLIBLE);
+    let mut body = Vec::with_capacity(size.0);
+    serde_json::to_writer(&mut body, &payload).expect(INFALLIBLE);
+    debug_assert_eq!(body.len(), body.capacity());
 
     PreparedBatch {
         doc_id: doc_id.to_string(),
@@ -392,7 +443,10 @@ impl DocState {
     }
 
     fn close_open(&mut self) {
-        if let Some(open) = self.open.take() {
+        if let Some(mut open) = self.open.take() {
+            // It may wait in the queue for a long time: without the room it grew for events
+            // that did not come.
+            open.batch.events.shrink_to_fit();
             self.queue.push_back(open.batch);
         }
     }
@@ -695,7 +749,10 @@ impl Batcher {
                     // already took it.
                     continue;
                 }
-                let prepared = Arc::new(prepare(&doc_id, &self.instance_id, batch, gap_before));
+                let prepared = Arc::new(Self::start_delivery(
+                    &self.shared,
+                    prepare(&doc_id, &self.instance_id, batch, gap_before),
+                ));
                 state.in_flight = Some(prepared.clone());
                 startable.push(prepared);
                 break;
@@ -705,6 +762,25 @@ impl Batcher {
             }
         }
         startable
+    }
+
+    /// Makes the charge of a batch that was just serialized cover its body.
+    ///
+    /// From here until it is acked or dropped, what the batch holds is its body. The estimate
+    /// its events were charged on arrival ([event_cost]) covers that, except for strings that
+    /// grow when escaped as JSON (a control character takes six bytes). The difference is
+    /// charged now, over the budget if need be: the memory is in use either way, and counting
+    /// it is what makes the observers hold back.
+    ///
+    /// An empty gap batch is exempt. It carries no events, and how many of those there can be
+    /// is bounded on its own (see [Batcher::enforce_gap_only_cap]).
+    fn start_delivery(shared: &Shared, mut batch: PreparedBatch) -> PreparedBatch {
+        if batch.events > 0 {
+            let uncharged = batch.body.len().saturating_sub(batch.cost);
+            shared.charge(uncharged);
+            batch.cost += uncharged;
+        }
+        batch
     }
 
     /// Records the end of a doc's in-flight delivery: acked, or dropped for good.
@@ -3083,6 +3159,94 @@ GZuNFD2CfzKu6mHIOnyE
             "{held} bytes held, {} charged",
             cost("doc", 1)
         );
+    }
+
+    /// The bytes the body of a batch keeps allocated, once the batcher has let go of it.
+    fn retained(batch: Arc<PreparedBatch>) -> usize {
+        let batch = Arc::try_unwrap(batch)
+            .ok()
+            .expect("the batcher still holds the batch");
+        batch
+            .body
+            .try_into_mut()
+            .expect("the body is not shared")
+            .capacity()
+    }
+
+    #[test]
+    fn a_batch_in_flight_keeps_no_more_memory_than_it_is_charged() {
+        // With the receiver down every doc ends up with one batch serialized and in flight,
+        // for up to ten minutes. The budget is only a bound on memory if such a batch keeps
+        // allocated no more than it holds against the budget. A body built by appending to a
+        // growing buffer keeps the buffer's spare capacity, up to as much again.
+        for (events, size) in [
+            (1, 1),
+            (1, 700),
+            (1, 100_000),
+            (1, MIB + 1),
+            (1, 3 * MIB),
+            (1, 8 * MIB),
+            (7, 100_000),
+            (256, 3_000),
+            (256, 1),
+        ] {
+            let mut p = Pipeline::new(test_config());
+            for _ in 0..events {
+                p.emit("doc", size);
+            }
+            p.advance(WINDOW);
+            let batch = p.start_one();
+            assert_eq!(batch.events, events);
+            let (charged, body) = (batch.cost, batch.body.len());
+            assert_eq!(p.shared.held_bytes(), charged);
+            p.ack(&batch);
+            let retained = retained(batch);
+            assert_eq!(retained, body, "{events} events of {size} bytes");
+            assert!(
+                retained <= charged,
+                "{events} events of {size} bytes: {retained} bytes kept, {charged} charged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_whose_strings_need_escaping_is_charged_for_its_real_size() {
+        // Control characters take six bytes each in JSON. The estimate made when the event
+        // arrives does not know that; the charge is corrected when the batch is serialized.
+        let mut p = Pipeline::new(test_config());
+        let escaped = AttributedUpdate {
+            actor: Some(Actor {
+                user_id: Some("\u{1}".repeat(128)),
+                writer: Some("\u{2}".repeat(64)),
+            }),
+            ..event("doc", 1)
+        };
+        let estimate = event_cost(&escaped);
+        p.sink.offer(escaped);
+        p.pump();
+        assert_eq!(p.shared.held_bytes(), estimate);
+        p.advance(WINDOW);
+        let batch = p.start_one();
+        assert!(batch.body.len() > estimate);
+        assert_eq!(batch.cost, batch.body.len());
+        assert_eq!(p.shared.held_bytes(), batch.body.len());
+        // And all of it is released again.
+        p.ack(&batch);
+        assert_eq!(p.shared.held_bytes(), 0);
+    }
+
+    #[test]
+    fn a_closed_batch_keeps_no_spare_room_for_events() {
+        let mut p = Pipeline::new(test_config());
+        for _ in 0..5 {
+            p.emit("doc", 1);
+        }
+        p.advance(WINDOW);
+        let state = &p.batcher.docs["doc"];
+        assert!(state.open.is_none());
+        let batch = &state.queue[0];
+        assert_eq!(batch.events.len(), 5);
+        assert_eq!(batch.events.capacity(), 5);
     }
 
     /// The wire contract shared with the receiver: see `testdata/update-webhook-contract`.

@@ -250,9 +250,18 @@ The budget counts estimated memory, not raw update bytes. Each event is charged 
 strings, and a fixed 256 bytes for the structs and JSON framing around it. Counting raw bytes alone
 undercounted badly in the case the budget exists for: with the receiver down for hours and many tiny edits,
 each event was charged a byte or two while holding a few hundred. The charge is computed by the observer
-with a few additions and no allocation. With the budget full, real memory is about the budget; allocator
-overhead and the one batch being serialized at a time are outside the estimate. The operator doc gives
-sizing guidance.
+with a few additions and no allocation.
+
+For the charge to bound memory, each form an event takes must keep no more than the charge. Waiting, it is
+the raw update plus about 110 bytes of structure; a batch drops its spare event slots when it closes. In
+flight, it is the request body alone, which is why the body is measured first and then serialized into a
+buffer of exactly that size, with base64 written straight into it. (Serializing into a growing buffer left
+the body with up to twice the capacity it used: a doc with one large update in flight kept 2.0 times its
+charge, and with the receiver down every doc has a batch in flight, so the pipeline could hold about twice
+the budget.) Should a body still be larger than its events were charged, which takes strings that need
+JSON escaping, the charge is raised to the body's length when the batch is serialized. With the budget
+full, real memory is therefore the budget, plus the one batch being serialized at a time (raw and encoded
+forms together, at most about 19 MiB), plus allocator overhead. The operator doc gives sizing guidance.
 
 ### 4.4 Signing and transport
 
