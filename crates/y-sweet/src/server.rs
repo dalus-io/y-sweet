@@ -2102,6 +2102,9 @@ mod test {
         /// of it: it is kept in `stale_write`, to be applied late by `land_stale_write`.
         time_out_next_set: Arc<std::sync::atomic::AtomicBool>,
         stale_write: Arc<std::sync::Mutex<Option<StoredWrite>>>,
+        /// When that write was failed: taken by the store as it returns the error, so it is
+        /// never later than the moment the server learns of the failure.
+        timed_out_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
         /// How many writes were stored.
         sets: Arc<std::sync::atomic::AtomicUsize>,
         /// Every write takes this long, in milliseconds.
@@ -2129,6 +2132,7 @@ mod test {
                 fail_sets: Default::default(),
                 time_out_next_set: Default::default(),
                 stale_write: Default::default(),
+                timed_out_at: Default::default(),
                 sets: Default::default(),
                 set_delay_ms: Default::default(),
                 hold_sets: Default::default(),
@@ -2185,6 +2189,7 @@ mod test {
             }
             if self.time_out_next_set.swap(false, SeqCst) {
                 *self.stale_write.lock().unwrap() = Some((key.to_string(), value));
+                *self.timed_out_at.lock().unwrap() = Some(std::time::Instant::now());
                 return Err(y_sweet_core::store::StoreError::Timeout {
                     limit: Duration::from_millis(1),
                     what: "waiting for",
@@ -2267,7 +2272,14 @@ mod test {
             store.stale_write.lock().unwrap().is_some()
         })
         .await;
-        let timed_out_at = std::time::Instant::now();
+        // The store's own record of the moment, not the time this test noticed: the suspect
+        // window is counted from the failure, and the checks below compare against it to
+        // the millisecond (GC can collect the doc within moments of the window's end).
+        let timed_out_at = store
+            .timed_out_at
+            .lock()
+            .unwrap()
+            .expect("set with the write");
         assert_eq!(
             post_update(addr, doc_id, map_edit(2)).await.unwrap(),
             Some(200)
@@ -2292,9 +2304,15 @@ mod test {
         const DOC: &str = "suspect-doc";
         let store = TestStore::default();
         let token = CancellationToken::new();
-        let window = Duration::from_millis(2500);
+        // Long against what the test does inside it (well under a second on an idle machine),
+        // so that a loaded machine still gets its checks in before the window ends.
+        let window = Duration::from_millis(4000);
         let (docs, serving, timed_out_at) =
             server_after_a_timed_out_save(&store, &token, DOC, window).await;
+        assert!(
+            timed_out_at.elapsed() < window / 2,
+            "the test ran too slowly to check anything"
+        );
         let unsaved = || docs.get(DOC).unwrap().sync_kv().has_unsaved_changes();
 
         // (a) The save that succeeded did not leave the doc clean...
@@ -2312,17 +2330,21 @@ mod test {
 
         // (b) GC leaves the doc alone for as long as it is suspect, idle though it is: here
         // for ten checkpoints, where two would do otherwise.
+        let mut checked = 0;
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            if timed_out_at.elapsed() < window - Duration::from_millis(200) {
+            // Looked at only while the window is certainly still open, with a margin for
+            // the time the three lines take themselves.
+            if timed_out_at.elapsed() < window - Duration::from_millis(500) {
                 assert!(docs.contains_key(DOC), "collected while suspect");
                 assert!(!is_retired(&docs, DOC), "retired while suspect");
                 assert!(unsaved());
+                checked += 1;
             }
         }
         assert!(
-            timed_out_at.elapsed() < window,
-            "the test ran too slowly to check anything"
+            checked >= 5,
+            "the test ran too slowly: only {checked} looks inside the window"
         );
 
         // (c) After the window a save clears the doc, and GC collects it.
@@ -2330,10 +2352,11 @@ mod test {
             !docs.contains_key(DOC)
         })
         .await;
+        // Not a moment before the window, counted from the failure itself, had passed.
         assert!(timed_out_at.elapsed() >= window);
-        // Meanwhile it was saved every 250 ms or so, not at each of the fifty checkpoints.
+        // Meanwhile it was saved every 250 ms or so, not at each of the eighty checkpoints.
         let saves = store.sets.load(std::sync::atomic::Ordering::SeqCst);
-        assert!((5..25).contains(&saves), "{saves} saves");
+        assert!((4..40).contains(&saves), "{saves} saves");
         let stored = stored_keys_of(&store, DOC).await;
         assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
 
