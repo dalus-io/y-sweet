@@ -355,14 +355,59 @@ With `Y_SWEET_USER_SUSPENSION=true` the server behaves as the production build w
   server token: `401`. With the switch off the route does not exist (`404`).
 - **Token lifetime.** A websocket opened with a managed token is closed when the token
   expires.
-- **State.** One small JSON object per user that was ever suspended or restored, under
-  `__dalus_auth/users/` in the store; include it in backups. Reads and writes of it have a
-  3 s limit. It is read once per user and then kept in memory, which is one more reason this
-  server must be the only one on its store.
+- **State.** Small JSON objects under `__dalus_auth/users/` in the store; include them in
+  backups. Reads and writes of them have a 3 s limit each. A user's state is read once and
+  then kept in memory, which is one more reason this server must be the only one on its
+  store. See [Revocation records](#revocation-records).
 
-An HTTP update is checked twice: when the request arrives, and again just before it is
-applied, so an update that was waiting for its doc to load while its user was suspended is
-refused (`401`).
+**What the `204` means.** When the suspension endpoint has answered, nothing of that user is
+applied or read any more: not an HTTP update, not a websocket frame, not an `as-update`
+read. A request is checked when it arrives and again at the moment it acts, once its doc is
+in memory; from that second check until it is done it holds a per-user guard, and the endpoint
+takes that guard exclusively before it answers. So a request that got in before the
+suspension is finished before the `204`, and one that asks after it is refused (`401`), also
+if it had been waiting for its doc to load or for the doc lock. The endpoint therefore waits
+for the user's writes that are in progress, which is in-memory work on a doc and normally
+takes milliseconds. A response already being sent when the user is suspended is not recalled.
+
+#### Revocation records
+
+Every suspension or restore is a new *generation* of the user, stored as a record of its own:
+`__dalus_auth/users/<user>/<generation>.json`, holding the generation and whether the user is
+suspended. The user's state is the record with the highest generation. The server finds it
+by reading generations upwards until one is missing.
+
+Records are never overwritten with a different acknowledged state, for this reason: a write
+to the store can time out for the server and be applied by the store later. With one object
+per user, overwritten on every change (which is how the production build with the patch
+stores it), such a late write can replace a state that was acknowledged after it: a restore
+that timed out, landing after a later suspension, un-suspends the user at the next restart.
+Here a late write lands on a generation that is no longer the highest, and changes nothing.
+Two rules make that hold:
+
+- A change whose write failed is never retried on the same generation. The next change first
+  stores a record that keeps the current state under the generation that may have been
+  used, then stores itself under the one after.
+- The first change of a user after the server started does the same, because the server
+  cannot know whether the previous process left such a write behind.
+
+So a change takes one or two generations and up to three writes, and a user's tokens can be
+invalidated by a change that then fails (when its first write succeeded and its second did
+not): the call answers `503`, the user's state is unchanged, their sockets are closed and they
+need new tokens. Repeating the call is safe.
+
+**The single object of earlier builds** (`__dalus_auth/users/<user>.json`) is still read: its
+generation is where the server starts reading upwards, so everything the production build
+wrote is honoured. It is also still written, after every change, with the new state, so that
+a build that knows only that object (the current production build, during a rolling deploy or
+after a rollback) sees the change. If writing it fails the change stands and the server logs
+`could not update the single-object copy of a user access record` (warn, no user id); that
+build would then see the previous state until the next change. What the fencing does not
+cover is a build of that kind writing while this one runs: it reads and overwrites only the
+single object. If it writes a generation below the lowest generation-keyed record of that
+user, this build, at its next start, reads that older state. That is the same last-writer-wins
+the production build has today, and needs two servers writing to one store, which the
+deployment forbids.
 
 #### Suspension and attribution together
 
@@ -399,7 +444,14 @@ With `Y_SWEET_ENFORCE_TOKEN_EXPIRY=true` the server behaves as the appliance bui
   to expire. This applies to HTTP and websocket requests alike. Tokens this server mints
   always expire (`validForSeconds`, default one hour).
 - A websocket is closed when the token it was opened with expires, and a frame that arrives
-  after that moment is not applied.
+  after that moment is not applied. The deadline is checked when a frame or an HTTP request
+  arrives and again at the moment it acts. A write that passes that second check just before
+  the deadline can complete just after it, by the time it waits for the doc lock and is
+  applied (normally well under a millisecond); nothing that starts after the deadline is
+  applied. The socket itself is closed by a timer set when it opens, while a token is judged
+  by the wall clock; where the two drift apart (a clock being corrected), a socket can be
+  closed slightly before the token stops verifying, and a reconnect in that gap is accepted
+  and closed again at the deadline.
 - Attributed tokens are held to the same rule and keep their actor. (The patch predates them
   and would have rejected them.)
 - In single-doc mode (`serve-doc`), which has no tokens, the switch is a startup error.

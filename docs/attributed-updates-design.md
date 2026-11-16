@@ -94,14 +94,31 @@ had to settle:
   drops the `DocConnection`, which unregisters from the doc under the doc lock (the connection-churn fix
   below), and only then aborts the sender task so that the socket closes at once. A suspension that
   closes many sockets of one doc while others connect is therefore serialized like any other churn.
-- **HTTP updates.** Verified on arrival, then the doc is fetched (which can wait for a load), then the
-  cancellation is checked again under write admission, right before applying.
+- **What the suspension answer guarantees.** Checking a flag before applying is not enough: a write can
+  pass the check, wait for the doc lock, and be applied after the endpoint has answered. Each user has an
+  activity guard, a read/write lock. A request takes it for reading at its last check (after its doc is in
+  memory and, for writes, after write admission) and holds it until the read or write is done, the wait
+  for the doc lock included. `UserAccess::set_suspended` cancels the user's token state and then takes the
+  guard for writing before it returns. So a request either holds the guard before the suspension, and the
+  endpoint waits for it, or takes it after, and finds the cancellation. Lock order is write gate, then
+  activity guard, then doc lock; the endpoint takes only the user's own mutex and then the guard, and no
+  holder of the guard takes that mutex, so there is no cycle. The guard is held across in-memory work
+  only: never across a doc load, store IO or a socket write. The same check applies the token's deadline;
+  for that, a write admitted just before the deadline may finish just after it.
+- **HTTP reads.** `as-update` fetches the doc, then takes the guard, checks, and encodes the doc under it.
+- **Revocation records.** The patch kept one object per user and overwrote it on each change, so a write
+  that timed out and landed late could replace a later, acknowledged state. Records are now one object per
+  generation, the highest generation is the state, a key never receives two different acknowledged
+  contents, and a generation is only used once all below it are stored, which is what lets the highest be
+  found by reading upwards without listing the store (the `Store` trait has no listing). The single object
+  is kept as a starting point for reading and as a mirror for builds that know nothing else. The operator
+  page has the details and the one case this does not cover (an old build writing concurrently).
 - **Shutdown, GC, loading.** Revocation records are written straight to the store by the suspension
   endpoint, with their own 3 s limit, and are durable before the endpoint answers; they are not docs, so
-  the write gate, the final saves, doc GC and the suspect window do not involve them. If such a write
-  times out after reaching the store, the store may end up one generation ahead of memory: after a
-  restart the user is then in the state the timed-out call asked for and tokens minted in between are
-  dead, which errs on the side of denying.
+  the write gate, the final saves, doc GC and the suspect window do not involve them. A change whose
+  write times out after reaching the store, and that is never followed by another change of that user,
+  can still take effect at the next restart: no later generation exists to outrank it. That is inherent
+  in a write of unknown outcome; what cannot happen any more is that it outranks a later change.
 - **Tokens with attribution.** A token that must carry both the binding and the actor is variant 4.
   Whether a request's `userId` binds the token is decided as the patch decides it (it does), with
   `"userScoped": false` as the request's way out; see the operator page for what that means for
