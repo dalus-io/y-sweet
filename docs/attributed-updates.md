@@ -47,6 +47,12 @@ these ways:
   that load the same doc at once share one load; upstream could let the second replace the
   first while it was being written to, losing those writes.
 
+- **Connections opening and closing at once cannot freeze a doc.** Upstream unregisters a
+  closing websocket's observers without the doc lock. The yrs version in use (0.19) can then
+  spin for ever in a connection that is opening at that moment, with the doc locked: nothing
+  reads, writes or saves that doc again, and the thread is lost. Here a connection is closed
+  under the doc lock, so the two never overlap. This matters more with attribution on, since a
+  client then reconnects whenever its actor changes.
 - **A new way for one doc to be unavailable, for a while.** The price of the point above:
   while the store write that saves an idle doc before it is unloaded is stalled, that doc
   stays "being unloaded", and every HTTP update and websocket connection for it is answered

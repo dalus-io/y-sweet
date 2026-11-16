@@ -422,6 +422,16 @@ timed-out save as it does for one that failed any other way. What it cannot rule
 applies a fully received write after the connection is gone and after a later save; see the operator
 page. The waits that writers and shutdown depend on stay bounded independently of this, as above.
 
+**Connection churn.** yrs 0.19 registers an observer with a compare-and-swap loop that does not reload
+the list head it compares against (`Observer::subscribe_with`); if the head is unregistered concurrently,
+the loop never ends. `DocConnection::new` registers its two observers under the doc write lock, and
+upstream's `Drop` released them with no lock, so a socket connecting while another disconnected could spin
+for ever holding the doc lock. `DocConnection`'s `Drop` now takes the doc write lock and unregisters under
+it, which serializes every registration and removal on a doc (the doc's own two observers are registered
+before the doc is shared and removed after its last connection is gone). A stress test with eight threads
+opening and closing connections froze after a few hundred sessions before the change and completes 40,000
+with it. Attribution makes this path hotter: the app reconnects on every actor switch.
+
 ### 4.7 Configuration
 
 | Variable | Meaning |

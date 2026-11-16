@@ -51,13 +51,6 @@ fn write_timeout(request_timeout: Duration, body_len: usize) -> Duration {
     request_timeout + Duration::from_secs((body_len / MIN_UPLOAD_BYTES_PER_SECOND) as u64)
 }
 
-fn timed_out(limit: Duration, what: &str) -> StoreError {
-    StoreError::ConnectionError(format!(
-        "Timed out after {} ms {what} the S3-compatible API.",
-        limit.as_millis()
-    ))
-}
-
 /// `what`, given up on after `limit`. Giving up drops the request, which closes its
 /// connection: when the error is returned, nothing of the request is still being sent.
 #[cfg(not(target_arch = "wasm32"))]
@@ -66,9 +59,12 @@ async fn within<T>(
     what: &str,
     request: impl std::future::Future<Output = T>,
 ) -> Result<T> {
-    tokio::time::timeout(limit, request)
-        .await
-        .map_err(|_| timed_out(limit, what))
+    tokio::time::timeout(limit, request).await.map_err(|_| {
+        StoreError::ConnectionError(format!(
+            "Timed out after {} ms {what} the S3-compatible API.",
+            limit.as_millis()
+        ))
+    })
 }
 
 /// On wasm (the Cloudflare worker) there is no timer here; the platform bounds the request.
