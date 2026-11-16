@@ -1,4 +1,5 @@
 use crate::update_webhook::{self, UpdateWebhookConfig};
+use crate::user_access::UserAccess;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -263,6 +264,41 @@ pub struct Server {
     /// often it is saved again meanwhile without having changed (see [SyncKv::is_suspect]).
     suspect_window: Duration,
     suspect_resave: Duration,
+    /// Whether doc tokens are bound to users and their revocation generation, and users can
+    /// be suspended (see [Server::with_user_suspension]).
+    user_suspension: bool,
+    /// The revocation state of users. Only consulted with `user_suspension` on.
+    user_access: UserAccess,
+    /// Whether a doc token that can write must expire, and a websocket ends when the token
+    /// it authenticated with does (see [Server::with_token_expiry_enforcement]).
+    enforce_token_expiry: bool,
+}
+
+/// What a request may do to a doc, and for how long.
+struct Access {
+    doc: DocAccess,
+    /// Cancelled when the user the token is bound to is suspended or restored. Never, for a
+    /// token that is bound to no user.
+    cancellation: CancellationToken,
+    /// When a websocket opened with the token must end, in milliseconds since the epoch.
+    deadline: Option<u64>,
+}
+
+impl From<DocAccess> for Access {
+    /// Access that is tied to no user and has no end.
+    fn from(doc: DocAccess) -> Self {
+        Self {
+            doc,
+            cancellation: CancellationToken::new(),
+            deadline: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuspensionRequest {
+    suspended: bool,
 }
 
 impl Server {
@@ -301,6 +337,9 @@ impl Server {
             loading: Arc::new(DashMap::new()),
             suspect_window: y_sweet_core::sync_kv::DEFAULT_SUSPECT_WINDOW,
             suspect_resave: y_sweet_core::sync_kv::DEFAULT_SUSPECT_RESAVE_INTERVAL,
+            user_suspension: false,
+            user_access: UserAccess::default(),
+            enforce_token_expiry: false,
         })
     }
 
@@ -314,6 +353,44 @@ impl Server {
     pub fn with_attributed_tokens(mut self, attributed_tokens: bool) -> Self {
         self.attributed_tokens = attributed_tokens;
         self
+    }
+
+    /// Turns user suspension on or off (off by default).
+    ///
+    /// On, the server works as the Dalus production build with the user-suspension patch does:
+    ///
+    /// - `POST /doc/:doc_id/auth` mints managed tokens. One minted with a `userId` is bound to
+    ///   that user and the user's current revocation generation; minting for a suspended
+    ///   user is refused.
+    /// - Every doc endpoint accepts only the server token and managed tokens, and checks a
+    ///   bound token against the user's state. Tokens of any other kind are refused, so their
+    ///   holders authenticate again.
+    /// - `POST /users/:user_id/suspension` (server token) suspends or restores a user. Either
+    ///   moves the user to a new generation, durably, before it is acknowledged, and closes
+    ///   the websockets opened with tokens of the old one.
+    /// - A websocket ends when the token it was opened with expires.
+    ///
+    /// It needs an authenticator: without one there are no tokens to bind.
+    pub fn with_user_suspension(mut self, user_suspension: bool) -> Result<Self> {
+        if user_suspension && self.authenticator.is_none() {
+            return Err(anyhow!("User suspension requires --auth"));
+        }
+        self.user_suspension = user_suspension;
+        Ok(self)
+    }
+
+    /// Turns token expiry enforcement on or off (off by default; the on-prem appliance runs
+    /// with it on).
+    ///
+    /// On, a doc token with full access is accepted only if it expires (the server token
+    /// stays unbounded, for trusted internal clients), a websocket ends when the token it was
+    /// opened with expires, and no frame received after that moment is applied.
+    pub fn with_token_expiry_enforcement(mut self, enforce_token_expiry: bool) -> Result<Self> {
+        if enforce_token_expiry && self.authenticator.is_none() {
+            return Err(anyhow!("Token expiry enforcement requires --auth"));
+        }
+        self.enforce_token_expiry = enforce_token_expiry;
+        Ok(self)
     }
 
     /// Delivers every update applied to a doc loaded from now on to the configured webhook.
@@ -783,7 +860,13 @@ impl Server {
     }
 
     pub fn routes(self: &Arc<Self>) -> Router {
-        Router::new()
+        let mut router = Router::new();
+        if self.user_suspension {
+            // Not there at all with the switch off, as on a build without the feature: a
+            // caller must not take a 2xx from a server that suspends nobody.
+            router = router.route("/users/:user_id/suspension", post(set_user_suspension));
+        }
+        router
             .route("/ready", get(ready))
             .route("/check_store", post(check_store))
             .route("/check_store", get(check_store_deprecated))
@@ -1016,19 +1099,74 @@ impl Server {
         s.serve_internal(listener, redact_errors, routes).await
     }
 
-    fn verify_doc_token(&self, token: Option<&str>, doc: &str) -> Result<DocAccess, AppError> {
-        if let Some(authenticator) = &self.authenticator {
-            if let Some(token) = token {
-                let access = authenticator
-                    .verify_doc_token(token, doc, current_time_epoch_millis())
+    /// Verifies a doc token the way the server is configured to.
+    ///
+    /// - With user suspension: the server token and managed tokens only; a token bound to a
+    ///   user is checked against that user's revocation state, and the returned cancellation
+    ///   fires when that state changes.
+    /// - With token expiry enforcement: a token with full access must expire.
+    /// - With neither: as upstream, plus the actor of an attributed token; a server without
+    ///   auth grants full access to anyone.
+    ///
+    /// The deadline is set whenever either switch is on and the token has one.
+    async fn verify_doc_token(&self, token: Option<&str>, doc: &str) -> Result<Access, AppError> {
+        let now = current_time_epoch_millis();
+        if self.user_suspension {
+            let auth = self.authenticator.as_ref().ok_or_else(|| {
+                AppError(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("Authenticated server required"),
+                )
+            })?;
+            let managed = auth
+                .verify_managed_doc_access(token.unwrap_or(""), doc, now)
+                .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+            let mut deadline = managed.deadline;
+            if self.enforce_token_expiry {
+                deadline = y_sweet_core::auth::finite_deadline(deadline);
+                // The server token stays unbounded, for trusted internal clients.
+                if !managed.server_token {
+                    y_sweet_core::auth::require_deadline_for_writes(
+                        managed.access.authorization,
+                        deadline,
+                    )
                     .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
-                Ok(access)
-            } else {
-                Err((StatusCode::UNAUTHORIZED, anyhow!("No token provided.")))?
+                }
             }
-        } else {
-            Ok(DocAccess::full())
+            let cancellation = match &managed.user {
+                Some((user, generation)) => self
+                    .user_access
+                    .authorize(&self.store, user, *generation)
+                    .await
+                    .map_err(|e| (StatusCode::UNAUTHORIZED, e))?,
+                None => CancellationToken::new(),
+            };
+            return Ok(Access {
+                doc: managed.access,
+                cancellation,
+                deadline,
+            });
         }
+
+        let Some(authenticator) = &self.authenticator else {
+            return Ok(DocAccess::full().into());
+        };
+        if self.enforce_token_expiry {
+            let (doc, deadline) = authenticator
+                .verify_expiring_doc_access(token.unwrap_or(""), doc, now)
+                .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+            return Ok(Access {
+                deadline,
+                ..doc.into()
+            });
+        }
+        let Some(token) = token else {
+            return Err((StatusCode::UNAUTHORIZED, anyhow!("No token provided.")))?;
+        };
+        let access = authenticator
+            .verify_doc_token(token, doc, now)
+            .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+        Ok(access.into())
     }
 
     fn get_single_doc_id(&self) -> Result<String, AppError> {
@@ -1052,7 +1190,9 @@ async fn get_doc_as_update(
 ) -> Result<Response, AppError> {
     // All authorization types allow reading the document.
     let token = get_token_from_header(auth_header);
-    let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    let _ = server_state
+        .verify_doc_token(token.as_deref(), &doc_id)
+        .await?;
 
     let dwskv = server_state
         .get_or_create_doc(&doc_id)
@@ -1099,17 +1239,19 @@ async fn update_doc(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let token = get_token_from_header(auth_header);
-    let access = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    let access = server_state
+        .verify_doc_token(token.as_deref(), &doc_id)
+        .await?;
     update_doc_inner(doc_id, server_state, access, body).await
 }
 
 async fn update_doc_inner(
     doc_id: String,
     server_state: Arc<Server>,
-    access: DocAccess,
+    access: Access,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    if !matches!(access.authorization, Authorization::Full) {
+    if !matches!(access.doc.authorization, Authorization::Full) {
         return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
     }
 
@@ -1127,7 +1269,15 @@ async fn update_doc_inner(
             anyhow!("The server is shutting down."),
         ));
     };
-    if let Err(err) = apply_update_to(&awareness, &body, access.actor.as_ref()) {
+    // The user may have been suspended while the doc was loading. Checked under admission,
+    // right before applying: a suspension that was acknowledged before this point is honoured.
+    if access.cancellation.is_cancelled() {
+        return Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            anyhow!("User access denied"),
+        ));
+    }
+    if let Err(err) = apply_update_to(&awareness, &body, access.doc.actor.as_ref()) {
         tracing::error!(?err, "Failed to apply update");
         return Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, err));
     }
@@ -1150,16 +1300,16 @@ async fn update_doc_single(
         authorization,
         actor: None,
     };
-    update_doc_inner(doc_id, server_state, access, body).await
+    update_doc_inner(doc_id, server_state, access.into(), body).await
 }
 
 async fn handle_socket_upgrade(
     ws: WebSocketUpgrade,
     Path(doc_id): Path<String>,
-    access: DocAccess,
+    access: Access,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
-    if !matches!(access.authorization, Authorization::Full)
+    if !matches!(access.doc.authorization, Authorization::Full)
         && !server_state.docs.contains_key(&doc_id)
     {
         return Err(AppError(
@@ -1195,7 +1345,9 @@ async fn handle_socket_upgrade_deprecated(
     tracing::warn!(
         "/doc/ws/:doc_id is deprecated; call /doc/:doc_id/auth instead and use the returned URL."
     );
-    let access = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
+    let access = server_state
+        .verify_doc_token(params.token.as_deref(), &doc_id)
+        .await?;
     handle_socket_upgrade(ws, Path(doc_id), access, State(server_state)).await
 }
 
@@ -1211,7 +1363,9 @@ async fn handle_socket_upgrade_full_path(
             anyhow!("For Yjs compatibility, the doc_id appears twice in the URL. It must be the same in both places, but we got {} and {}.", doc_id, doc_id2),
         ));
     }
-    let access = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
+    let access = server_state
+        .verify_doc_token(params.token.as_deref(), &doc_id)
+        .await?;
     handle_socket_upgrade(ws, Path(doc_id), access, State(server_state)).await
 }
 
@@ -1232,25 +1386,38 @@ async fn handle_socket_upgrade_single(
     // the doc server is meant to be run in Plane, so we expect verified plane
     // headers to be used for authorization.
     let authorization = get_authorization_from_plane_header(headers)?;
+    if server_state.enforce_token_expiry && matches!(authorization, Authorization::Full) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            anyhow!("Expiring document tokens required; use multi-doc mode"),
+        )
+            .into());
+    }
     let access = DocAccess {
         authorization,
         actor: None,
     };
-    handle_socket_upgrade(ws, Path(single_doc_id), access, State(server_state)).await
+    handle_socket_upgrade(ws, Path(single_doc_id), access.into(), State(server_state)).await
 }
 
 async fn handle_socket(
     socket: WebSocket,
     doc_id: String,
     awareness: Arc<RwLock<Awareness>>,
-    access: DocAccess,
+    access: Access,
     cancellation_token: CancellationToken,
     write_gate: Arc<WriteGate>,
 ) {
-    let DocAccess {
-        authorization,
-        actor,
+    let Access {
+        doc: DocAccess {
+            authorization,
+            actor,
+        },
+        cancellation: user_cancel,
+        deadline,
     } = access;
+    let sender_cancel = user_cancel.clone();
+    let past_deadline = move || deadline.is_some_and(|d| current_time_epoch_millis() >= d);
     if let Some(actor) = &actor {
         // The writer kind only: user ids are never logged.
         tracing::debug!(
@@ -1267,12 +1434,14 @@ async fn handle_socket(
     let last_pong = Arc::new(RwLock::new(tokio::time::Instant::now()));
     let last_pong_clone = last_pong.clone();
 
-    tokio::spawn(async move {
+    let sender = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(PING_EVERY);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
+                biased;
+                _ = sender_cancel.cancelled() => break,
                 msg = recv.recv() => {
                     let Some(msg) = msg else {
                         break;
@@ -1296,9 +1465,37 @@ async fn handle_socket(
         }
     });
 
+    // The end of the token's life, when the server holds connections to it: with user
+    // suspension or token expiry enforcement on. Otherwise there is no deadline.
+    let expiry = async {
+        match deadline {
+            Some(deadline) => {
+                tokio::time::sleep(Duration::from_millis(
+                    deadline.saturating_sub(current_time_epoch_millis()),
+                ))
+                .await
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(expiry);
+
     loop {
         tokio::select! {
+            biased;
+            _ = user_cancel.cancelled() => break,
+            _ = &mut expiry => break,
+            _ = cancellation_token.cancelled() => {
+                tracing::debug!("Closing doc connection due to server cancel...");
+                break;
+            }
             msg = stream.next() => {
+                // Check each frame as well: no queued update may be applied after the user
+                // was suspended or the authenticated deadline passed, even when the runtime
+                // is busy.
+                if user_cancel.is_cancelled() || past_deadline() {
+                    break;
+                }
                 let Some(msg) = msg else {
                     break;
                 };
@@ -1326,17 +1523,47 @@ async fn handle_socket(
                 let Some(admitted) = write_gate.enter().await else {
                     break;
                 };
+                // Again under admission: waiting for it must not carry a frame past a
+                // suspension or the deadline.
+                if user_cancel.is_cancelled() || past_deadline() {
+                    break;
+                }
                 if let Err(e) = connection.send(&msg).await {
                     tracing::warn!(?e, "Error handling message");
                 }
                 drop(admitted);
             }
-            _ = cancellation_token.cancelled() => {
-                tracing::debug!("Closing doc connection due to server cancel...");
-                break;
-            }
         }
     }
+    // Close the connection first: it unregisters from the doc under the doc lock, and after
+    // that nothing more is queued for this socket.
+    drop(connection);
+    // Drop both socket halves; leaving the sender alive would leave the peer
+    // unaware that its authorization has ended until the next ping timeout.
+    sender.abort();
+}
+
+async fn set_user_suspension(
+    State(server): State<Arc<Server>>,
+    Path(user): Path<String>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+    Json(body): Json<SuspensionRequest>,
+) -> Result<StatusCode, AppError> {
+    if server.authenticator.is_none() {
+        return Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            anyhow!("Authenticated server required"),
+        ));
+    }
+    server.check_auth(auth_header)?;
+    server
+        .user_access
+        .set_suspended(&server.store, &user, body.suspended)
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    // Not the user: user ids are never logged.
+    tracing::info!(suspended = body.suspended, "user suspension changed");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn check_store(
@@ -1414,7 +1641,14 @@ async fn auth_doc(
         valid_for_seconds,
         user_id,
         writer,
+        user_scoped,
     }) = body.unwrap_or_default();
+
+    // With user suspension, the user the token is bound to: the request's `userId`, unless
+    // the request says the token is not to be scoped to them.
+    let scoped_user = user_id
+        .clone()
+        .filter(|_| server_state.user_suspension && user_scoped != Some(false));
 
     let actor_requested = user_id.is_some() || writer.is_some();
     let (user_id_bytes, writer_bytes) = (
@@ -1465,7 +1699,28 @@ async fn auth_doc(
             writer = requested_writer.as_deref(),
             "minted doc token"
         );
-        let token = auth.gen_doc_token_with_actor(&doc_id, authorization, expiration_time, actor);
+        let token = if server_state.user_suspension {
+            let user = match scoped_user {
+                Some(user) => {
+                    let generation = server_state
+                        .user_access
+                        .generation(&server_state.store, &user)
+                        .await
+                        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
+                    Some((user, generation))
+                }
+                None => None,
+            };
+            auth.gen_managed_doc_token_with_actor(
+                &doc_id,
+                authorization,
+                user,
+                expiration_time,
+                actor,
+            )
+        } else {
+            auth.gen_doc_token_with_actor(&doc_id, authorization, expiration_time, actor)
+        };
         Some(token)
     } else {
         None
@@ -1561,6 +1816,7 @@ mod test {
                 user_id: None,
                 writer: None,
                 valid_for_seconds: None,
+                user_scoped: None,
             })),
         )
         .await
@@ -1675,6 +1931,7 @@ mod test {
             user_id: user_id.map(str::to_string),
             writer: writer.map(str::to_string),
             valid_for_seconds: None,
+            user_scoped: None,
         })
     }
 
@@ -3953,5 +4210,758 @@ mod test {
             .unwrap()
             .clone();
         bincode::deserialize(&snapshot).unwrap()
+    }
+
+    // --- User suspension and token expiry -----------------------------------------------------
+
+    /// A served server with auth, a store, and the given switches, driven over real HTTP and
+    /// websockets as the application drives it.
+    struct Deployed {
+        addr: std::net::SocketAddr,
+        verifier: Authenticator,
+        store: TestStore,
+        events: Events,
+        docs: Arc<DashMap<String, DocWithSyncKv>>,
+        token: CancellationToken,
+        task: tokio::task::JoinHandle<Result<()>>,
+        http: reqwest::Client,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct Switches {
+        suspension: bool,
+        expiry: bool,
+        attribution: bool,
+    }
+
+    impl Deployed {
+        async fn start(switches: Switches) -> Self {
+            let authenticator = Authenticator::gen_key().unwrap();
+            let verifier = Authenticator::new(&authenticator.private_key()).unwrap();
+            let token = CancellationToken::new();
+            let store = TestStore::default();
+            let mut server = Server::new(
+                Some(Box::new(store.clone())),
+                Duration::from_secs(3600),
+                Some(authenticator),
+                None,
+                token.clone(),
+                true,
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .with_attributed_tokens(switches.attribution)
+            .with_user_suspension(switches.suspension)
+            .unwrap()
+            .with_token_expiry_enforcement(switches.expiry)
+            .unwrap();
+            let events = Events::default();
+            server.on_update = Some({
+                let events = events.clone();
+                Arc::new(
+                    move |event: y_sweet_core::update_events::ObservedUpdate<'_>| {
+                        events.lock().unwrap().push(event.to_owned())
+                    },
+                )
+            });
+            server.load_doc(DOC_ID).await.unwrap();
+            let docs = server.docs.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(server.serve(listener, false));
+            Self {
+                addr,
+                verifier,
+                store,
+                events,
+                docs,
+                token,
+                task,
+                http: reqwest::Client::new(),
+            }
+        }
+
+        fn root(&self) -> String {
+            self.verifier.server_token()
+        }
+
+        /// `POST /doc/:doc_id/auth` with the server token: the token, or the status.
+        async fn mint(&self, request: Value) -> std::result::Result<String, u16> {
+            let response = self
+                .http
+                .post(format!("http://{}/doc/{DOC_ID}/auth", self.addr))
+                .bearer_auth(self.root())
+                .header("content-type", "application/json")
+                .body(request.to_string())
+                .send()
+                .await
+                .unwrap();
+            if !response.status().is_success() {
+                return Err(response.status().as_u16());
+            }
+            let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            Ok(body["token"].as_str().expect("a token").to_string())
+        }
+
+        async fn suspend(&self, user: &str, suspended: bool, bearer: &str) -> u16 {
+            self.http
+                .post(format!("http://{}/users/{user}/suspension", self.addr))
+                .bearer_auth(bearer)
+                .header("content-type", "application/json")
+                .body(json!({ "suspended": suspended }).to_string())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+
+        /// `POST /d/:doc_id/update` with `token`: the status.
+        async fn update(&self, token: &str, edit: Vec<u8>) -> u16 {
+            self.http
+                .post(format!("http://{}/d/{DOC_ID}/update", self.addr))
+                .bearer_auth(token)
+                .body(edit)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+
+        async fn read(&self, token: &str) -> u16 {
+            self.http
+                .get(format!("http://{}/d/{DOC_ID}/as-update", self.addr))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+
+        /// Opens a websocket with `token`: the socket, or the status the upgrade was
+        /// refused with.
+        async fn connect(&self, token: &str) -> std::result::Result<TestSocket, u16> {
+            use tokio_tungstenite::tungstenite::Error;
+            let url = format!("ws://{}/d/{DOC_ID}/ws/{DOC_ID}?token={token}", self.addr);
+            match tokio_tungstenite::connect_async(url).await {
+                Ok((socket, _)) => Ok(socket),
+                Err(Error::Http(response)) => Err(response.status().as_u16()),
+                Err(other) => panic!("{other}"),
+            }
+        }
+
+        fn keys(&self) -> std::collections::HashSet<String> {
+            memory_keys(&self.docs, DOC_ID)
+        }
+
+        async fn stop(self) {
+            self.token.cancel();
+            tokio::time::timeout(Duration::from_secs(10), self.task)
+                .await
+                .expect("server did not stop")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// Whether the server ends the connection within `within` (reading whatever it sends
+    /// before that).
+    async fn closed_by_server(socket: &mut TestSocket, within: Duration) -> bool {
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let closed = async {
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => return,
+                    Some(Ok(_)) => {}
+                }
+            }
+        };
+        tokio::time::timeout(within, closed).await.is_ok()
+    }
+
+    async fn send_edit(socket: &mut TestSocket, id: u64) {
+        socket.send(ws_update(map_edit(id))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_switches_need_an_authenticator() {
+        let server = || async {
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                None,
+                None,
+                CancellationToken::new(),
+                true,
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+        };
+        let error = server().await.with_user_suspension(true).err().unwrap();
+        assert_eq!(error.to_string(), "User suspension requires --auth");
+        let error = server()
+            .await
+            .with_token_expiry_enforcement(true)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "Token expiry enforcement requires --auth"
+        );
+        // Off, neither asks for anything.
+        server()
+            .await
+            .with_user_suspension(false)
+            .unwrap()
+            .with_token_expiry_enforcement(false)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_the_switch_there_is_no_suspension_and_managed_tokens_are_refused() {
+        let deployed = Deployed::start(Switches::default()).await;
+        assert_eq!(
+            deployed.suspend("member", true, &deployed.root()).await,
+            404
+        );
+
+        // A plain token, as before, whatever the request says about users.
+        let token = deployed
+            .mint(json!({ "userId": "member", "userScoped": true }))
+            .await
+            .unwrap();
+        assert_eq!(deployed.update(&token, map_edit(1)).await, 200);
+        let mut socket = deployed.connect(&token).await.unwrap();
+        send_edit(&mut socket, 2).await;
+        eventually("the websocket edit is applied", || {
+            deployed.keys().contains("2")
+        })
+        .await;
+
+        // A token a suspension-enforcing server minted for this key cannot be honoured here.
+        let expiry = ExpirationTimeEpochMillis(current_time_epoch_millis() + 60_000);
+        let managed = deployed.verifier.gen_managed_doc_token(
+            DOC_ID,
+            Authorization::Full,
+            Some(("member".to_string(), 0)),
+            expiry,
+        );
+        assert_eq!(deployed.update(&managed, map_edit(3)).await, 401);
+        assert_eq!(deployed.read(&managed).await, 401);
+        assert_eq!(deployed.connect(&managed).await.err(), Some(401));
+        assert!(!deployed.keys().contains("3"));
+        deployed.stop().await;
+    }
+
+    /// The protocol the application's suspension test drives against the production build
+    /// (`scripts/test-y-sweet-user-suspension.mjs` in the app repo): an active writer, a
+    /// second device, unaffected peers, old-token reconnect and HTTP denial, unauthorized
+    /// restoration, and fresh-token restoration with the doc's data preserved.
+    #[tokio::test]
+    async fn suspension_closes_a_users_sockets_and_retires_their_tokens() {
+        let deployed = Deployed::start(Switches {
+            suspension: true,
+            ..Default::default()
+        })
+        .await;
+        let root = deployed.root();
+
+        let before = deployed.mint(json!({ "userId": "target" })).await.unwrap();
+        let read_only = deployed
+            .mint(json!({ "userId": "target", "authorization": "read-only" }))
+            .await
+            .unwrap();
+        let peer_token = deployed
+            .mint(json!({ "userId": "observer" }))
+            .await
+            .unwrap();
+        let unscoped = deployed.mint(json!({})).await.unwrap();
+        let mut writer = deployed.connect(&before).await.unwrap();
+        let mut second_device = deployed.connect(&read_only).await.unwrap();
+        let mut peer = deployed.connect(&peer_token).await.unwrap();
+        let mut job = deployed.connect(&unscoped).await.unwrap();
+
+        send_edit(&mut writer, 1).await;
+        eventually("the writer's edit is applied", || {
+            deployed.keys().contains("1")
+        })
+        .await;
+
+        // Only the server token may suspend.
+        assert_eq!(deployed.suspend("target", true, &before).await, 401);
+        assert_eq!(deployed.suspend("target", true, &root).await, 204);
+
+        // Both of the user's connections end; nobody else's does.
+        assert!(closed_by_server(&mut writer, Duration::from_secs(3)).await);
+        assert!(closed_by_server(&mut second_device, Duration::from_secs(3)).await);
+        assert!(!closed_by_server(&mut peer, Duration::from_millis(300)).await);
+        assert!(!closed_by_server(&mut job, Duration::from_millis(100)).await);
+        send_edit(&mut peer, 2).await;
+        send_edit(&mut job, 3).await;
+        eventually("the others' edits are applied", || {
+            deployed.keys().contains("2") && deployed.keys().contains("3")
+        })
+        .await;
+
+        // The old tokens are dead for everything, and no new one is minted.
+        for token in [&before, &read_only] {
+            assert_eq!(deployed.connect(token).await.err(), Some(401));
+            assert_eq!(deployed.read(token).await, 401);
+        }
+        assert_eq!(deployed.update(&before, map_edit(4)).await, 401);
+        assert!(!deployed.keys().contains("4"));
+        assert_eq!(deployed.mint(json!({ "userId": "target" })).await, Err(403));
+        // Other users, tokens bound to no user and the server token are untouched.
+        assert_eq!(deployed.update(&peer_token, map_edit(5)).await, 200);
+        assert_eq!(deployed.update(&unscoped, map_edit(6)).await, 200);
+        assert_eq!(deployed.update(&root, map_edit(7)).await, 200);
+
+        // Restoring needs the server token too, and does not revive the old tokens.
+        assert_eq!(deployed.suspend("target", false, &peer_token).await, 401);
+        assert_eq!(deployed.suspend("target", false, &root).await, 204);
+        assert_eq!(deployed.update(&before, map_edit(8)).await, 401);
+        assert_eq!(deployed.connect(&before).await.err(), Some(401));
+        let after = deployed.mint(json!({ "userId": "target" })).await.unwrap();
+        let mut restored = deployed.connect(&after).await.unwrap();
+        send_edit(&mut restored, 9).await;
+        eventually("the restored user's edit is applied", || {
+            deployed.keys().contains("9")
+        })
+        .await;
+        // Nothing written before was lost, and nothing refused was applied.
+        let keys = deployed.keys();
+        for kept in ["1", "2", "3", "5", "6", "7", "9"] {
+            assert!(keys.contains(kept), "{kept} missing from {keys:?}");
+        }
+        assert!(!keys.contains("4") && !keys.contains("8"), "{keys:?}");
+
+        // A user id that could leave the revocation directory is refused, not stored.
+        assert_eq!(deployed.suspend("..%2Fescape", true, &root).await, 503);
+        assert_eq!(
+            deployed.mint(json!({ "userId": "not/valid" })).await,
+            Err(403)
+        );
+        // The body is exactly `{"suspended": bool}`.
+        let malformed = deployed
+            .http
+            .post(format!("http://{}/users/target/suspension", deployed.addr))
+            .bearer_auth(&root)
+            .header("content-type", "application/json")
+            .body(json!({ "suspended": true, "reason": "x" }).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status().as_u16(), 422);
+        // The revocation is in the store, where a restart finds it.
+        assert!(deployed
+            .store
+            .data
+            .contains_key("__dalus_auth/users/target.json"));
+        deployed.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_suspension_server_accepts_only_managed_tokens() {
+        let deployed = Deployed::start(Switches {
+            suspension: true,
+            ..Default::default()
+        })
+        .await;
+        let expiry = ExpirationTimeEpochMillis(current_time_epoch_millis() + 60_000);
+        // Tokens with no revocation generation: upstream's, and an attributed one minted
+        // before the switch was turned on. Their holders have to authenticate again.
+        let legacy = deployed
+            .verifier
+            .gen_doc_token(DOC_ID, Authorization::Full, expiry);
+        let attributed = deployed.verifier.gen_doc_token_with_actor(
+            DOC_ID,
+            Authorization::Full,
+            expiry,
+            Some(Actor {
+                user_id: Some("member".to_string()),
+                writer: Some("ui".to_string()),
+            }),
+        );
+        for token in [legacy.as_str(), attributed.as_str(), "", "garbage"] {
+            assert_eq!(deployed.update(token, map_edit(1)).await, 401);
+            assert_eq!(deployed.read(token).await, 401);
+            assert_eq!(deployed.connect(token).await.err(), Some(401));
+        }
+        assert!(deployed.keys().is_empty());
+
+        // A token minted at a generation the user has since left.
+        let stale = deployed.verifier.gen_managed_doc_token(
+            DOC_ID,
+            Authorization::Full,
+            Some(("member".to_string(), 5)),
+            expiry,
+        );
+        assert_eq!(deployed.update(&stale, map_edit(2)).await, 401);
+        // The production build's own mint: bound to the user's generation, here 0.
+        let token = deployed.mint(json!({ "userId": "member" })).await.unwrap();
+        assert_eq!(
+            deployed
+                .verifier
+                .verify_managed_doc_token(&token, DOC_ID, 0)
+                .map(|(authorization, user, _)| (authorization, user)),
+            Ok((Authorization::Full, Some(("member".to_string(), 0))))
+        );
+        assert_eq!(deployed.update(&token, map_edit(3)).await, 200);
+        deployed.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_managed_websocket_ends_when_its_token_expires() {
+        // As the production build does: with suspension, a socket lives as long as its token.
+        let deployed = Deployed::start(Switches {
+            suspension: true,
+            ..Default::default()
+        })
+        .await;
+        let token = deployed
+            .mint(json!({ "userId": "member", "validForSeconds": 1 }))
+            .await
+            .unwrap();
+        let mut socket = deployed.connect(&token).await.unwrap();
+        send_edit(&mut socket, 1).await;
+        eventually("the edit is applied", || deployed.keys().contains("1")).await;
+        assert!(closed_by_server(&mut socket, Duration::from_secs(4)).await);
+        assert_eq!(deployed.connect(&token).await.err(), Some(401));
+        deployed.stop().await;
+    }
+
+    #[tokio::test]
+    async fn with_attribution_a_token_bound_to_a_suspended_user_stops_and_an_unscoped_one_does_not()
+    {
+        let deployed = Deployed::start(Switches {
+            suspension: true,
+            attribution: true,
+            ..Default::default()
+        })
+        .await;
+        let root = deployed.root();
+        let actor = |writer: &str| {
+            Some(Actor {
+                user_id: Some("member".to_string()),
+                writer: Some(writer.to_string()),
+            })
+        };
+
+        // A browser token and two tokens of server-side writers acting for the same user.
+        // One of the writers says it is not to be scoped to the user.
+        let browser = deployed
+            .mint(json!({ "userId": "member", "writer": "ui" }))
+            .await
+            .unwrap();
+        let bound = deployed
+            .mint(json!({ "userId": "member", "writer": "copilot" }))
+            .await
+            .unwrap();
+        let unscoped = deployed
+            .mint(json!({ "userId": "member", "writer": "import", "userScoped": false }))
+            .await
+            .unwrap();
+        // All three name the user as the actor; only the unscoped one is bound to no user.
+        let bound_to = |token: &str| {
+            let managed = deployed
+                .verifier
+                .verify_managed_doc_access(token, DOC_ID, 0)
+                .unwrap();
+            (managed.access.actor, managed.user)
+        };
+        let member = Some(("member".to_string(), 0));
+        assert_eq!(bound_to(&browser), (actor("ui"), member.clone()));
+        assert_eq!(bound_to(&bound), (actor("copilot"), member));
+        assert_eq!(bound_to(&unscoped), (actor("import"), None));
+
+        let mut browser_socket = deployed.connect(&browser).await.unwrap();
+        let mut bound_socket = deployed.connect(&bound).await.unwrap();
+        let mut unscoped_socket = deployed.connect(&unscoped).await.unwrap();
+        assert_eq!(deployed.update(&bound, map_edit(1)).await, 200);
+        assert_eq!(deployed.update(&unscoped, map_edit(2)).await, 200);
+
+        assert_eq!(deployed.suspend("member", true, &root).await, 204);
+
+        // Bound tokens: sockets closed, HTTP writes and new mints refused.
+        assert!(closed_by_server(&mut browser_socket, Duration::from_secs(3)).await);
+        assert!(closed_by_server(&mut bound_socket, Duration::from_secs(3)).await);
+        assert_eq!(deployed.update(&browser, map_edit(3)).await, 401);
+        assert_eq!(deployed.update(&bound, map_edit(4)).await, 401);
+        assert_eq!(
+            deployed
+                .mint(json!({ "userId": "member", "writer": "copilot" }))
+                .await,
+            Err(403)
+        );
+        // The unscoped writer carries on, attributed to the user all the same.
+        assert!(!closed_by_server(&mut unscoped_socket, Duration::from_millis(300)).await);
+        send_edit(&mut unscoped_socket, 5).await;
+        assert_eq!(deployed.update(&unscoped, map_edit(6)).await, 200);
+        assert!(deployed
+            .mint(json!({ "userId": "member", "writer": "import", "userScoped": false }))
+            .await
+            .is_ok());
+        eventually("the unscoped writer's edits are applied", || {
+            deployed.keys().contains("5") && deployed.keys().contains("6")
+        })
+        .await;
+        let keys = deployed.keys();
+        assert!(!keys.contains("3") && !keys.contains("4"), "{keys:?}");
+
+        let mut actors: Vec<_> = deployed
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.actor.clone().and_then(|actor| actor.writer))
+            .collect();
+        actors.sort();
+        let writer = |writer: &str| Some(writer.to_string());
+        assert_eq!(
+            actors,
+            [
+                writer("copilot"),
+                writer("import"),
+                writer("import"),
+                writer("import")
+            ]
+        );
+        deployed.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_update_whose_user_is_suspended_while_its_doc_loads_is_not_applied() {
+        let deployed = Deployed::start(Switches {
+            suspension: true,
+            ..Default::default()
+        })
+        .await;
+        let token = deployed.mint(json!({ "userId": "member" })).await.unwrap();
+
+        // The doc is not in memory and its load hangs: the update has passed the token check
+        // and waits for the doc.
+        deployed.docs.remove(DOC_ID);
+        *deployed.store.held_key.lock().unwrap() = Some(format!("{DOC_ID}/data.ysweet"));
+        let update = tokio::spawn({
+            let (http, addr, token) = (deployed.http.clone(), deployed.addr, token.clone());
+            async move {
+                http.post(format!("http://{addr}/d/{DOC_ID}/update"))
+                    .bearer_auth(token)
+                    .body(map_edit(1))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        });
+        deployed.store.held_get_entered.notified().await;
+
+        // The suspension is acknowledged while it waits...
+        assert_eq!(
+            deployed.suspend("member", true, &deployed.root()).await,
+            204
+        );
+        // ...so when the doc arrives, the update is refused.
+        deployed.store.held_get_release.add_permits(1);
+        assert_eq!(update.await.unwrap(), 401);
+        assert!(deployed.docs.contains_key(DOC_ID));
+        assert!(deployed.keys().is_empty());
+        deployed.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn suspending_a_user_with_many_sockets_while_others_connect_leaves_the_doc_usable() {
+        // Every closing socket unregisters from the doc under the doc lock while the
+        // observer's sockets register: the pairing that used to freeze a doc for good.
+        let deployed = Arc::new(
+            Deployed::start(Switches {
+                suspension: true,
+                ..Default::default()
+            })
+            .await,
+        );
+        let target = deployed.mint(json!({ "userId": "target" })).await.unwrap();
+        let observer = deployed
+            .mint(json!({ "userId": "observer" }))
+            .await
+            .unwrap();
+        let mut sockets = Vec::new();
+        for _ in 0..40 {
+            sockets.push(deployed.connect(&target).await.unwrap());
+        }
+
+        let churn = tokio::spawn({
+            let (deployed, observer) = (deployed.clone(), observer.clone());
+            async move {
+                for _ in 0..60 {
+                    let socket = deployed.connect(&observer).await.unwrap();
+                    drop(socket);
+                }
+            }
+        });
+        assert_eq!(
+            deployed.suspend("target", true, &deployed.root()).await,
+            204
+        );
+        for socket in &mut sockets {
+            assert!(closed_by_server(socket, Duration::from_secs(5)).await);
+        }
+        tokio::time::timeout(Duration::from_secs(20), churn)
+            .await
+            .expect("connecting froze")
+            .unwrap();
+
+        // The doc still takes writes and reads.
+        let update = tokio::time::timeout(
+            Duration::from_secs(5),
+            deployed.update(&observer, map_edit(1)),
+        )
+        .await
+        .expect("the doc is frozen");
+        assert_eq!(update, 200);
+        eventually("every connection is gone from the doc", || {
+            Arc::strong_count(&deployed.docs.get(DOC_ID).unwrap().awareness()) == 2
+        })
+        .await;
+        Arc::try_unwrap(deployed).ok().unwrap().stop().await;
+    }
+
+    #[tokio::test]
+    async fn with_expiry_enforced_a_websocket_ends_with_its_token() {
+        let deployed = Deployed::start(Switches {
+            expiry: true,
+            attribution: true,
+            ..Default::default()
+        })
+        .await;
+        let now = current_time_epoch_millis;
+        let alice = Actor {
+            user_id: Some("alice".to_string()),
+            writer: Some("ui".to_string()),
+        };
+
+        // An attributed token that lives for a second: its edits are applied and attributed,
+        // and the connection ends when the token does.
+        let token = deployed
+            .mint(json!({ "userId": "alice", "writer": "ui", "validForSeconds": 1 }))
+            .await
+            .unwrap();
+        let opened = std::time::Instant::now();
+        let mut socket = deployed.connect(&token).await.unwrap();
+        send_edit(&mut socket, 1).await;
+        eventually("the edit is applied", || deployed.keys().contains("1")).await;
+        assert!(closed_by_server(&mut socket, Duration::from_secs(4)).await);
+        assert!(opened.elapsed() >= Duration::from_millis(900));
+        assert_eq!(
+            deployed.events.lock().unwrap()[0].actor,
+            Some(alice.clone())
+        );
+        // Expired: no reconnect, no HTTP write.
+        assert_eq!(deployed.connect(&token).await.err(), Some(401));
+        assert_eq!(deployed.update(&token, map_edit(2)).await, 401);
+
+        // A token that can write must expire...
+        for unbounded in [
+            deployed.verifier.gen_doc_token(
+                DOC_ID,
+                Authorization::Full,
+                ExpirationTimeEpochMillis::max(),
+            ),
+            deployed.verifier.gen_doc_token_with_actor(
+                DOC_ID,
+                Authorization::Full,
+                ExpirationTimeEpochMillis::max(),
+                Some(alice.clone()),
+            ),
+        ] {
+            assert_eq!(deployed.connect(&unbounded).await.err(), Some(401));
+            assert_eq!(deployed.update(&unbounded, map_edit(3)).await, 401);
+            assert_eq!(deployed.read(&unbounded).await, 401);
+        }
+        assert_eq!(deployed.connect("").await.err(), Some(401));
+        // ...a read-only one need not, and the server token stays unbounded.
+        let read_only = deployed.verifier.gen_doc_token(
+            DOC_ID,
+            Authorization::ReadOnly,
+            ExpirationTimeEpochMillis::max(),
+        );
+        let mut reader = deployed.connect(&read_only).await.unwrap();
+        let mut trusted = deployed.connect(&deployed.root()).await.unwrap();
+        assert!(!closed_by_server(&mut reader, Duration::from_millis(200)).await);
+        send_edit(&mut trusted, 4).await;
+        eventually("the server token's edit is applied", || {
+            deployed.keys().contains("4")
+        })
+        .await;
+        // A bounded token works over HTTP for as long as it lives.
+        let bounded = deployed.verifier.gen_doc_token(
+            DOC_ID,
+            Authorization::Full,
+            ExpirationTimeEpochMillis(now() + 60_000),
+        );
+        assert_eq!(deployed.update(&bounded, map_edit(5)).await, 200);
+        let keys = deployed.keys();
+        assert!(!keys.contains("2") && !keys.contains("3"), "{keys:?}");
+        deployed.stop().await;
+    }
+
+    #[tokio::test]
+    async fn without_expiry_enforcement_a_websocket_outlives_its_token() {
+        // Upstream's behaviour, and this fork's with both switches off.
+        let deployed = Deployed::start(Switches::default()).await;
+        let token = deployed
+            .mint(json!({ "validForSeconds": 1 }))
+            .await
+            .unwrap();
+        let mut socket = deployed.connect(&token).await.unwrap();
+        assert!(!closed_by_server(&mut socket, Duration::from_millis(1600)).await);
+        send_edit(&mut socket, 1).await;
+        eventually("the edit is applied", || deployed.keys().contains("1")).await;
+        deployed.stop().await;
+    }
+
+    #[tokio::test]
+    async fn suspension_and_expiry_enforcement_apply_together() {
+        let deployed = Deployed::start(Switches {
+            suspension: true,
+            expiry: true,
+            ..Default::default()
+        })
+        .await;
+        let member = Some(("member".to_string(), 0));
+        // A managed token that can write and never expires is refused; a bounded one and the
+        // server token are not.
+        let unbounded = deployed.verifier.gen_managed_doc_token(
+            DOC_ID,
+            Authorization::Full,
+            member.clone(),
+            ExpirationTimeEpochMillis::max(),
+        );
+        assert_eq!(deployed.update(&unbounded, map_edit(1)).await, 401);
+        assert_eq!(deployed.connect(&unbounded).await.err(), Some(401));
+        let unscoped_unbounded = deployed.verifier.gen_managed_doc_token(
+            DOC_ID,
+            Authorization::Full,
+            None,
+            ExpirationTimeEpochMillis::max(),
+        );
+        assert_eq!(deployed.update(&unscoped_unbounded, map_edit(2)).await, 401);
+        let bounded = deployed.mint(json!({ "userId": "member" })).await.unwrap();
+        assert_eq!(deployed.update(&bounded, map_edit(3)).await, 200);
+        assert_eq!(deployed.update(&deployed.root(), map_edit(4)).await, 200);
+        // And the bounded one still answers to suspension.
+        assert_eq!(
+            deployed.suspend("member", true, &deployed.root()).await,
+            204
+        );
+        assert_eq!(deployed.update(&bounded, map_edit(5)).await, 401);
+        deployed.stop().await;
     }
 }

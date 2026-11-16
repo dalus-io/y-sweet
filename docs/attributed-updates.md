@@ -8,7 +8,9 @@ This fork of Y-Sweet can do two things upstream cannot:
    its actor, batched per doc, in order per doc, signed, with at-least-once delivery and a signal
    when something was lost (see [Gaps](#gaps) for what the receiver must do with it).
 
-The two are independent and both are off by default.
+The two are independent and both are off by default. Two further switches, user suspension and
+token expiry enforcement, are described under
+[User suspension and token expiry](#user-suspension-and-token-expiry).
 
 ### Differences from upstream with both switches off
 
@@ -278,17 +280,19 @@ server token, with a plain doc token, or on a server without auth are unattribut
 
 ### Token formats this build knows
 
-| Variant | Minted by | This build |
-| --- | --- | --- |
-| `Doc` | upstream; here when the request names no actor or the switch is off | accepts |
-| `ManagedDoc` (user id and revocation generation) | the Dalus production build with user suspension (fork revision 4f1909b plus its patch) | rejects with `401`: it cannot check the generation, and must not ignore it |
-| `AttributedDoc` | here, with the switch on | accepts |
+| Index | Variant | Minted | Accepted |
+| --- | --- | --- | --- |
+| 1 | `Doc` | upstream; here when the request names no actor or attributed tokens are off | unless user suspension is on |
+| 2 | `ManagedDoc` (user id and revocation generation) | here with user suspension on, and by the Dalus production build of fork revision 4f1909b plus its patch: same bytes | only with user suspension on |
+| 3 | `AttributedDoc` | here, with attributed tokens on | unless user suspension is on |
+| 4 | `ManagedAttributedDoc` (both) | here, with user suspension and attributed tokens on, when the request names an actor | only with user suspension on |
 
-So a build of this branch cannot take over from the production suspension build while that
-build's tokens are outstanding without every client re-authenticating, and the two must never
-verify each other's tokens side by side. Builds of this branch up to 649406a used the
-`ManagedDoc` slot for `AttributedDoc`; attributed tokens they minted are rejected by later
-builds until they expire.
+A server that does not enforce suspension answers a managed token with `401` (`The token is of
+a kind this server does not accept`): it cannot check the generation the token is bound to, and
+must not ignore it. A server that does enforce it answers every unmanaged token with `401`, as
+the production build does, so their holders authenticate again. Builds of this branch up to
+649406a used index 2 for `AttributedDoc`; attributed tokens they minted are rejected by later
+builds until they expire. See [User suspension and token expiry](#user-suspension-and-token-expiry).
 
 ### Turning it on and off
 
@@ -308,6 +312,106 @@ A binary without this feature cannot decode an attributed token and rejects it w
   3. Only then deploy the older image.
 
   Turning the webhook off needs no such care: unset the URL and restart.
+
+## User suspension and token expiry
+
+Two more switches, both off by default, replace the patches the Dalus images used to apply to
+fork revision 4f1909b at build time. One binary now serves production (suspension), the on-prem
+appliance (token expiry) and attribution, in any combination.
+
+| Variable | Flag | Default | Meaning |
+| --- | --- | --- | --- |
+| `Y_SWEET_USER_SUSPENSION` | `--user-suspension [true\|false]` | `false` | Bind doc tokens to users, and let users be suspended. Needs `Y_SWEET_AUTH`, and a store for any token that names a user. |
+| `Y_SWEET_ENFORCE_TOKEN_EXPIRY` | `--enforce-token-expiry [true\|false]` | `false` | A doc token that can write must expire, and a websocket ends with its token. Needs `Y_SWEET_AUTH`. |
+
+Both read their value like `Y_SWEET_ATTRIBUTED_TOKENS` (`true`/`1`/`yes`/`on`,
+`false`/`0`/`no`/`off`, any letter case; empty is unset). A value that is neither, or a switch
+turned on without `Y_SWEET_AUTH`, is a startup error (`User suspension requires --auth`,
+`Token expiry enforcement requires --auth`): these switches decide who gets in, and a server
+that silently enforced nothing would be worse than one that does not start. The
+`attributed updates configuration` line reports both (`user_suspension`,
+`enforce_token_expiry`).
+
+### User suspension
+
+With `Y_SWEET_USER_SUSPENSION=true` the server behaves as the production build with
+`user-suspension.patch` did:
+
+- **Minting.** `POST /doc/:doc_id/auth` mints managed tokens. A request with a `userId` gets a
+  token bound to that user and the user's current *generation*; a request without one gets a
+  token bound to nobody. The user id must be 1 to 128 characters of `A-Z a-z 0-9 - _`. Minting
+  for a suspended user, for an invalid user id, or with a `userId` on a server without a store
+  is refused with `403`.
+- **Verifying.** Every doc endpoint (`as-update`, `update`, the websocket) accepts only the
+  server token and managed tokens. A token bound to a user is accepted only while that user is
+  not suspended and is still at the token's generation; otherwise `401`. Tokens of any other
+  kind get `401`, so after the switch is turned on every client authenticates again.
+- **Suspending.** `POST /users/:user_id/suspension` with the server token and the body
+  `{"suspended": true}` or `{"suspended": false}` (nothing else: an unknown field is `422`)
+  answers `204` once the change is stored. Either direction moves the user to a new
+  generation, so every token minted before it is dead for good, also after the user is
+  restored; a restored user needs new tokens. The user's open websockets are closed at once.
+  A storage failure answers `503` and changes nothing; the call can be repeated. Without the
+  server token: `401`. With the switch off the route does not exist (`404`).
+- **Token lifetime.** A websocket opened with a managed token is closed when the token
+  expires.
+- **State.** One small JSON object per user that was ever suspended or restored, under
+  `__dalus_auth/users/` in the store; include it in backups. Reads and writes of it have a
+  3 s limit. It is read once per user and then kept in memory, which is one more reason this
+  server must be the only one on its store.
+
+An HTTP update is checked twice: when the request arrives, and again just before it is
+applied, so an update that was waiting for its doc to load while its user was suspended is
+refused (`401`).
+
+#### Suspension and attribution together
+
+Both features read the `userId` of the mint request. With both switches on, a token for a
+request that names an actor carries the actor *and* the binding (`ManagedAttributedDoc`), and
+the binding follows the same rule as without attribution: **a `userId` binds the token to that
+user.** That is what the production build does with such a request today (it ignores `writer`
+and binds on `userId`). The consequence is new for the application, though: with attribution
+on, its server-side writers (REST, Copilot, imports, action runs) send the acting user's id
+where they used to send none, so their tokens become bound too. When that user is suspended:
+
+- their open server-side connections are closed, like the user's browser connections;
+- HTTP updates with those tokens, and reconnects, get `401`;
+- new tokens for that `userId` are refused with `403`, for every writer kind, until the user is
+  restored.
+
+A request can ask for the other behaviour with `"userScoped": false`: the token still names
+the user as the actor, so its writes are attributed to them, but it is bound to no user and is
+untouched by their suspension, like the tokens internal jobs get today. The field is read only
+with user suspension on, and an older server ignores it. Which server-side writers should
+keep working for a suspended user is the application's decision; the server does not know
+writer kinds and treats every request alike. Two more things follow from sharing the field:
+with suspension on, a `userId` that is fine for attribution alone (any bytes, up to 128) is
+refused with `403` unless it fits the stricter character set above or the request is not
+user-scoped; and a request with a `writer` but no `userId` is attributed and bound to nobody.
+
+### Token expiry
+
+With `Y_SWEET_ENFORCE_TOKEN_EXPIRY=true` the server behaves as the appliance build with
+`token-expiry.patch` did:
+
+- A doc token with full access is accepted only if it expires: one minted without an expiry,
+  or with the maximum one, gets `401`. Read-only tokens and the server token are not required
+  to expire. This applies to HTTP and websocket requests alike. Tokens this server mints
+  always expire (`validForSeconds`, default one hour).
+- A websocket is closed when the token it was opened with expires, and a frame that arrives
+  after that moment is not applied.
+- Attributed tokens are held to the same rule and keep their actor. (The patch predates them
+  and would have rejected them.)
+- In single-doc mode (`serve-doc`), which has no tokens, the switch is a startup error.
+
+With both switches on, a managed token that can write must expire as well.
+
+With neither switch on, a websocket outlives the token it was opened with, as upstream.
+
+### Logs
+
+`user suspension changed` (info, `suspended`) on each successful call of the suspension
+endpoint. The user id is not logged, there or anywhere.
 
 ## The update webhook
 

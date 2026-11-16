@@ -261,6 +261,87 @@ async fn empty_or_invalid_settings_do_not_stop_the_server() {
     stop_signal_saves_pending_edits("INT", &[("Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS", "soon")]).await;
 }
 
+/// Runs `y-sweet serve` with `env` on a free port and returns whether it comes up (and stops
+/// it), or exits first.
+async fn starts(env: &[(&str, &str)]) -> bool {
+    let starting = STARTING.lock().await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_y-sweet"))
+        .args(["serve", "--host", "127.0.0.1", "--prod"])
+        .args(["--port", &port.to_string()])
+        .env_clear()
+        .envs(env.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let started = loop {
+        if let Ok(response) = http
+            .get(format!("http://127.0.0.1:{port}/ready"))
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                break true;
+            }
+        }
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        assert!(Instant::now() < deadline, "neither ready nor exited");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    drop(starting);
+    let _ = child.kill();
+    let _ = child.wait();
+    started
+}
+
+/// The switches that decide who gets in refuse to run without what they need, or with a
+/// value that is neither on nor off, rather than start a server that enforces nothing.
+#[tokio::test]
+async fn suspension_and_token_expiry_need_auth_and_a_clear_value() {
+    // A private key in the format `y-sweet gen-auth` prints.
+    const AUTH: (&str, &str) = ("Y_SWEET_AUTH", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd");
+
+    // The appliance image sets this one, and always runs with auth.
+    assert!(!starts(&[("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "true")]).await);
+    assert!(!starts(&[("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "1")]).await);
+    assert!(starts(&[("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "true"), AUTH]).await);
+    assert!(!starts(&[("Y_SWEET_USER_SUSPENSION", "true")]).await);
+    assert!(starts(&[("Y_SWEET_USER_SUSPENSION", "true"), AUTH]).await);
+    assert!(
+        starts(&[
+            ("Y_SWEET_USER_SUSPENSION", "true"),
+            ("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "true"),
+            ("Y_SWEET_ATTRIBUTED_TOKENS", "true"),
+            AUTH
+        ])
+        .await
+    );
+
+    // Off, empty and unset ask for nothing.
+    for off in ["false", "0", "", " "] {
+        assert!(
+            starts(&[
+                ("Y_SWEET_ENFORCE_TOKEN_EXPIRY", off),
+                ("Y_SWEET_USER_SUSPENSION", off)
+            ])
+            .await,
+            "{off:?}"
+        );
+    }
+    // Neither on nor off.
+    assert!(!starts(&[("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "enabled"), AUTH]).await);
+    assert!(!starts(&[("Y_SWEET_USER_SUSPENSION", "enabled"), AUTH]).await);
+}
+
 async fn stop_signal_saves_pending_edits(signal: &str, env: &[(&str, &str)]) {
     let starting = STARTING.lock().await;
     use std::sync::Arc;

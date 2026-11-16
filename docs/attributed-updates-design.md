@@ -57,8 +57,9 @@ pub struct Actor {
 pub enum Permission {
     Server,                                            // 0
     Doc(DocPermission),                                // 1: unchanged, still minted when no actor is given
-    ManagedDoc(DocPermission, Option<(String, u64)>),  // 2: reserved, see below
+    ManagedDoc(DocPermission, Option<(String, u64)>),  // 2: user suspension, see below
     AttributedDoc(DocPermission, Actor),               // 3: new
+    ManagedAttributedDoc(DocPermission, Option<(String, u64)>, Actor),  // 4: both
 }
 ```
 
@@ -71,10 +72,40 @@ user id and the user's revocation generation) as variant 2. `AttributedDoc` was 
 here, and the two layouts overlap: a managed token for a user at generation 0 is, byte for byte, an
 attributed token for that user with no writer, and its signature verifies, because the signature is over
 those bytes. So `ManagedDoc` is declared at index 2 with the patch's exact layout and `AttributedDoc` is
-index 3. A build without suspension support rejects a `ManagedDoc` token with 401 (`The token is of a kind
+index 3. A server that does not enforce suspension rejects a `ManagedDoc` token with 401 (`The token is of a kind
 this server does not accept`) rather than treating it as a doc token: it cannot check the generation the
 token is bound to, so accepting it would make a revocable token irrevocable. Tests pin the bytes of every
 variant, written out by hand from the layout.
+
+User suspension and token expiry enforcement, formerly patches applied to revision 4f1909b when the
+production and appliance images were built, are part of the server behind `Y_SWEET_USER_SUSPENSION` and
+`Y_SWEET_ENFORCE_TOKEN_EXPIRY` (both off by default; the operator page has the behaviour). What the port
+had to settle:
+
+- **One verification path.** `Server::verify_doc_token` returns the access, a cancellation token and a
+  deadline. With suspension on it accepts the server token and managed tokens only and asks `UserAccess`
+  (the patch's module, unchanged) whether the bound user is at the token's generation; the cancellation
+  token it gets back fires when that user is suspended or restored. With expiry enforcement it applies
+  the appliance rule (a doc token that can write must have a finite expiry). With both, both. With
+  neither it is the code this branch had.
+- **Websockets.** The connection loop ends on the user's cancellation, on the token's deadline and on
+  shutdown, and checks both again for each frame, before and after the frame is admitted through the
+  write gate, so that waiting for admission cannot carry a frame past a suspension. Ending the loop
+  drops the `DocConnection`, which unregisters from the doc under the doc lock (the connection-churn fix
+  below), and only then aborts the sender task so that the socket closes at once. A suspension that
+  closes many sockets of one doc while others connect is therefore serialized like any other churn.
+- **HTTP updates.** Verified on arrival, then the doc is fetched (which can wait for a load), then the
+  cancellation is checked again under write admission, right before applying.
+- **Shutdown, GC, loading.** Revocation records are written straight to the store by the suspension
+  endpoint, with their own 3 s limit, and are durable before the endpoint answers; they are not docs, so
+  the write gate, the final saves, doc GC and the suspect window do not involve them. If such a write
+  times out after reaching the store, the store may end up one generation ahead of memory: after a
+  restart the user is then in the state the timed-out call asked for and tokens minted in between are
+  dead, which errs on the side of denying.
+- **Tokens with attribution.** A token that must carry both the binding and the actor is variant 4.
+  Whether a request's `userId` binds the token is decided as the patch decides it (it does), with
+  `"userScoped": false` as the request's way out; see the operator page for what that means for
+  server-side writers.
 
 Attributed tokens minted while `AttributedDoc` was index 2 (only builds of this branch up to 649406a with
 the switch on) are rejected by later builds; they expire within their lifetime, an hour by default.

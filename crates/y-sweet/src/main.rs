@@ -89,6 +89,35 @@ enum ServSubcommand {
         )]
         attributed_tokens: bool,
 
+        /// Enforce user suspension: mint doc tokens bound to the requesting user and their
+        /// revocation generation, accept only such tokens (and the server token), and serve
+        /// `POST /users/:user_id/suspension`. Needs `--auth` and a store. Accepts `true` or
+        /// `false`, like `--attributed-tokens`.
+        #[clap(
+            long,
+            env = "Y_SWEET_USER_SUSPENSION",
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_value = "false",
+            default_missing_value = "true",
+            value_parser = parse_plain_switch,
+        )]
+        user_suspension: bool,
+
+        /// Enforce token expiry: a doc token that can write must expire, and a websocket ends
+        /// when the token it was opened with does. Needs `--auth`. Accepts `true` or `false`,
+        /// like `--attributed-tokens`.
+        #[clap(
+            long,
+            env = "Y_SWEET_ENFORCE_TOKEN_EXPIRY",
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_value = "false",
+            default_missing_value = "true",
+            value_parser = parse_plain_switch,
+        )]
+        enforce_token_expiry: bool,
+
         /// URL that receives attributed doc updates. Unset (or empty) disables the webhook.
         #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_URL")]
         update_webhook_url: Option<String>,
@@ -151,6 +180,21 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "false", env = "Y_SWEET_SKIP_GC")]
         skip_gc: bool,
+
+        /// Enforce token expiry: a doc token that can write must expire, and a websocket ends
+        /// when the token it was opened with does. Needs auth, which this
+        /// mode has none of: turning it on here is an error, not a silently unprotected server. Accepts `true` or `false`,
+        /// like `--attributed-tokens`.
+        #[clap(
+            long,
+            env = "Y_SWEET_ENFORCE_TOKEN_EXPIRY",
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_value = "false",
+            default_missing_value = "true",
+            value_parser = parse_plain_switch,
+        )]
+        enforce_token_expiry: bool,
     },
 }
 
@@ -211,6 +255,17 @@ fn parse_switch(value: &str) -> Result<bool, String> {
              `--attributed-tokens=true` or `--attributed-tokens true` before the store."
         )),
     }
+}
+
+/// [parse_switch] for the other switches: the same values, and an error that does not talk
+/// about `--attributed-tokens`.
+fn parse_plain_switch(value: &str) -> Result<bool, String> {
+    parse_switch(value).map_err(|_| {
+        format!(
+            "expected `true` or `false` (or `1`/`0`, `yes`/`no`, `on`/`off`), got `{}`",
+            value.trim()
+        )
+    })
 }
 
 /// `None` for an option that is unset or set to nothing.
@@ -448,6 +503,8 @@ async fn run() -> Result<()> {
             skip_gc,
             shutdown_timeout_seconds,
             attributed_tokens,
+            user_suspension,
+            enforce_token_expiry,
             update_webhook_url,
             update_webhook_secret,
             update_webhook_batch_ms,
@@ -521,7 +578,9 @@ async fn run() -> Result<()> {
                 .with_shutdown_budgets(y_sweet::server::ShutdownBudgets::with_total(
                     shutdown_timeout,
                 ))
-                .with_attributed_tokens(*attributed_tokens);
+                .with_attributed_tokens(*attributed_tokens)
+                .with_user_suspension(*user_suspension)?
+                .with_token_expiry_enforcement(*enforce_token_expiry)?;
                 let mut server = server;
                 // Set up here, before the configuration line below, so that the line reports
                 // what is actually running. Fails on an unreadable or empty CA file, for one.
@@ -537,6 +596,8 @@ async fn run() -> Result<()> {
                 // the rest of the URL and the secret are never logged.
                 tracing::info!(
                     attributed_tokens = *attributed_tokens,
+                    user_suspension = *user_suspension,
+                    enforce_token_expiry = *enforce_token_expiry,
                     shutdown_timeout_seconds = shutdown_timeout.as_secs(),
                     update_webhook_enabled = update_webhook.is_some(),
                     update_webhook_host = update_webhook
@@ -625,6 +686,7 @@ async fn run() -> Result<()> {
             checkpoint_freq_seconds,
             max_body_size,
             skip_gc,
+            enforce_token_expiry,
         } => {
             let doc_id = env::var("SESSION_BACKEND_KEY").expect("SESSION_BACKEND_KEY must be set");
 
@@ -674,7 +736,8 @@ async fn run() -> Result<()> {
                 *max_body_size,
                 *skip_gc,
             )
-            .await?;
+            .await?
+            .with_token_expiry_enforcement(*enforce_token_expiry)?;
 
             // Load the one document we're operating with
             server
@@ -828,6 +891,40 @@ mod tests {
             .unwrap()
             .is_none());
         }
+    }
+
+    #[test]
+    fn suspension_and_expiry_switches() {
+        let parsed = |args: &[&str]| {
+            let opts = Opts::try_parse_from([&["y-sweet", "serve"], args].concat())
+                .map_err(|e| e.to_string())?;
+            match opts.subcmd {
+                ServSubcommand::Serve {
+                    user_suspension,
+                    enforce_token_expiry,
+                    ..
+                } => Ok::<_, String>((user_suspension, enforce_token_expiry)),
+                _ => unreachable!(),
+            }
+        };
+        // Both off unless asked for.
+        assert_eq!(parsed(&[]), Ok((false, false)));
+        assert_eq!(parsed(&["--user-suspension"]), Ok((true, false)));
+        assert_eq!(parsed(&["--enforce-token-expiry=true"]), Ok((false, true)));
+        assert_eq!(
+            parsed(&["--user-suspension=1", "--enforce-token-expiry", "true"]),
+            Ok((true, true))
+        );
+        // Empty counts as unset, as for every setting of this fork.
+        assert_eq!(
+            parsed(&["--user-suspension=", "--enforce-token-expiry= "]),
+            Ok((false, false))
+        );
+        // A value that is neither is an error: these decide who gets in.
+        let error = parsed(&["--enforce-token-expiry=enabled"]).unwrap_err();
+        assert!(error.contains("expected `true` or `false`"), "{error}");
+        assert!(!error.contains("attributed"), "{error}");
+        assert!(parsed(&["--user-suspension=maybe"]).is_err());
     }
 
     /// `(attributed_tokens, store)` as parsed from `y-sweet serve <args>`.
