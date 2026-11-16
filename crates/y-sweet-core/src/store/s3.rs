@@ -247,9 +247,7 @@ impl S3Store {
         let response = self.store_request(Method::GET, object_get, None).await;
 
         match response {
-            Ok(response) => {
-                Ok(Some(self.read_response_bytes(response).await?))
-            }
+            Ok(response) => Ok(Some(self.read_response_bytes(response).await?)),
             Err(StoreError::DoesNotExist(_)) => Ok(None),
             Err(e) => Err(e),
         }

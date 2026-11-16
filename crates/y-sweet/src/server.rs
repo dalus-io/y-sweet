@@ -2085,9 +2085,7 @@ mod test {
         }
         async fn get(&self, key: &str) -> y_sweet_core::store::Result<Option<Vec<u8>>> {
             self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let delay = self
-                .get_delay_ms
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let delay = self.get_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
@@ -3070,7 +3068,9 @@ mod test {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let serving = tokio::spawn(server.serve(listener, false));
-        store.get_delay_ms.store(load_time.as_millis() as u64, SeqCst);
+        store
+            .get_delay_ms
+            .store(load_time.as_millis() as u64, SeqCst);
         let reads_before = store.gets.load(SeqCst);
 
         // The first writer gives up, as it must.
@@ -3087,7 +3087,9 @@ mod test {
         let mut attempt = 1;
         loop {
             attempt += 1;
-            let status = post_update(addr, "slow-doc", map_edit(attempt)).await.unwrap();
+            let status = post_update(addr, "slow-doc", map_edit(attempt))
+                .await
+                .unwrap();
             if status == Some(200) {
                 break;
             }

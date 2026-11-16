@@ -3343,13 +3343,12 @@ GZuNFD2CfzKu6mHIOnyE
     /// directory (hex digest, two spaces, file name, one line per file, sorted by name).
     fn contract_checksums(dir: &std::path::Path) -> String {
         use sha2::Digest;
-        contract_fixture_names(dir)
-            .iter()
-            .map(|name| {
-                let digest = Sha256::digest(std::fs::read(dir.join(name)).unwrap());
-                format!("{}  {name}\n", HEXLOWER.encode(&digest))
-            })
-            .collect()
+        let mut checksums = String::new();
+        for name in contract_fixture_names(dir) {
+            let digest = Sha256::digest(std::fs::read(dir.join(&name)).unwrap());
+            checksums.push_str(&format!("{}  {name}\n", HEXLOWER.encode(&digest)));
+        }
+        checksums
     }
 
     fn assert_contract_checksums(dir: &std::path::Path) {
