@@ -155,41 +155,44 @@ Timing out closes the request's connection, so nothing of an abandoned save is s
 sent when the next one starts, and saves of one doc never overlap: each begins only when the
 one before has succeeded or failed, and holds a newer copy of the whole doc.
 
-**A save that timed out may still land.** The store may have received the write in full
-before the connection was closed, and apply it later: after a newer save, putting an older
-copy of the doc back. Nothing can recall that write (and conditional writes are not available
-on every S3-compatible store), so the server assumes it can happen. For a window after the
-timeout the doc is *suspect*:
+**A failed save may still land.** A save has an unknown outcome when it fails after the
+request may have reached the store: it timed out, the connection broke after the request was
+sent, or the store answered with a `5xx`. The store may hold the write in full and apply it
+later: after a newer save, putting an older copy of the doc back. Nothing can recall that
+write (and conditional writes are not available on every S3-compatible store), so the server
+assumes it can happen. A failure that cannot have left a write behind does not count: the
+connection could not be made (refused, DNS, TLS, the connect timeout), or the store refused the
+request (`401`, `403`, `404`). After a failure that counts, the doc is *suspect* for a window:
 
-- The window is 5 minutes from the timeout, or 5 times the time that request was given if
+- The window is 5 minutes from the failure, or 5 times the time that request was given if
   that is longer (a higher `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS`, or a large doc). Another
-  timeout inside the window extends it.
-- A successful save of a suspect doc does not count as having saved it. The doc stays marked
-  unsaved and is saved again at every checkpoint (`Y_SWEET_CHECKPOINT_FREQ_SECONDS`, default
-  10 s), edited or not, so a stale write that lands is overwritten with the current state at
-  the next checkpoint. These are ordinary full saves at the checkpoint rate, nothing faster.
+  such failure inside the window extends it.
+- A successful save of a suspect doc does not count as having saved it. The doc is saved
+  again **every 60 s** during the window although nothing in it changed, so a stale write
+  that lands is overwritten with the current state within a minute. A doc that does change
+  is saved at the next checkpoint as always, and that save takes the place of the next
+  60 s one. After an S3 brownout this means every affected doc is rewritten in full about
+  five times, not at each of the thirty checkpoints in the window.
 - A suspect doc is not unloaded, however idle: memory holds the only copy known to be
-  current. GC logs `a save of the doc being collected timed out; keeping it loaded` (warn)
-  if it finds this out part-way.
-- The first save that starts after the window clears the doc as usual, and it can then be
-  unloaded.
+  current. GC logs `an earlier save of the doc being collected may still land; keeping it
+  loaded` (warn) if it finds this out part-way.
+- One more save is made once the window has passed. It is the first that cannot be
+  overtaken by the stale write, and it clears the doc, which can then be unloaded.
 
 **What remains.** Only a stale write that the store applies *after the last save this process
 makes*:
 
-- after the final save at shutdown, when the process stops inside a doc's window. The final
-  save is made as usual and holds the current state; the server then logs one warning,
-  `shutting down with docs a timed-out save of which may still be applied by the store`,
-  with the number as `suspect_docs`. If the store applies the timed-out write after that, the
-  stored doc is the older copy: it lacks whatever was written between the timed-out save and
-  the shutdown, until a client that still holds those edits reconnects and sends them again;
+- after the final save at shutdown, when the process stops inside a doc's window. Every
+  suspect doc gets a final save, changed or not, and it holds the current state; the server
+  then logs one warning, `shutting down with docs an earlier save of which may still be
+  applied by the store`, with the number as `suspect_docs`. If the store applies the earlier
+  write after that, the stored doc is the older copy: it lacks whatever was written between
+  the failed save and the shutdown, until a client that still holds those edits reconnects
+  and sends them again;
 - after the window, should a store sit on a write for more than 5 minutes (5 request
   timeouts) and then apply it;
-- for up to one checkpoint interval at a time during the window (between the stale write
-  landing and the next checkpoint), if the process is killed just then.
-
-A save whose connection breaks for another reason after the body was sent has the same
-exposure in principle, as it has upstream; only timeouts are treated this way.
+- for up to 60 s at a time during the window (between the stale write landing and the next
+  save), if the process is killed just then.
 
 The filesystem store has no timeout. Neither has the Cloudflare worker build, where the
 platform bounds requests.
@@ -569,8 +572,8 @@ level; the webhook URL appears only as its host.
 | info | `shutdown started` / `shutdown finished` | `budget_ms` on the first, `elapsed_ms` on the second |
 | warn / error | `shutdown stage did not finish in time` | `stage`, `budget_ms`; for `persist` (error): `unsaved_docs`, `workers_left` |
 | error | `doc not saved before the shutdown deadline` (full message continues `; its changes since the last save are lost`) | `doc_id`. One per unsaved doc. |
-| warn | `shutting down with docs a timed-out save of which may still be applied by the store` | `suspect_docs` (a count). See [Store timeouts](#store-timeouts). |
-| warn | `a save of the doc being collected timed out; keeping it loaded` | In the `gc_loop` span, which carries the `doc_id`. |
+| warn | `shutting down with docs an earlier save of which may still be applied by the store` | `suspect_docs` (a count). See [Store timeouts](#store-timeouts). |
+| warn | `an earlier save of the doc being collected may still land; keeping it loaded` | In the `gc_loop` span, which carries the `doc_id`. |
 | warn | `final save failed; retrying` | `retry_in_ms`; in the `save_loop` span, which carries the `doc_id` |
 | error | `update webhook configuration is invalid; starting with the update webhook DISABLED` | `error` (the reason; never the URL or the secret) |
 | error | `timeout setting is not a whole number of seconds; using the default` | `setting` (the variable's name), `default_seconds`. The rejected value is not logged. |

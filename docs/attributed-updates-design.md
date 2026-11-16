@@ -445,27 +445,42 @@ stay bounded independently of this, as above.
 
 **Suspect window.** Before the timeout existed a hung save never returned, so nothing was saved after it.
 Now it returns, the save lock is released, and a later save can succeed, while the store may still hold
-the timed-out write in full and apply it afterwards, over the newer copy. There is no fence for this that
-works on AWS S3, MinIO and LocalStack alike (conditional writes are not uniformly supported), so it is
-mitigated by saving again. The store reports a timeout as its own error (`StoreError::Timeout`, with the
-time the request was given). `SyncKv::persist` then marks the doc suspect until
-`max(5 min, 5 x that time)` from now. While a doc is suspect:
+the earlier write in full and apply it afterwards, over the newer copy. The same is true of a save whose
+connection is reset after the body went out, or that the store answers with a `5xx`. There is no fence for
+this that works on AWS S3, MinIO and LocalStack alike (conditional writes are not uniformly supported), so
+it is mitigated by saving again.
 
-- a successful save leaves the dirty flag set (the save's drop guard, which re-marks the doc dirty when a
-  save fails or is abandoned, is simply left armed), so the persistence worker saves again at the next
-  checkpoint and each save rewrites the current state over whatever landed. No dirty callback is fired:
-  the worker's checkpoint timer is what brings the next save, so the cadence is the checkpoint's and
-  nothing can spin. Whether a save counts is decided when it starts, not when it ends: one sent inside the
-  window may itself be applied before the stale write;
-- GC does not retire the doc, and does not drop a doc whose save succeeded if it turned suspect meanwhile
-  (the worker's save timing out just before GC's): it un-retires it instead;
-- the first save that starts after the window clears the flag normally.
+The store sorts its failures (`StoreError::write_may_still_land`). `Timeout` (with the time the request
+was given) and `Interrupted` may have left a write behind. `ConnectionError` and the refusals cannot have:
+reqwest reports failures of the connect phase and of building the request as such (`is_connect`,
+`is_builder`), and a request that never got a connection sent no body; everything else reqwest reports is
+treated as possibly sent. `SyncKv::persist` marks the doc suspect on the first kind, until
+`max(5 min, 5 x that time)` from then. While a doc is suspect:
+
+- a successful save is recorded as the latest attempt, not as "saved": `has_unsaved_changes` stays true,
+  and the doc is due another save 60 s later although nothing changed. The persistence worker calls
+  `persist` at every checkpoint anyway; `persist` writes when the doc changed, or when that 60 s mark has
+  passed, and otherwise returns as it does for any unchanged doc. So an idle suspect doc is rewritten once
+  a minute instead of at every checkpoint (after a store brownout that is the difference between about
+  five and about thirty full rewrites of every affected doc), and nothing can spin: there is no extra
+  timer and no dirty callback;
+- the save's drop guard is unchanged: a save that fails or is abandoned re-marks the doc dirty, suspect or
+  not;
+- GC does not retire the doc, and does not drop a doc whose save succeeded if it became suspect meanwhile
+  (the worker's save failing just before GC's): it un-retires it instead;
+- the last save a copy of a doc gets (the final save at shutdown, GC's save) is made whether or not the
+  60 s are up;
+- one more save is made after the window. Whether a save settles the doc is decided by when it started,
+  not when it ended: one sent inside the window may itself be applied before the stale write. The save
+  that started after the window clears the state, and GC can then collect the doc.
 
 What is left is a stale write applied after the last save the process makes: after the final save at
-shutdown (the save is made as usual and the number of suspect docs is logged in one warning), after the
-window if a store holds a write that long, or in the gap of at most one checkpoint between a stale write
-landing and the next save if the process is killed there. The shutdown report of unsaved docs counts a
-suspect doc as unsaved even when its final save succeeded, which is the cautious reading.
+shutdown (every suspect doc is saved and their number is logged in one warning), after the window if a
+store holds a write that long, or in the gap of at most 60 s between a stale write landing and the next
+save if the process is killed there. The shutdown report of unsaved docs counts a suspect doc as unsaved
+even when its final save succeeded, which is the cautious reading.
+
+Store error messages no longer include the request URL: it is presigned and carries a signature.
 
 **Connection churn.** yrs 0.19 registers an observer with a compare-and-swap loop that does not reload
 the list head it compares against (`Observer::subscribe_with`); if the head is unregistered concurrently,

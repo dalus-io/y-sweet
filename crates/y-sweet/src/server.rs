@@ -141,6 +141,7 @@ struct DocLoader {
     doc_workers_token: CancellationToken,
     doc_worker_tracker: TaskTracker,
     suspect_window: Duration,
+    suspect_resave: Duration,
 }
 
 /// Admission for writes to docs, closed once at shutdown before the final saves.
@@ -258,9 +259,10 @@ pub struct Server {
     /// The loads under way, one per doc, so that concurrent requests load a doc once and a
     /// load survives the requests waiting for it (see [Server::load_doc]).
     loading: Arc<DashMap<String, SharedLoad>>,
-    /// How long a doc stays suspect after a save of it timed out, at least (see
-    /// [SyncKv::is_suspect]).
+    /// How long a doc stays suspect after a save of it may still land, at least, and how
+    /// often it is saved again meanwhile without having changed (see [SyncKv::is_suspect]).
     suspect_window: Duration,
+    suspect_resave: Duration,
 }
 
 impl Server {
@@ -298,6 +300,7 @@ impl Server {
             doc_wait: DEFAULT_DOC_WAIT,
             loading: Arc::new(DashMap::new()),
             suspect_window: y_sweet_core::sync_kv::DEFAULT_SUSPECT_WINDOW,
+            suspect_resave: y_sweet_core::sync_kv::DEFAULT_SUSPECT_RESAVE_INTERVAL,
         })
     }
 
@@ -381,6 +384,7 @@ impl Server {
                     doc_workers_token: self.doc_workers_token.clone(),
                     doc_worker_tracker: self.doc_worker_tracker.clone(),
                     suspect_window: self.suspect_window,
+                    suspect_resave: self.suspect_resave,
                 };
                 // The entry goes when the task ends, also if it panics. That cannot happen
                 // before the entry is in the map: removing it needs the shard lock held here.
@@ -429,7 +433,9 @@ impl DocLoader {
             self.on_update.clone(),
         )
         .await?;
-        dwskv.sync_kv().set_suspect_window(self.suspect_window);
+        dwskv
+            .sync_kv()
+            .set_suspect_window(self.suspect_window, self.suspect_resave);
 
         dwskv
             .sync_kv()
@@ -517,8 +523,8 @@ impl Server {
                         }
                         // Retired only if, under the doc lock, nothing holds it: a writer that
                         // took the doc since the count above keeps it alive.
-                        // Nor while a save of it that timed out may still land: memory then
-                        // holds the only copy known to be current (see `SyncKv::is_suspect`).
+                        // Nor while an earlier save of it may still land: memory then holds
+                        // the only copy known to be current (see `SyncKv::is_suspect`).
                         let retire = checkpoints_without_refs >= 2 && !doc.sync_kv().is_suspect();
                         (retire && doc.retire_if_unused(), doc.sync_kv())
                     };
@@ -530,6 +536,8 @@ impl Server {
                         continue;
                     }
 
+                    // The last save this copy gets (see `SyncKv::resave_now`).
+                    sync_kv.resave_now();
                     // Save before dropping: a writer that finds the doc retired waits for it to
                     // go (see `live_doc`), and its reload must read everything. Never abandoned
                     // part-way: a write already sent cannot be recalled, and one that lands
@@ -538,9 +546,10 @@ impl Server {
                     // and shutdown after its stage budget.
                     let saved = Self::compact_and_persist(&sync_kv, &persist_lock).await;
                     match saved {
-                        // A save by the persistence worker timed out just before this one.
-                        Ok(()) if sync_kv.is_suspect() => {
-                            tracing::warn!("a save of the doc being collected timed out; keeping it loaded");
+                        // A save by the persistence worker failed just before this one, in
+                        // a way that may still land.
+                        Ok(()) if sync_kv.is_unsettled() => {
+                            tracing::warn!("an earlier save of the doc being collected may still land; keeping it loaded");
                         }
                         Ok(()) => {
                             tracing::info!("GCing doc");
@@ -648,6 +657,10 @@ impl Server {
                 break;
             }
             tracing::info!("Persisting.");
+            if is_done {
+                // The last save: a suspect doc gets it whether or not its interval is up.
+                sync_kv.resave_now();
+            }
             let mut retry_in = Duration::from_millis(250);
             loop {
                 let result = Self::compact_and_persist(&sync_kv, &persist_lock).await;
@@ -970,8 +983,8 @@ impl Server {
             }
         }
 
-        // Docs whose last saves include one that timed out: the final save above stored the
-        // current state, but nothing saves again after it, so a timed-out write that the
+        // Docs with a recent save that failed but may still land: the final save above stored
+        // the current state, but nothing saves again after it, so an earlier write that the
         // store applies from here on would put an older copy back.
         let suspect_docs = self
             .docs
@@ -981,7 +994,7 @@ impl Server {
         if suspect_docs > 0 {
             tracing::warn!(
                 suspect_docs,
-                "shutting down with docs a timed-out save of which may still be applied by the store"
+                "shutting down with docs an earlier save of which may still be applied by the store"
             );
         }
 
@@ -2089,6 +2102,8 @@ mod test {
         /// of it: it is kept in `stale_write`, to be applied late by `land_stale_write`.
         time_out_next_set: Arc<std::sync::atomic::AtomicBool>,
         stale_write: Arc<std::sync::Mutex<Option<StoredWrite>>>,
+        /// How many writes were stored.
+        sets: Arc<std::sync::atomic::AtomicUsize>,
         /// Every write takes this long, in milliseconds.
         set_delay_ms: Arc<std::sync::atomic::AtomicU64>,
         /// Writes wait for `set_release` while set.
@@ -2114,6 +2129,7 @@ mod test {
                 fail_sets: Default::default(),
                 time_out_next_set: Default::default(),
                 stale_write: Default::default(),
+                sets: Default::default(),
                 set_delay_ms: Default::default(),
                 hold_sets: Default::default(),
                 detach_next_set: Default::default(),
@@ -2179,6 +2195,7 @@ mod test {
                     "test failure".to_string(),
                 ));
             }
+            self.sets.fetch_add(1, SeqCst);
             self.data.insert(key.to_string(), value);
             Ok(())
         }
@@ -2233,6 +2250,7 @@ mod test {
         .await
         .unwrap();
         server.suspect_window = suspect_window;
+        server.suspect_resave = Duration::from_millis(250);
         let docs = server.docs.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2313,6 +2331,9 @@ mod test {
         })
         .await;
         assert!(timed_out_at.elapsed() >= window);
+        // Meanwhile it was saved every 250 ms or so, not at each of the fifty checkpoints.
+        let saves = store.sets.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((5..25).contains(&saves), "{saves} saves");
         let stored = stored_keys_of(&store, DOC).await;
         assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
 

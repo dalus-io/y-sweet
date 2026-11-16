@@ -64,6 +64,30 @@ async fn within<T>(
         .map_err(|_| StoreError::Timeout { limit, what })
 }
 
+/// Sorts a failed request by whether it can have reached the endpoint.
+///
+/// A request that failed while connecting (refused, unresolved, TLS, the connect timeout) or
+/// while being built never sent its body. Every other failure may have come after the body
+/// was sent: a reset, a broken response. Those are [StoreError::Interrupted].
+///
+/// The error's URL is left out of the message: it is presigned, so it carries a signature.
+#[cfg(not(target_arch = "wasm32"))]
+fn request_error(error: reqwest::Error) -> StoreError {
+    let never_sent = error.is_connect() || error.is_builder();
+    let message = error.without_url().to_string();
+    if never_sent {
+        StoreError::ConnectionError(message)
+    } else {
+        StoreError::Interrupted(message)
+    }
+}
+
+/// On wasm the kinds cannot be told apart, and nothing acts on the difference there.
+#[cfg(target_arch = "wasm32")]
+fn request_error(error: reqwest::Error) -> StoreError {
+    StoreError::ConnectionError(error.without_url().to_string())
+}
+
 /// On wasm (the Cloudflare worker) there is no timer here; the platform bounds the request.
 #[cfg(target_arch = "wasm32")]
 async fn within<T>(
@@ -152,7 +176,7 @@ impl S3Store {
 
         let response = match response {
             Ok(response) => response,
-            Err(e) => return Err(StoreError::ConnectionError(e.to_string())),
+            Err(e) => return Err(request_error(e)),
         };
 
         match response.status() {
@@ -166,6 +190,11 @@ impl S3Store {
             StatusCode::UNAUTHORIZED => Err(StoreError::NotAuthorized(
                 "Received UNAUTHORIZED from S3-compatible API.".to_string(),
             )),
+            // The endpoint had the request and failed on its side: whether it applied a
+            // write is not something the status settles.
+            status if status.is_server_error() && cfg!(not(target_arch = "wasm32")) => Err(
+                StoreError::Interrupted(format!("Received {status} from S3-compatible API.")),
+            ),
             _ => Err(StoreError::ConnectionError(format!(
                 "Received {} from S3-compatible API.",
                 response.status()
@@ -181,7 +210,7 @@ impl S3Store {
         loop {
             let chunk = within(self.request_timeout, "reading from", response.chunk())
                 .await?
-                .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+                .map_err(request_error)?;
             match chunk {
                 Some(chunk) if body.is_empty() => body = Vec::from(chunk),
                 Some(chunk) => body.extend_from_slice(&chunk),
@@ -343,6 +372,10 @@ mod tests {
     enum Behaviour {
         /// Reads the whole request, then never answers. Reports when the client hangs up.
         NeverAnswer,
+        /// Reads the whole request, then closes the connection without answering.
+        HangUp,
+        /// Reads the whole request and answers with this status.
+        Status(u16),
         /// Answers a `GET` with `total` bytes, one every `every`, stopping for good after
         /// `stall_after` bytes if that is set.
         Drip {
@@ -408,6 +441,11 @@ mod tests {
                     let _ = reader.read_to_end(&mut rest);
                     let _ = hung_up.send(Instant::now());
                     return;
+                }
+                Behaviour::HangUp => return,
+                Behaviour::Status(status) => {
+                    let head = format!("HTTP/1.1 {status} X\r\ncontent-length: 0\r\n\r\n");
+                    let _ = stream.write_all(head.as_bytes());
                 }
                 Behaviour::Drip {
                     total,
@@ -511,6 +549,49 @@ mod tests {
         hung_up
             .recv_timeout(Duration::from_secs(5))
             .expect("the connection of the stalled read was left open");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_write_says_whether_it_may_still_land() {
+        let timeout = Duration::from_secs(10);
+        let write = |url: String| async move {
+            watched(store(url, timeout).set("doc/data.ysweet", vec![7; 4096])).await
+        };
+
+        // The endpoint took the whole request and dropped the connection: it may apply it.
+        let (url, _) = endpoint(Behaviour::HangUp);
+        let error = write(url).await.unwrap_err();
+        assert!(matches!(error, StoreError::Interrupted(_)), "{error:?}");
+        assert_eq!(error.write_may_still_land(), Some(Duration::ZERO));
+        // The message does not carry the presigned URL.
+        assert!(!error.to_string().contains("X-Amz"), "{error}");
+
+        // It failed on its side.
+        let (url, _) = endpoint(Behaviour::Status(503));
+        let error = write(url).await.unwrap_err();
+        assert!(matches!(error, StoreError::Interrupted(_)), "{error:?}");
+
+        // It refused the request: nothing was applied.
+        let (url, _) = endpoint(Behaviour::Status(403));
+        let error = write(url).await.unwrap_err();
+        assert!(matches!(error, StoreError::NotAuthorized(_)), "{error:?}");
+        assert_eq!(error.write_may_still_land(), None);
+
+        // Nothing listens there: the request never left.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let error = write(url).await.unwrap_err();
+        assert!(matches!(error, StoreError::ConnectionError(_)), "{error:?}");
+        assert_eq!(error.write_may_still_land(), None);
+
+        // And a timeout, as before.
+        let (url, _) = endpoint(Behaviour::NeverAnswer);
+        let limit = Duration::from_millis(200);
+        let error = watched(store(url, limit).set("doc/data.ysweet", vec![7; 16]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.write_may_still_land(), Some(limit));
     }
 
     #[test]
