@@ -273,6 +273,20 @@ Every write through an attributed token is tagged with its actor: websocket `Upd
 `SyncStep2` messages, and `POST /d/:doc_id/update` with the token as the bearer. Writes with the
 server token, with a plain doc token, or on a server without auth are unattributed (`actor: null`).
 
+### Token formats this build knows
+
+| Variant | Minted by | This build |
+| --- | --- | --- |
+| `Doc` | upstream; here when the request names no actor or the switch is off | accepts |
+| `ManagedDoc` (user id and revocation generation) | the Dalus production build with user suspension (fork revision 4f1909b plus its patch) | rejects with `401`: it cannot check the generation, and must not ignore it |
+| `AttributedDoc` | here, with the switch on | accepts |
+
+So a build of this branch cannot take over from the production suspension build while that
+build's tokens are outstanding without every client re-authenticating, and the two must never
+verify each other's tokens side by side. Builds of this branch up to 649406a used the
+`ManagedDoc` slot for `AttributedDoc`; attributed tokens they minted are rejected by later
+builds until they expire.
+
 ### Turning it on and off
 
 A binary without this feature cannot decode an attributed token and rejects it with `401`. So:

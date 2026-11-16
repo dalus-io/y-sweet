@@ -83,6 +83,8 @@ pub enum AuthError {
     InvalidSignature,
     #[error("The key ID did not match")]
     KeyMismatch,
+    #[error("The token is of a kind this server does not accept")]
+    Unsupported,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, PartialOrd, Debug)]
@@ -177,11 +179,28 @@ impl DocAccess {
 }
 
 // The payload is bincode and positional: variants may only ever be appended, and the fields of
-// an existing variant may never change, or every outstanding token stops verifying.
+// an existing variant may never change, or every outstanding token stops verifying. The
+// indexes are shared with every build that mints tokens for the same key, including the Dalus
+// production build of this fork (revision 4f1909b plus its user-suspension patch), which has
+// used index 2 since before this variant list knew of it. The golden-bytes tests below pin
+// each layout.
 #[derive(Serialize, Deserialize)]
 pub enum Permission {
+    /// Index 0.
     Server,
+    /// Index 1. Upstream's doc token.
     Doc(DocPermission),
+    /// Index 2. A doc token bound to a user and that user's revocation generation (`None`
+    /// for a token that is explicitly not user-scoped). Minted by servers that enforce user
+    /// suspension. The layout is that build's, field for field.
+    ///
+    /// This build does not enforce suspension, so it cannot honour what the token binds: it
+    /// reserves the index and rejects the token ([AuthError::Unsupported]). Accepting it as a
+    /// plain doc token would turn a revocable token into one that survives its user's
+    /// suspension. Leaving the index to another variant is worse: a managed token whose
+    /// generation is 0 has the same bytes as an `AttributedDoc` with a user and no writer.
+    ManagedDoc(DocPermission, Option<(String, u64)>),
+    /// Index 3. A doc token that carries the actor it writes for.
     AttributedDoc(DocPermission, Actor),
 }
 
@@ -465,6 +484,8 @@ impl Authenticator {
             Permission::AttributedDoc(doc_permission, actor) => (doc_permission, Some(actor)),
             // Server tokens can access any doc, and are never attributed.
             Permission::Server => return Ok(DocAccess::full()),
+            // See the variant: only a server that enforces suspension may accept it.
+            Permission::ManagedDoc(..) => return Err(AuthError::Unsupported),
         };
 
         if doc_permission.doc_id == doc {
@@ -797,6 +818,177 @@ mod tests {
             ),
             old_token
         );
+    }
+
+    // --- Wire format ---------------------------------------------------------------------
+    //
+    // The expected bytes below are written out by hand from the bincode layout (variant index,
+    // then each field in order; strings and byte vectors are a length and the bytes; an
+    // `Option` is 0, or 1 and the value; integers are varints, a value over 250 taking the
+    // marker 0xFB and two little-endian bytes). They do not come from this crate's encoder, so
+    // they fail if a variant moves or a field changes.
+
+    /// "doc", full access, as every variant with a `DocPermission` starts.
+    const DOC_FULL: [u8; 5] = [3, b'd', b'o', b'c', 1];
+    /// `Some(ExpirationTimeEpochMillis(1000))`.
+    const EXPIRES_AT_1000: [u8; 4] = [1, 0xFB, 0xE8, 0x03];
+    const GOLDEN_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd";
+
+    fn bytes(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    /// The token a server holding `GOLDEN_KEY` issues for these payload bytes: the payload,
+    /// then the 32-byte SHA-256 of payload and key, as base64.
+    fn token_for(payload: &[u8]) -> String {
+        let key = b64_decode(GOLDEN_KEY).unwrap();
+        let signature = hash(&bytes(&[payload, &key]));
+        b64_encode(&bytes(&[payload, &[32], &signature]))
+    }
+
+    fn golden_payloads() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("server", vec![0, 0]),
+            ("doc", bytes(&[&[1], &DOC_FULL, &EXPIRES_AT_1000])),
+            (
+                "managed, user-1 at generation 7",
+                bytes(&[&[2], &DOC_FULL, &[1, 6], b"user-1", &[7], &EXPIRES_AT_1000]),
+            ),
+            (
+                "managed, user-1 at generation 0",
+                bytes(&[&[2], &DOC_FULL, &[1, 6], b"user-1", &[0], &EXPIRES_AT_1000]),
+            ),
+            (
+                "managed, no user",
+                bytes(&[&[2], &DOC_FULL, &[0], &EXPIRES_AT_1000]),
+            ),
+            (
+                "attributed, user-1 as ui",
+                bytes(&[
+                    &[3],
+                    &DOC_FULL,
+                    &[1, 6],
+                    b"user-1",
+                    &[1, 2],
+                    b"ui",
+                    &EXPIRES_AT_1000,
+                ]),
+            ),
+            (
+                "attributed, user-1 and no writer",
+                bytes(&[&[3], &DOC_FULL, &[1, 6], b"user-1", &[0], &EXPIRES_AT_1000]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_permission_variant_has_its_pinned_bytes() {
+        let doc = || DocPermission {
+            doc_id: "doc".to_string(),
+            authorization: Authorization::Full,
+        };
+        let expiring = |permission| {
+            Payload::new_with_expiration(permission, ExpirationTimeEpochMillis(1000))
+        };
+        let user = |generation| Some(("user-1".to_string(), generation));
+        let built = [
+            Payload::new(Permission::Server),
+            expiring(Permission::Doc(doc())),
+            expiring(Permission::ManagedDoc(doc(), user(7))),
+            expiring(Permission::ManagedDoc(doc(), user(0))),
+            expiring(Permission::ManagedDoc(doc(), None)),
+            expiring(Permission::AttributedDoc(
+                doc(),
+                actor(Some("user-1"), Some("ui")),
+            )),
+            expiring(Permission::AttributedDoc(doc(), actor(Some("user-1"), None))),
+        ];
+        let golden = golden_payloads();
+        assert_eq!(built.len(), golden.len());
+        for (payload, (name, expected)) in built.iter().zip(&golden) {
+            assert_eq!(&bincode_encode(payload).unwrap(), expected, "{name}");
+            // And the bytes decode to a payload that encodes to the same bytes.
+            let decoded: Payload = bincode_decode(expected).unwrap();
+            assert_eq!(&bincode_encode(&decoded).unwrap(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn tokens_of_every_variant_are_read_as_what_they_are() {
+        let authenticator = Authenticator::new(GOLDEN_KEY).unwrap();
+        let verify = |name: &str| {
+            let (_, payload) = golden_payloads()
+                .into_iter()
+                .find(|(golden, _)| *golden == name)
+                .unwrap();
+            authenticator.verify_doc_token(&token_for(&payload), "doc", 1000)
+        };
+        let full = |actor| {
+            Ok(DocAccess {
+                authorization: Authorization::Full,
+                actor,
+            })
+        };
+
+        assert_eq!(verify("server"), full(None));
+        assert_eq!(verify("doc"), full(None));
+        assert_eq!(
+            verify("attributed, user-1 as ui"),
+            full(Some(actor(Some("user-1"), Some("ui"))))
+        );
+        assert_eq!(
+            verify("attributed, user-1 and no writer"),
+            full(Some(actor(Some("user-1"), None)))
+        );
+
+        // A token of the production build that enforces user suspension. It verifies there
+        // against the user's revocation generation, which this build does not track: it is
+        // refused, never read as some other permission. Generation 0 is the case that was: with
+        // the attributed variant at index 2, these bytes were a valid attributed token for
+        // user-1 with full access.
+        for managed in [
+            "managed, user-1 at generation 7",
+            "managed, user-1 at generation 0",
+            "managed, no user",
+        ] {
+            assert_eq!(verify(managed), Err(AuthError::Unsupported), "{managed}");
+        }
+
+        // Why the index matters: these two payloads differ in nothing but it.
+        let golden = golden_payloads();
+        assert_eq!(golden[3].1[1..], golden[6].1[1..]);
+
+        // The signature is over the payload bytes: a token is not accepted under another
+        // variant's index.
+        let (_, attributed) = golden_payloads().remove(6);
+        let mut forged = token_for(&attributed).into_bytes();
+        assert_eq!(forged[0], b'A'); // "Aw..." is index 3; "Ag..." would be index 2.
+        forged[1] = b'g';
+        assert_eq!(
+            authenticator.verify_doc_token(&String::from_utf8(forged).unwrap(), "doc", 1000),
+            Err(AuthError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn minting_still_produces_only_doc_and_attributed_tokens() {
+        let authenticator = Authenticator::new(GOLDEN_KEY).unwrap();
+        let expiry = ExpirationTimeEpochMillis(1000);
+        let golden = golden_payloads();
+        assert_eq!(
+            authenticator.gen_doc_token("doc", Authorization::Full, expiry),
+            token_for(&golden[1].1)
+        );
+        assert_eq!(
+            authenticator.gen_doc_token_with_actor(
+                "doc",
+                Authorization::Full,
+                expiry,
+                Some(actor(Some("user-1"), Some("ui")))
+            ),
+            token_for(&golden[5].1)
+        );
+        assert_eq!(authenticator.server_token(), token_for(&golden[0].1));
     }
 
     #[test]

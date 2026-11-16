@@ -55,13 +55,29 @@ pub struct Actor {
 }
 
 pub enum Permission {
-    Server,
-    Doc(DocPermission),                       // unchanged, still minted when no actor is given
-    AttributedDoc(DocPermission, Actor),      // new
+    Server,                                            // 0
+    Doc(DocPermission),                                // 1: unchanged, still minted when no actor is given
+    ManagedDoc(DocPermission, Option<(String, u64)>),  // 2: reserved, see below
+    AttributedDoc(DocPermission, Actor),               // 3: new
 }
 ```
 
-Old tokens decode as `Doc` and verify with no actor. Every build with this change verifies both variants.
+Old tokens decode as `Doc` and verify with no actor. Every build with this change verifies `Doc` and
+`AttributedDoc`.
+
+Index 2 is not free. The Dalus production image is built from fork revision 4f1909b plus a user-suspension
+patch, and that patch appended `ManagedDoc(DocPermission, Option<(String, u64)>)` (a doc token bound to a
+user id and the user's revocation generation) as variant 2. `AttributedDoc` was first written as variant 2
+here, and the two layouts overlap: a managed token for a user at generation 0 is, byte for byte, an
+attributed token for that user with no writer, and its signature verifies, because the signature is over
+those bytes. So `ManagedDoc` is declared at index 2 with the patch's exact layout and `AttributedDoc` is
+index 3. A build without suspension support rejects a `ManagedDoc` token with 401 (`The token is of a kind
+this server does not accept`) rather than treating it as a doc token: it cannot check the generation the
+token is bound to, so accepting it would make a revocable token irrevocable. Tests pin the bytes of every
+variant, written out by hand from the layout.
+
+Attributed tokens minted while `AttributedDoc` was index 2 (only builds of this branch up to 649406a with
+the switch on) are rejected by later builds; they expire within their lifetime, an hour by default.
 
 A binary without this change cannot decode `AttributedDoc` and rejects such a token with 401. Dalus already
 sends `userId` on every browser mint, so minting the new variant unconditionally would produce tokens the
