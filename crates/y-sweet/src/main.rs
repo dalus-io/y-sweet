@@ -64,9 +64,12 @@ enum ServSubcommand {
 
         /// How long a graceful shutdown may take in all, in seconds. Docs are saved until
         /// then; set it a little below the time the platform allows between the stop signal
-        /// and killing the process.
-        #[clap(long, default_value = "110", env = "Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS")]
-        shutdown_timeout_seconds: u64,
+        /// and killing the process. Defaults to 110.
+        // Text, not a number, so that clap does not refuse to start on a value that is empty
+        // (an env file that passes the variable through unset) or malformed: see
+        // [shutdown_timeout_from_opt].
+        #[clap(long, env = "Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS")]
+        shutdown_timeout_seconds: Option<String>,
 
         /// Mint doc tokens that carry the `userId` and `writer` of the auth request, so that
         /// updates can be attributed. Only turn this on once every server that verifies the
@@ -222,6 +225,35 @@ fn parse_number<T: std::str::FromStr>(name: &str, value: &Option<String>) -> Res
                 .map_err(|_| anyhow::anyhow!("{name} must be a non-negative integer"))
         })
         .transpose()
+}
+
+/// The longest shutdown timeout accepted, in seconds: one day. Far beyond any platform's stop
+/// timeout, and small enough that deadlines computed from it cannot overflow.
+const MAX_SHUTDOWN_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+
+/// The shutdown timeout to run with. Unset or empty means the default. A value that is not a
+/// whole number of seconds is reported and replaced by the default rather than keeping the
+/// server from starting: this server is the only copy of the sync service, and the default is
+/// a safe value. A number is kept within 1 s and one day.
+fn shutdown_timeout_from_opt(value: &Option<String>) -> std::time::Duration {
+    let default = y_sweet::server::DEFAULT_SHUTDOWN_TIMEOUT;
+    let Some(value) = non_empty(value) else {
+        return default;
+    };
+    match value.parse::<u64>() {
+        Ok(seconds) => {
+            std::time::Duration::from_secs(seconds.clamp(1, MAX_SHUTDOWN_TIMEOUT_SECONDS))
+        }
+        Err(_) => {
+            // The value is not echoed: nothing read from the environment is, in case the
+            // wrong variable ended up here.
+            tracing::error!(
+                default_seconds = default.as_secs(),
+                "Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS is not a whole number of seconds; using the default"
+            );
+            default
+        }
+    }
 }
 
 /// Builds the update webhook configuration from the `serve` options. `Ok(None)` means the
@@ -406,6 +438,8 @@ async fn run() -> Result<()> {
             // that never answers, say) abandons startup instead of being held until it is done.
             let mut shutdown = Box::pin(shutdown_signal());
 
+            let shutdown_timeout = shutdown_timeout_from_opt(shutdown_timeout_seconds);
+
             let startup = async {
                 // The webhook is an optional feature and this server is the only copy of the
                 // sync service: a mistake in the webhook's settings disables the webhook, with
@@ -462,7 +496,7 @@ async fn run() -> Result<()> {
                 )
                 .await?
                 .with_shutdown_budgets(y_sweet::server::ShutdownBudgets::with_total(
-                    std::time::Duration::from_secs((*shutdown_timeout_seconds).max(1)),
+                    shutdown_timeout,
                 ))
                 .with_attributed_tokens(*attributed_tokens);
                 let mut server = server;
@@ -480,7 +514,7 @@ async fn run() -> Result<()> {
                 // the rest of the URL and the secret are never logged.
                 tracing::info!(
                     attributed_tokens = *attributed_tokens,
-                    shutdown_timeout_seconds = *shutdown_timeout_seconds,
+                    shutdown_timeout_seconds = shutdown_timeout.as_secs(),
                     update_webhook_enabled = update_webhook.is_some(),
                     update_webhook_host = update_webhook
                         .as_ref()
@@ -666,6 +700,97 @@ mod tests {
             assert_eq!(parse_switch(off), Ok(false), "{off}");
         }
         assert!(parse_switch("maybe").is_err());
+    }
+
+    #[test]
+    fn switch_treats_blank_as_off() {
+        for blank in ["", " ", "\t", " \n"] {
+            assert_eq!(parse_switch(blank), Ok(false), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn shutdown_timeout_parsing() {
+        let default = y_sweet::server::DEFAULT_SHUTDOWN_TIMEOUT;
+        let seconds = std::time::Duration::from_secs;
+        assert_eq!(default, seconds(110));
+        assert_eq!(shutdown_timeout_from_opt(&None), default);
+        // Passed through empty: unset.
+        for blank in ["", " ", "\t\n"] {
+            assert_eq!(shutdown_timeout_from_opt(&opt(blank)), default, "{blank:?}");
+        }
+        assert_eq!(shutdown_timeout_from_opt(&opt("25")), seconds(25));
+        assert_eq!(shutdown_timeout_from_opt(&opt(" 25\n")), seconds(25));
+        // Not a number: the default, not a refusal to start.
+        for invalid in ["soon", "-1", "1.5", "30s", "18446744073709551616"] {
+            assert_eq!(
+                shutdown_timeout_from_opt(&opt(invalid)),
+                default,
+                "{invalid}"
+            );
+        }
+        // Kept within bounds, so no deadline computed from it can overflow.
+        assert_eq!(shutdown_timeout_from_opt(&opt("0")), seconds(1));
+        assert_eq!(
+            shutdown_timeout_from_opt(&opt("18446744073709551615")),
+            seconds(MAX_SHUTDOWN_TIMEOUT_SECONDS)
+        );
+    }
+
+    /// Every setting this fork adds, given as an empty or blank flag value (which is what clap
+    /// makes of an empty environment variable), parses and means "unset".
+    #[test]
+    fn blank_values_of_the_new_settings_parse_as_unset() {
+        for blank in ["", " "] {
+            let args: Vec<String> = [
+                "--shutdown-timeout-seconds",
+                "--attributed-tokens",
+                "--update-webhook-url",
+                "--update-webhook-secret",
+                "--update-webhook-batch-ms",
+                "--update-webhook-max-bytes",
+                "--update-webhook-concurrency",
+                "--update-webhook-ca-file",
+            ]
+            .iter()
+            .map(|flag| format!("{flag}={blank}"))
+            .collect();
+            let opts = Opts::try_parse_from(
+                ["y-sweet", "serve"]
+                    .into_iter()
+                    .chain(args.iter().map(String::as_str)),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            let ServSubcommand::Serve {
+                shutdown_timeout_seconds,
+                attributed_tokens,
+                update_webhook_url,
+                update_webhook_secret,
+                update_webhook_batch_ms,
+                update_webhook_max_bytes,
+                update_webhook_concurrency,
+                update_webhook_ca_file,
+                ..
+            } = opts.subcmd
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                shutdown_timeout_from_opt(&shutdown_timeout_seconds),
+                y_sweet::server::DEFAULT_SHUTDOWN_TIMEOUT
+            );
+            assert!(!attributed_tokens);
+            assert!(update_webhook_config_from_opts(
+                &update_webhook_url,
+                &update_webhook_secret,
+                &update_webhook_batch_ms,
+                &update_webhook_max_bytes,
+                &update_webhook_concurrency,
+                &update_webhook_ca_file,
+            )
+            .unwrap()
+            .is_none());
+        }
     }
 
     /// `(attributed_tokens, store)` as parsed from `y-sweet serve <args>`.

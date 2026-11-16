@@ -237,6 +237,30 @@ async fn a_broken_webhook_configuration_does_not_stop_the_server() {
     }
 }
 
+/// An environment that defines every setting of this fork but leaves it empty or blank, as an
+/// env file or a compose file that passes the variables through does, starts the server with
+/// each of them at its default. So does a shutdown timeout that is not a number.
+#[tokio::test]
+async fn empty_or_invalid_settings_do_not_stop_the_server() {
+    for value in ["", " "] {
+        stop_signal_saves_pending_edits(
+            "INT",
+            &[
+                ("Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS", value),
+                ("Y_SWEET_ATTRIBUTED_TOKENS", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_URL", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_SECRET", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_BATCH_MS", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_CA_FILE", value),
+            ],
+        )
+        .await;
+    }
+    stop_signal_saves_pending_edits("INT", &[("Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS", "soon")]).await;
+}
+
 async fn stop_signal_saves_pending_edits(signal: &str, env: &[(&str, &str)]) {
     let starting = STARTING.lock().await;
     use std::sync::Arc;

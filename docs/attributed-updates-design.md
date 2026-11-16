@@ -404,7 +404,7 @@ on are bounded instead, as above.
 | --- | --- |
 | `Y_SWEET_UPDATE_WEBHOOK_URL` | Target URL. Unset means no observer and no dispatcher. |
 | `Y_SWEET_UPDATE_WEBHOOK_SECRET` | HMAC secret. Required when the URL is set. |
-| `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` | Total time a graceful shutdown may take, default 110 (section 4.6). Not a webhook setting: it applies with everything off. |
+| `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` | Total time a graceful shutdown may take, default 110 (section 4.6). Not a webhook setting: it applies with everything off. Empty counts as unset; a value that is not a number is logged as an error and replaced by the default, so it cannot keep the server from starting. |
 | `Y_SWEET_UPDATE_WEBHOOK_BATCH_MS` | Coalescing window per doc, default 1000. |
 | `Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES` | Global budget for the estimated memory of held updates, default 268435456. |
 | `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | Requests in flight at once across docs, default 16 (section 4.5). |

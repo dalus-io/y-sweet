@@ -73,10 +73,19 @@ All of these apply to `y-sweet serve` only. `serve-doc` has neither feature.
 | `Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY` | `--update-webhook-concurrency` | `16` | How many webhook requests may be in flight at once, across all docs. From 1 to 1024. |
 | `Y_SWEET_UPDATE_WEBHOOK_CA_FILE` | `--update-webhook-ca-file` | unset | PEM file of extra CA certificates to trust for the webhook URL, in addition to the bundled public roots. For a receiver behind a private CA. If the file cannot be read or holds no certificate the webhook stays off (see below). |
 
-A variable that is set but empty counts as unset, so passing the variables through an environment
-that does not define them is safe. `Y_SWEET_ATTRIBUTED_TOKENS` accepts `true`/`false`
-(also `1`/`0`, `yes`/`no`, `on`/`off`); anything else is a startup error, as is a
-`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` that is not a number.
+A variable that is set but empty, or holds only whitespace, counts as unset for every setting
+in this table, so passing the variables through an environment that does not define them (an
+env file, a compose file) is safe. Whitespace around a value is ignored, except in the secret
+(below).
+
+`Y_SWEET_ATTRIBUTED_TOKENS` accepts exactly these values, in any letter case: `true`, `1`,
+`yes`, `on` for on; `false`, `0`, `no`, `off` for off. Anything else is a startup error: the
+switch decides what tokens are minted, so a typo must not silently pick one.
+
+`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS` is a whole number of seconds, kept within 1 and 86400. A
+value that is not a number does not stop the server: it logs one error,
+`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS is not a whole number of seconds; using the default`, and
+runs with 110. The `attributed updates configuration` line shows the value in use.
 
 **A mistake in the webhook settings does not stop the server.** The webhook is optional, and
 this server is the only copy of the sync service, so a malformed URL, a URL without a secret, a
@@ -449,6 +458,7 @@ level; the webhook URL appears only as its host.
 | error | `doc not saved before the shutdown deadline` (full message continues `; its changes since the last save are lost`) | `doc_id`. One per unsaved doc. |
 | warn | `final save failed; retrying` | `retry_in_ms`; in the `save_loop` span, which carries the `doc_id` |
 | error | `update webhook configuration is invalid; starting with the update webhook DISABLED` | `error` (the reason; never the URL or the secret) |
+| error | `Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS is not a whole number of seconds; using the default` | `default_seconds`. The rejected value is not logged. |
 | info | `update webhook shutdown: nothing to flush` / `update webhook shutdown flush done` | `docs`, `batches`, `delivered` |
 | warn | `update webhook shutdown flush incomplete` | `docs`, `batches`, `delivered`, `timed_out` |
 
