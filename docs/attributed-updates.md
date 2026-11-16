@@ -372,22 +372,23 @@ takes milliseconds. A response already being sent when the user is suspended is 
 
 #### Revocation records
 
-Every suspension or restore is a new *generation* of the user, stored as a record of its own:
-`__dalus_auth/users/<user>/<generation>.json`, holding the generation and whether the user is
-suspended. The user's state is the record with the highest generation. The server finds it
-by reading generations upwards until one is missing.
+Every suspension or restore is a new *generation* of the user, stored as a record of its own
+at the end of the user's chain: `__dalus_auth/users/<user>/1.json`, `2.json`, and so on, each
+holding a generation and whether the user is suspended. The user's state is the last record
+of the chain. The chain always starts at `1.json`, and the server finds its end by reading
+upwards until a position is missing.
 
 Records are never overwritten with a different acknowledged state, for this reason: a write
 to the store can time out for the server and be applied by the store later. With one object
 per user, overwritten on every change (which is how the production build with the patch
 stores it), such a late write can replace a state that was acknowledged after it: a restore
 that timed out, landing after a later suspension, un-suspends the user at the next restart.
-Here a late write lands on a generation that is no longer the highest, and changes nothing.
-Two rules make that hold:
+Here a late write lands on a position that is no longer the last, and changes nothing. Two
+rules make that hold:
 
-- A change whose write failed is never retried on the same generation. The next change first
-  stores a record that keeps the current state under the generation that may have been
-  used, then stores itself under the one after.
+- A change whose write failed is never retried on the same position. The next change first
+  stores a record that keeps the current state on the position that may have been used,
+  then stores itself on the one after.
 - The first change of a user after the server started does the same, because the server
   cannot know whether the previous process left such a write behind.
 
@@ -396,18 +397,30 @@ invalidated by a change that then fails (when its first write succeeded and its 
 not): the call answers `503`, the user's state is unchanged, their sockets are closed and they
 need new tokens. Repeating the call is safe.
 
-**The single object of earlier builds** (`__dalus_auth/users/<user>.json`) is still read: its
-generation is where the server starts reading upwards, so everything the production build
-wrote is honoured. It is also still written, after every change, with the new state, so that
-a build that knows only that object (the current production build, during a rolling deploy or
-after a rollback) sees the change. If writing it fails the change stands and the server logs
-`could not update the single-object copy of a user access record` (warn, no user id); that
-build would then see the previous state until the next change. What the fencing does not
-cover is a build of that kind writing while this one runs: it reads and overwrites only the
-single object. If it writes a generation below the lowest generation-keyed record of that
-user, this build, at its next start, reads that older state. That is the same last-writer-wins
-the production build has today, and needs two servers writing to one store, which the
-deployment forbids.
+**The single object of earlier builds** (`__dalus_auth/users/<user>.json`) can raise a user's
+state but never lower it:
+
+- It is read, and it counts only when its generation is higher than the last record of the
+  chain. That is the case for everything the production build wrote before this build first
+  saw the user, and for a change an earlier build makes during a rollback.
+- When it counts, it is copied to the end of the chain at once (the first time this build
+  looks the user up, be it for a mint that is then refused). From then on it is part of the
+  chain, and nothing written to the single object afterwards with a lower or equal
+  generation matters. In particular a write of the earlier build that timed out before the
+  upgrade and lands after it, such as a restore landing on top of a later suspension, is
+  ignored. If the copy cannot be stored, the lookup still succeeds with the same state, and
+  the user's next change puts it in the chain.
+- It is still written after every change, with the new state, so that a build that knows
+  only that object (the production build, during a rolling deploy or after a rollback) sees
+  the change. If writing it fails the change stands and the server logs `could not update the
+  single-object copy of a user access record` (warn, no user id); that build would then see
+  the previous state until the next change.
+
+What this cannot cover: a late write of an earlier build that lands before this build has
+ever looked that user up is indistinguishable from the state that build meant to leave, and
+is taken as it. And a build that knows only the single object, running at the same time as
+this one, can still overwrite that object with an older state that it alone will read; two
+servers on one store are forbidden for this among other reasons.
 
 #### Suspension and attribution together
 

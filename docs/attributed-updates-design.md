@@ -107,12 +107,17 @@ had to settle:
   for that, a write admitted just before the deadline may finish just after it.
 - **HTTP reads.** `as-update` fetches the doc, then takes the guard, checks, and encodes the doc under it.
 - **Revocation records.** The patch kept one object per user and overwrote it on each change, so a write
-  that timed out and landed late could replace a later, acknowledged state. Records are now one object per
-  generation, the highest generation is the state, a key never receives two different acknowledged
-  contents, and a generation is only used once all below it are stored, which is what lets the highest be
-  found by reading upwards without listing the store (the `Store` trait has no listing). The single object
-  is kept as a starting point for reading and as a mirror for builds that know nothing else. The operator
-  page has the details and the one case this does not cover (an old build writing concurrently).
+  that timed out and landed late could replace a later, acknowledged state. Records now form a chain per
+  user, at positions 1, 2, 3 and so on; the last record is the state; a position never receives two
+  different acknowledged contents; and a position is used only once all before it are stored, which is
+  what lets the end be found by reading upwards without listing the store (the `Store` trait has no
+  listing). The chain starts at a fixed position on purpose. An earlier version started it at the
+  generation found in the single object, which made recovery depend on that mutable object: a write of the
+  old build, pending since before the upgrade, could lower it afterwards, the scan then began below the
+  chain and found nothing, and a suspended user came back. The single object is now only ever an input
+  that can raise the state: it counts when its generation is above the chain's and is then appended to
+  the chain. It is still written as a mirror for builds that know nothing else. The operator page has the
+  details and what remains uncovered.
 - **Shutdown, GC, loading.** Revocation records are written straight to the store by the suspension
   endpoint, with their own 3 s limit, and are durable before the endpoint answers; they are not docs, so
   the write gate, the final saves, doc GC and the suspect window do not involve them. A change whose

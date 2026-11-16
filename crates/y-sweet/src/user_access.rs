@@ -1,18 +1,24 @@
 //! Durable, singleton-server user revocation. Old generations never become valid on restore.
 //!
 //! A user's state is a [Record]: a generation and whether the user is suspended. Every change
-//! is a new generation, stored under a key of its own (`__dalus_auth/users/<user>/<n>.json`),
-//! and the record with the highest generation is the user's state. A key is written with one
-//! acknowledged content at most, and only once every lower generation is in the store, so:
+//! is a new record with a higher generation, appended to the user's *chain*: the objects
+//! `__dalus_auth/users/<user>/1.json`, `2.json`, and so on. The last record of the chain is
+//! the user's state. A position in the chain is written with one acknowledged content at
+//! most, and only once every position before it is in the store, so:
 //!
 //! - a write that timed out for this server and is applied by the store later (an S3 write
-//!   can be) lands on a key that is, by then, not the highest. It cannot replace a state that
-//!   was acknowledged after it, which a single overwritten object could not rule out;
-//! - the highest generation is found by reading upwards until a key is missing.
+//!   can be) lands on a position that is, by then, not the last. It cannot replace a state
+//!   that was acknowledged after it, which a single overwritten object could not rule out;
+//! - the chain always starts at position 1, whatever else the store holds, and its end is
+//!   found by reading positions upwards until one is missing.
 //!
-//! The single object earlier builds used (`__dalus_auth/users/<user>.json`) is still read,
-//! as the generation to start reading from, and still written after every change, so that a
-//! build that knows only that object sees the change too.
+//! Earlier builds kept one object per user (`__dalus_auth/users/<user>.json`) and overwrote
+//! it. It is still read, but it can only raise a user's state, never lower it: it counts
+//! when its generation is higher than the chain's (a change an earlier build made, before
+//! this build first saw the user or during a rollback), and it is then copied to the end of
+//! the chain, after which nothing written to that object later with a lower generation, such
+//! as an earlier build's write that timed out and lands late, matters any more. It is still
+//! written after every change, so that a build that knows only that object sees the change.
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -41,7 +47,9 @@ struct Entry {
     /// writing by [UserAccess::set_suspended] after it cancelled, before it returns. So once
     /// a suspension is acknowledged, nothing authorized before it is still under way.
     activity: Arc<RwLock<()>>,
-    /// Whether the key of the next generation may have been written already: by a write of
+    /// How many positions of the user's chain are known to be in the store.
+    chain_len: u64,
+    /// Whether the next position of the chain may have been written already: by a write of
     /// this process whose outcome is unknown, or by an earlier process (which this one
     /// cannot know). The next change must not put its record there.
     next_key_used: bool,
@@ -74,10 +82,10 @@ impl UserAccess {
         Ok(format!("__dalus_auth/users/{user}.json"))
     }
 
-    /// The key of the user's record of one generation.
-    fn generation_key(user: &str, generation: u64) -> Result<String> {
+    /// The key of one position (from 1) of the user's chain of records.
+    fn chain_key(user: &str, position: u64) -> Result<String> {
         Self::key(user)?;
-        Ok(format!("__dalus_auth/users/{user}/{generation}.json"))
+        Ok(format!("__dalus_auth/users/{user}/{position}.json"))
     }
 
     async fn read(store: &Arc<Box<dyn Store>>, key: &str) -> Result<Option<Record>> {
@@ -90,22 +98,6 @@ impl UserAccess {
     async fn write(store: &Arc<Box<dyn Store>>, key: &str, record: &Record) -> Result<()> {
         timeout(STORAGE_TIMEOUT, store.set(key, serde_json::to_vec(record)?)).await??;
         Ok(())
-    }
-
-    /// The user's record of generation `generation`, if the store has one.
-    async fn read_generation(
-        store: &Arc<Box<dyn Store>>,
-        user: &str,
-        generation: u64,
-    ) -> Result<Option<Record>> {
-        let record = Self::read(store, &Self::generation_key(user, generation)?).await?;
-        if record
-            .as_ref()
-            .is_some_and(|record| record.generation != generation)
-        {
-            return Err(anyhow!("Access record does not match its generation"));
-        }
-        Ok(record)
     }
 
     fn next_generation(record: &Record) -> Result<u64> {
@@ -135,31 +127,39 @@ impl UserAccess {
         if let Some(entry) = cached.as_ref() {
             return Ok(entry.clone());
         }
-        let record = match store {
-            Some(store) => {
-                // The single object of earlier builds says where to start. A record under
-                // a generation key takes precedence over it, at the same generation too.
-                let legacy = Self::read(store, &key).await?;
-                let mut record = legacy.clone().unwrap_or_default();
-                if legacy.is_some() {
-                    if let Some(same) =
-                        Self::read_generation(store, user, record.generation).await?
-                    {
-                        record = same;
-                    }
-                }
-                // Then upwards until a generation is missing: the highest one stored.
-                while let Some(next) =
-                    Self::read_generation(store, user, Self::next_generation(&record)?).await?
+        let Some(store) = store else {
+            return Err(anyhow!("User-scoped access requires durable storage"));
+        };
+        // The chain, from its fixed start to its last record.
+        let mut chain_len = 0;
+        let mut last = None;
+        while let Some(record) = Self::read(store, &Self::chain_key(user, chain_len + 1)?).await? {
+            last = Some(record);
+            chain_len += 1;
+        }
+        // The single object of earlier builds counts only where it is ahead of the chain.
+        let single = Self::read(store, &key).await?;
+        let record = match (last, single) {
+            (Some(last), Some(single)) if single.generation <= last.generation => last,
+            (Some(last), None) => last,
+            (None, None) => Record::default(),
+            (_, Some(single)) => {
+                // A change by an earlier build. Make it part of the chain, so that it holds
+                // whatever is written to the single object after this. If the copy cannot be
+                // made now, the user's state is the same; the next change settles the
+                // position (it is marked as possibly used below, like any first position).
+                if Self::write(store, &Self::chain_key(user, chain_len + 1)?, &single)
+                    .await
+                    .is_ok()
                 {
-                    record = next;
+                    chain_len += 1;
                 }
-                record
+                single
             }
-            None => return Err(anyhow!("User-scoped access requires durable storage")),
         };
         let entry = Entry {
             record,
+            chain_len,
             // An earlier process may have left a write behind that has yet to land.
             next_key_used: true,
             ..Entry::default()
@@ -212,12 +212,14 @@ impl UserAccess {
         })
     }
 
-    /// Moves the user to `record`, which is in the store: what was authorized under `old`
-    /// is cancelled, and whatever of it is still under way is waited for.
+    /// Moves the user to `record`, which is in the store as the next position of the
+    /// chain: what was authorized under `old` is cancelled, and whatever of it is still
+    /// under way is waited for.
     async fn advance(cached: &mut Option<Entry>, old: &Entry, record: Record) -> Entry {
         old.cancellation.cancel();
         let entry = Entry {
             record,
+            chain_len: old.chain_len + 1,
             ..Entry::default()
         };
         *cached = Some(entry.clone());
@@ -242,19 +244,19 @@ impl UserAccess {
             .ok_or_else(|| anyhow!("Durable storage required"))?;
 
         if old.next_key_used {
-            // The next generation's key may hold, or may yet receive, a write this process
-            // never confirmed. The record of this change must not share a key with it, or
-            // that write could replace it later. So that key is settled first, with a record
-            // that changes nothing but the generation, and the change goes one higher. If
-            // the unconfirmed write lands on the settled key after all, it is below the
-            // change by then.
+            // The next position of the chain may hold, or may yet receive, a write this
+            // process never confirmed. The record of this change must not share a position
+            // with it, or that write could replace it later. So that position is settled
+            // first, with a record that changes nothing but the generation, and the change
+            // goes one higher. If the unconfirmed write lands on the settled position after
+            // all, it is below the change by then.
             let unchanged = Record {
                 generation: Self::next_generation(&old.record)?,
                 suspended: old.record.suspended,
             };
             Self::write(
                 store,
-                &Self::generation_key(user, unchanged.generation)?,
+                &Self::chain_key(user, old.chain_len + 1)?,
                 &unchanged,
             )
             .await?;
@@ -266,14 +268,10 @@ impl UserAccess {
             suspended,
         };
         // Persist before acknowledging. Failure leaves the old state and allows a safe retry.
-        if let Err(error) = Self::write(
-            store,
-            &Self::generation_key(user, record.generation)?,
-            &record,
-        )
-        .await
+        if let Err(error) =
+            Self::write(store, &Self::chain_key(user, old.chain_len + 1)?, &record).await
         {
-            // The write may have reached the store all the same: its key is used.
+            // The write may have reached the store all the same: its position is used.
             if let Some(entry) = cached.as_mut() {
                 entry.next_key_used = true;
             }
@@ -518,6 +516,7 @@ mod tests {
             let data = backing.data.lock().unwrap();
             String::from_utf8(data.get(key).expect(key).clone()).unwrap()
         };
+        let chain = |position: u64| stored(&format!("__dalus_auth/users/member/{position}.json"));
 
         // What the production build wrote for a user it suspended, twice restored before.
         backing.data.lock().unwrap().insert(
@@ -527,50 +526,51 @@ mod tests {
         let access = UserAccess::default();
         assert!(access.generation(&store, "member").await.is_err());
         assert!(access.authorize(&store, "member", 3).await.is_err());
+        // Seeing the user started their chain with that state. A user with nothing in the
+        // store gets nothing written.
+        assert_eq!(chain(1), r#"{"generation":3,"suspended":true}"#);
+        assert_eq!(access.generation(&store, "nobody").await.unwrap(), 0);
+        assert_eq!(backing.keys().len(), 2);
 
         // Restoring continues from that generation. The first change of a process settles
-        // the next key before using the one after it.
+        // the next position before using the one after it.
         access.set_suspended(&store, "member", false).await.unwrap();
         assert_eq!(access.generation(&store, "member").await.unwrap(), 5);
-        assert_eq!(
-            backing.keys(),
-            [
-                SINGLE,
-                "__dalus_auth/users/member/4.json",
-                "__dalus_auth/users/member/5.json"
-            ]
-        );
-        assert_eq!(
-            stored("__dalus_auth/users/member/4.json"),
-            r#"{"generation":4,"suspended":true}"#
-        );
+        assert_eq!(chain(2), r#"{"generation":4,"suspended":true}"#);
+        assert_eq!(chain(3), r#"{"generation":5,"suspended":false}"#);
+        assert_eq!(backing.keys().len(), 4);
         // The single object is in the format, and at the state, an earlier build expects.
         assert_eq!(stored(SINGLE), r#"{"generation":5,"suspended":false}"#);
-        assert_eq!(stored("__dalus_auth/users/member/5.json"), stored(SINGLE));
 
-        // A later change in the same process takes the next key and nothing else.
+        // A later change in the same process takes the next position and nothing else.
         access.set_suspended(&store, "member", true).await.unwrap();
-        assert_eq!(backing.keys().len(), 4);
+        assert_eq!(backing.keys().len(), 5);
         assert_eq!(stored(SINGLE), r#"{"generation":6,"suspended":true}"#);
+        assert_eq!(chain(4), stored(SINGLE));
 
         // If the single object cannot be written the change stands, and a restart finds it
-        // through the generation keys although the single object is behind.
+        // in the chain although the single object is behind.
         *backing.fail_sets_to.lock().unwrap() = Some("users/member.json".to_string());
         access.set_suspended(&store, "member", false).await.unwrap();
         assert_eq!(stored(SINGLE), r#"{"generation":6,"suspended":true}"#);
+        *backing.fail_sets_to.lock().unwrap() = None;
         let restarted = UserAccess::default();
         assert_eq!(restarted.generation(&store, "member").await.unwrap(), 7);
 
-        // An earlier build that suspends the user afterwards writes only the single object,
-        // one generation on from the one it read there. That is honoured.
+        // An earlier build that suspends the user afterwards (a rollback) writes only the
+        // single object, one generation on from the one it read there. That is honoured,
+        // and a build like this one continues from it.
         backing.data.lock().unwrap().insert(
             SINGLE.to_string(),
             br#"{"generation":8,"suspended":true}"#.to_vec(),
         );
-        assert!(UserAccess::default()
-            .generation(&store, "member")
+        let upgraded = UserAccess::default();
+        assert!(upgraded.generation(&store, "member").await.is_err());
+        upgraded
+            .set_suspended(&store, "member", false)
             .await
-            .is_err());
+            .unwrap();
+        assert_eq!(upgraded.generation(&store, "member").await.unwrap(), 10);
     }
 
     #[tokio::test]
@@ -605,5 +605,160 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!other.cancellation.is_cancelled());
+    }
+
+    const SINGLE_OBJECT: &str = "__dalus_auth/users/member.json";
+
+    /// The store as an earlier build (one object per user, overwritten) left it: the user
+    /// was suspended at generation 1, restored at 2, suspended again at 3. The first attempt
+    /// at the restore timed out and is still on its way: `late_restore` is what it will
+    /// write when it lands.
+    fn store_after_an_earlier_build() -> (LateStore, Vec<u8>) {
+        let backing = LateStore::default();
+        backing.data.lock().unwrap().insert(
+            SINGLE_OBJECT.to_string(),
+            br#"{"generation":3,"suspended":true}"#.to_vec(),
+        );
+        (backing, br#"{"generation":2,"suspended":false}"#.to_vec())
+    }
+
+    async fn assert_still_suspended(store: &Option<Arc<Box<dyn Store>>>) {
+        // In a process that starts now, and with the token the user got at generation 2.
+        let restarted = UserAccess::default();
+        assert!(restarted.generation(store, "member").await.is_err());
+        assert!(restarted.authorize(store, "member", 2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_restore_an_earlier_build_left_pending_cannot_resurrect_a_suspended_user() {
+        let (backing, late_restore) = store_after_an_earlier_build();
+        let store = backing.handle();
+
+        // This build takes over and suspends the user once more.
+        let access = UserAccess::default();
+        assert!(access.generation(&store, "member").await.is_err());
+        access.set_suspended(&store, "member", true).await.unwrap();
+
+        // Now the earlier build's restore lands, on the only object it knows.
+        backing
+            .data
+            .lock()
+            .unwrap()
+            .insert(SINGLE_OBJECT.to_string(), late_restore);
+
+        assert_still_suspended(&store).await;
+        // The running process is not fooled either, and the user can be restored properly.
+        assert!(access.generation(&store, "member").await.is_err());
+        let restarted = UserAccess::default();
+        restarted
+            .set_suspended(&store, "member", false)
+            .await
+            .unwrap();
+        let fresh = restarted.generation(&store, "member").await.unwrap();
+        assert!(fresh > 3);
+        assert!(restarted.authorize(&store, "member", 2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn seeing_a_user_is_enough_to_outlast_an_earlier_builds_late_write() {
+        // No change by this build: it only looked the user up (a refused mint), which
+        // copies what the single object says into the chain.
+        let (backing, late_restore) = store_after_an_earlier_build();
+        let store = backing.handle();
+        assert!(UserAccess::default()
+            .generation(&store, "member")
+            .await
+            .is_err());
+        backing
+            .data
+            .lock()
+            .unwrap()
+            .insert(SINGLE_OBJECT.to_string(), late_restore);
+        assert_still_suspended(&store).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_late_first_chain_write_does_not_weaken_a_later_suspension() {
+        for first_write in ["fails", "times out and lands late"] {
+            let (backing, late_restore) = store_after_an_earlier_build();
+            let store = backing.handle();
+            match first_write {
+                "fails" => {
+                    *backing.fail_sets_to.lock().unwrap() = Some("member/1.json".to_string())
+                }
+                _ => *backing.stall_after.lock().unwrap() = Some(0),
+            }
+
+            // Looking the user up works although the copy into the chain did not.
+            let access = UserAccess::default();
+            assert!(access.generation(&store, "member").await.is_err());
+            assert!(!backing.keys().iter().any(|key| key.ends_with("/1.json")));
+            *backing.fail_sets_to.lock().unwrap() = None;
+
+            // A suspension by this build then stands on its own.
+            access.set_suspended(&store, "member", true).await.unwrap();
+            backing.land_late_writes();
+            backing
+                .data
+                .lock()
+                .unwrap()
+                .insert(SINGLE_OBJECT.to_string(), late_restore);
+            assert_still_suspended(&store).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_single_object_can_raise_the_state_but_not_lower_it() {
+        let backing = LateStore::default();
+        let store = backing.handle();
+        let set_single = |record: &str| {
+            backing
+                .data
+                .lock()
+                .unwrap()
+                .insert(SINGLE_OBJECT.to_string(), record.as_bytes().to_vec());
+        };
+        // A user this build suspended, with nothing from an earlier build.
+        UserAccess::default()
+            .set_suspended(&store, "member", true)
+            .await
+            .unwrap();
+        let suspended_at = {
+            let data = backing.data.lock().unwrap();
+            let record: Record = serde_json::from_slice(data.get(SINGLE_OBJECT).unwrap()).unwrap();
+            record.generation
+        };
+
+        // Lower or equal generations in the single object change nothing.
+        for generation in [0, suspended_at - 1, suspended_at] {
+            set_single(&format!(
+                r#"{{"generation":{generation},"suspended":false}}"#
+            ));
+            assert!(UserAccess::default()
+                .generation(&store, "member")
+                .await
+                .is_err());
+        }
+        // A higher one is a change made by an earlier build after this one (a rollback): it
+        // is the state, and stays the state once this build has seen it.
+        let restored_at = suspended_at + 1;
+        set_single(&format!(
+            r#"{{"generation":{restored_at},"suspended":false}}"#
+        ));
+        assert_eq!(
+            UserAccess::default()
+                .generation(&store, "member")
+                .await
+                .unwrap(),
+            restored_at
+        );
+        set_single(r#"{"generation":1,"suspended":true}"#);
+        assert_eq!(
+            UserAccess::default()
+                .generation(&store, "member")
+                .await
+                .unwrap(),
+            restored_at
+        );
     }
 }
