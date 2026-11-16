@@ -191,17 +191,50 @@ pub enum Permission {
     /// Index 1. Upstream's doc token.
     Doc(DocPermission),
     /// Index 2. A doc token bound to a user and that user's revocation generation (`None`
-    /// for a token that is explicitly not user-scoped). Minted by servers that enforce user
-    /// suspension. The layout is that build's, field for field.
+    /// for a token that is explicitly not user-scoped). Minted, and accepted, only by a server
+    /// that enforces user suspension. The layout is the one the Dalus production build
+    /// (revision 4f1909b plus its user-suspension patch) has always used, field for field.
     ///
-    /// This build does not enforce suspension, so it cannot honour what the token binds: it
-    /// reserves the index and rejects the token ([AuthError::Unsupported]). Accepting it as a
-    /// plain doc token would turn a revocable token into one that survives its user's
-    /// suspension. Leaving the index to another variant is worse: a managed token whose
-    /// generation is 0 has the same bytes as an `AttributedDoc` with a user and no writer.
+    /// A server that does not enforce suspension rejects the token
+    /// ([AuthError::Unsupported]): it cannot honour what the token binds, and accepting it as
+    /// a plain doc token would turn a revocable token into one that survives its user's
+    /// suspension.
     ManagedDoc(DocPermission, Option<(String, u64)>),
     /// Index 3. A doc token that carries the actor it writes for.
     AttributedDoc(DocPermission, Actor),
+    /// Index 4. [Permission::ManagedDoc] that also carries the actor it writes for: what a
+    /// server that enforces suspension mints when attributed tokens are on as well.
+    ManagedAttributedDoc(DocPermission, Option<(String, u64)>, Actor),
+}
+
+/// What a verified managed doc token grants (see [Authenticator::verify_managed_doc_access]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagedDocAccess {
+    pub access: DocAccess,
+    /// The user the token is bound to and the revocation generation it was minted at. `None`
+    /// for a server token and for a token minted without a user.
+    pub user: Option<(String, u64)>,
+    /// When the token expires, in milliseconds since the epoch. `None` for a server token.
+    pub deadline: Option<u64>,
+    /// Whether this was the server token rather than a doc token.
+    pub server_token: bool,
+}
+
+/// A token's expiry as a deadline a connection can be held to: `None` when the token has no
+/// expiry or the maximum one, which is how a token that never expires is minted.
+pub fn finite_deadline(expiration_millis: Option<u64>) -> Option<u64> {
+    expiration_millis.filter(|time| *time != u64::MAX)
+}
+
+/// The rule of a server that enforces token expiry: a doc token that can write must expire.
+pub fn require_deadline_for_writes(
+    authorization: Authorization,
+    deadline: Option<u64>,
+) -> Result<(), AuthError> {
+    if matches!(authorization, Authorization::Full) && deadline.is_none() {
+        return Err(AuthError::InvalidToken);
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -484,8 +517,10 @@ impl Authenticator {
             Permission::AttributedDoc(doc_permission, actor) => (doc_permission, Some(actor)),
             // Server tokens can access any doc, and are never attributed.
             Permission::Server => return Ok(DocAccess::full()),
-            // See the variant: only a server that enforces suspension may accept it.
-            Permission::ManagedDoc(..) => return Err(AuthError::Unsupported),
+            // See the variants: only a server that enforces suspension may accept them.
+            Permission::ManagedDoc(..) | Permission::ManagedAttributedDoc(..) => {
+                return Err(AuthError::Unsupported)
+            }
         };
 
         if doc_permission.doc_id == doc {
@@ -496,6 +531,141 @@ impl Authenticator {
         } else {
             Err(AuthError::InvalidResource)
         }
+    }
+
+    /// Managed tokens bind optional user identity and revocation generation in the signature.
+    pub fn gen_managed_doc_token(
+        &self,
+        doc: &str,
+        authorization: Authorization,
+        user: Option<(String, u64)>,
+        expiry: ExpirationTimeEpochMillis,
+    ) -> String {
+        self.gen_managed_doc_token_with_actor(doc, authorization, user, expiry, None)
+    }
+
+    /// Like [Authenticator::gen_managed_doc_token], but also binds `actor` when one is given.
+    /// Without an actor this mints exactly the token `gen_managed_doc_token` does.
+    pub fn gen_managed_doc_token_with_actor(
+        &self,
+        doc: &str,
+        authorization: Authorization,
+        user: Option<(String, u64)>,
+        expiry: ExpirationTimeEpochMillis,
+        actor: Option<Actor>,
+    ) -> String {
+        let permission = DocPermission {
+            doc_id: doc.to_owned(),
+            authorization,
+        };
+        let permission = match actor {
+            Some(actor) => Permission::ManagedAttributedDoc(permission, user, actor),
+            None => Permission::ManagedDoc(permission, user),
+        };
+        self.sign(Payload::new_with_expiration(permission, expiry))
+    }
+
+    /// Verifies a token for a server that enforces user suspension. Only server tokens and
+    /// managed doc tokens pass: a token that carries no revocation generation cannot be
+    /// revoked, so every other kind is refused and its holder has to authenticate again.
+    ///
+    /// The caller still has to check the returned user against its revocation state.
+    pub fn verify_managed_doc_access(
+        &self,
+        token: &str,
+        doc: &str,
+        now: u64,
+    ) -> Result<ManagedDocAccess, AuthError> {
+        let payload = self.verify(token, now)?;
+        let deadline = payload.expiration_millis.map(|e| e.0);
+        let (permission, user, actor) = match payload.payload {
+            Permission::Server => {
+                return Ok(ManagedDocAccess {
+                    access: DocAccess::full(),
+                    user: None,
+                    deadline: None,
+                    server_token: true,
+                })
+            }
+            Permission::ManagedDoc(permission, user) => (permission, user, None),
+            Permission::ManagedAttributedDoc(permission, user, actor) => {
+                (permission, user, Some(actor))
+            }
+            // Legacy client tokens have no identity. Force re-authentication after deployment.
+            Permission::Doc(_) | Permission::AttributedDoc(..) => {
+                return Err(AuthError::InvalidResource)
+            }
+        };
+        if permission.doc_id != doc {
+            return Err(AuthError::InvalidResource);
+        }
+        Ok(ManagedDocAccess {
+            access: DocAccess {
+                authorization: permission.authorization,
+                actor,
+            },
+            user,
+            deadline,
+            server_token: false,
+        })
+    }
+
+    /// [Authenticator::verify_managed_doc_access] without the actor: the authorization, the
+    /// user and generation the token is bound to, and its deadline.
+    // The signature the user-suspension patch gave it.
+    #[allow(clippy::type_complexity)]
+    pub fn verify_managed_doc_token(
+        &self,
+        token: &str,
+        doc: &str,
+        now: u64,
+    ) -> Result<(Authorization, Option<(String, u64)>, Option<u64>), AuthError> {
+        let managed = self.verify_managed_doc_access(token, doc, now)?;
+        Ok((managed.access.authorization, managed.user, managed.deadline))
+    }
+
+    /// Appliance WebSockets retain the authenticated deadline for the connection's
+    /// lifetime. Root server tokens remain unbounded for trusted internal clients.
+    pub fn verify_expiring_doc_token(
+        &self,
+        token: &str,
+        doc: &str,
+        current_time_epoch_millis: u64,
+    ) -> Result<(Authorization, Option<u64>), AuthError> {
+        self.verify_expiring_doc_access(token, doc, current_time_epoch_millis)
+            .map(|(access, deadline)| (access.authorization, deadline))
+    }
+
+    /// [Authenticator::verify_expiring_doc_token] with the actor of an attributed token. A
+    /// token with full access must carry a deadline (an expiry that is neither absent nor
+    /// the maximum); the deadline of any doc token is returned for the connection to keep.
+    pub fn verify_expiring_doc_access(
+        &self,
+        token: &str,
+        doc: &str,
+        current_time_epoch_millis: u64,
+    ) -> Result<(DocAccess, Option<u64>), AuthError> {
+        let payload = self.verify(token, current_time_epoch_millis)?;
+        let deadline = finite_deadline(payload.expiration_millis.map(|time| time.0));
+        let (permission, actor) = match payload.payload {
+            Permission::Server => return Ok((DocAccess::full(), None)),
+            Permission::Doc(permission) => (permission, None),
+            Permission::AttributedDoc(permission, actor) => (permission, Some(actor)),
+            Permission::ManagedDoc(..) | Permission::ManagedAttributedDoc(..) => {
+                return Err(AuthError::InvalidResource)
+            }
+        };
+        if permission.doc_id != doc {
+            return Err(AuthError::InvalidResource);
+        }
+        require_deadline_for_writes(permission.authorization, deadline)?;
+        Ok((
+            DocAccess {
+                authorization: permission.authorization,
+                actor,
+            },
+            deadline,
+        ))
     }
 
     pub fn gen_key() -> Result<Authenticator, AuthError> {
@@ -552,6 +722,184 @@ mod tests {
             authenticator.verify_doc_token(&token, "doc456", 0),
             Err(AuthError::InvalidResource)
         ));
+    }
+
+    #[test]
+    fn appliance_deadlines_preserve_root_and_read_only_access() {
+        let auth = Authenticator::gen_key().unwrap();
+        let bounded =
+            auth.gen_doc_token("doc", Authorization::Full, ExpirationTimeEpochMillis(1000));
+        assert!(matches!(
+            auth.verify_expiring_doc_token(&bounded, "doc", 100),
+            Ok((Authorization::Full, Some(1000)))
+        ));
+        assert!(auth
+            .verify_expiring_doc_token(&bounded, "other", 100)
+            .is_err());
+        assert!(auth
+            .verify_expiring_doc_token(&bounded, "doc", 1001)
+            .is_err());
+        let unbounded = auth.sign(Payload::new(Permission::Doc(DocPermission {
+            doc_id: "doc".into(),
+            authorization: Authorization::Full,
+        })));
+        assert!(auth
+            .verify_expiring_doc_token(&unbounded, "doc", 100)
+            .is_err());
+        assert!(matches!(
+            auth.verify_doc_token(&unbounded, "doc", 100),
+            Ok(DocAccess {
+                authorization: Authorization::Full,
+                actor: None
+            })
+        ));
+        let maximum =
+            auth.gen_doc_token("doc", Authorization::Full, ExpirationTimeEpochMillis::max());
+        assert!(auth
+            .verify_expiring_doc_token(&maximum, "doc", 100)
+            .is_err());
+        let read_only = auth.sign(Payload::new(Permission::Doc(DocPermission {
+            doc_id: "doc".into(),
+            authorization: Authorization::ReadOnly,
+        })));
+        assert!(matches!(
+            auth.verify_expiring_doc_token(&read_only, "doc", 100),
+            Ok((Authorization::ReadOnly, None))
+        ));
+        assert!(matches!(
+            auth.verify_expiring_doc_token(&auth.server_token(), "doc", 100),
+            Ok((Authorization::Full, None))
+        ));
+    }
+
+    #[test]
+    fn appliance_deadlines_apply_to_attributed_tokens_too() {
+        let auth = Authenticator::gen_key().unwrap();
+        let alice = actor(Some("alice"), Some("ui"));
+        let mint = |authorization, expiry| {
+            auth.gen_doc_token_with_actor("doc", authorization, expiry, Some(alice.clone()))
+        };
+        let bounded = mint(Authorization::Full, ExpirationTimeEpochMillis(1000));
+        assert_eq!(
+            auth.verify_expiring_doc_access(&bounded, "doc", 100),
+            Ok((
+                DocAccess {
+                    authorization: Authorization::Full,
+                    actor: Some(alice.clone()),
+                },
+                Some(1000)
+            ))
+        );
+        assert_eq!(
+            auth.verify_expiring_doc_access(&bounded, "doc", 1001),
+            Err(AuthError::Expired)
+        );
+        assert_eq!(
+            auth.verify_expiring_doc_access(&bounded, "other", 100),
+            Err(AuthError::InvalidResource)
+        );
+        // Full access without a deadline is refused, attributed or not.
+        let maximum = mint(Authorization::Full, ExpirationTimeEpochMillis::max());
+        assert_eq!(
+            auth.verify_expiring_doc_access(&maximum, "doc", 100),
+            Err(AuthError::InvalidToken)
+        );
+        let read_only = mint(Authorization::ReadOnly, ExpirationTimeEpochMillis::max());
+        assert!(matches!(
+            auth.verify_expiring_doc_access(&read_only, "doc", 100),
+            Ok((_, None))
+        ));
+        // Managed tokens belong to a server that enforces suspension.
+        let managed = auth.gen_managed_doc_token(
+            "doc",
+            Authorization::Full,
+            None,
+            ExpirationTimeEpochMillis(1000),
+        );
+        assert_eq!(
+            auth.verify_expiring_doc_access(&managed, "doc", 100),
+            Err(AuthError::InvalidResource)
+        );
+    }
+
+    #[test]
+    fn managed_tokens_verify_only_as_managed_tokens() {
+        let auth = Authenticator::gen_key().unwrap();
+        let expiry = ExpirationTimeEpochMillis(1000);
+        let user = Some(("member".to_string(), 3));
+        let alice = actor(Some("member"), Some("ui"));
+
+        let plain = auth.gen_managed_doc_token("doc", Authorization::Full, user.clone(), expiry);
+        assert_eq!(
+            auth.verify_managed_doc_token(&plain, "doc", 100),
+            Ok((Authorization::Full, user.clone(), Some(1000)))
+        );
+        assert_eq!(
+            auth.verify_managed_doc_access(&plain, "doc", 100)
+                .unwrap()
+                .access
+                .actor,
+            None
+        );
+        let attributed = auth.gen_managed_doc_token_with_actor(
+            "doc",
+            Authorization::ReadOnly,
+            user.clone(),
+            expiry,
+            Some(alice.clone()),
+        );
+        assert_eq!(
+            auth.verify_managed_doc_access(&attributed, "doc", 100),
+            Ok(ManagedDocAccess {
+                access: DocAccess {
+                    authorization: Authorization::ReadOnly,
+                    actor: Some(alice.clone()),
+                },
+                user: user.clone(),
+                deadline: Some(1000),
+                server_token: false,
+            })
+        );
+        let unscoped = auth.gen_managed_doc_token("doc", Authorization::Full, None, expiry);
+        assert_eq!(
+            auth.verify_managed_doc_token(&unscoped, "doc", 100),
+            Ok((Authorization::Full, None, Some(1000)))
+        );
+        assert_eq!(
+            auth.verify_managed_doc_token(&auth.server_token(), "doc", 100),
+            Ok((Authorization::Full, None, None))
+        );
+
+        for managed in [&plain, &attributed, &unscoped] {
+            assert_eq!(
+                auth.verify_managed_doc_access(managed, "other", 100),
+                Err(AuthError::InvalidResource)
+            );
+            assert_eq!(
+                auth.verify_managed_doc_access(managed, "doc", 1001),
+                Err(AuthError::Expired)
+            );
+            // A server that does not enforce suspension refuses them.
+            assert_eq!(
+                auth.verify_doc_token(managed, "doc", 100),
+                Err(AuthError::Unsupported)
+            );
+            assert_eq!(
+                auth.verify_server_token(managed, 100),
+                Err(AuthError::InvalidResource)
+            );
+        }
+
+        // A server that enforces suspension refuses tokens that carry no generation.
+        let legacy = auth.gen_doc_token("doc", Authorization::Full, expiry);
+        let legacy_attributed =
+            auth.gen_doc_token_with_actor("doc", Authorization::Full, expiry, Some(alice));
+        for token in [&legacy, &legacy_attributed] {
+            assert_eq!(
+                auth.verify_managed_doc_access(token, "doc", 100),
+                Err(AuthError::InvalidResource)
+            );
+        }
     }
 
     #[test]
@@ -878,6 +1226,33 @@ mod tests {
                 "attributed, user-1 and no writer",
                 bytes(&[&[3], &DOC_FULL, &[1, 6], b"user-1", &[0], &EXPIRES_AT_1000]),
             ),
+            (
+                "managed and attributed, user-1 at generation 7 as ui",
+                bytes(&[
+                    &[4],
+                    &DOC_FULL,
+                    &[1, 6],
+                    b"user-1",
+                    &[7],
+                    &[1, 6],
+                    b"user-1",
+                    &[1, 2],
+                    b"ui",
+                    &EXPIRES_AT_1000,
+                ]),
+            ),
+            (
+                "managed and attributed, no user, writer only",
+                bytes(&[
+                    &[4],
+                    &DOC_FULL,
+                    &[0],
+                    &[0],
+                    &[1, 2],
+                    b"ui",
+                    &EXPIRES_AT_1000,
+                ]),
+            ),
         ]
     }
 
@@ -903,6 +1278,16 @@ mod tests {
             expiring(Permission::AttributedDoc(
                 doc(),
                 actor(Some("user-1"), None),
+            )),
+            expiring(Permission::ManagedAttributedDoc(
+                doc(),
+                user(7),
+                actor(Some("user-1"), Some("ui")),
+            )),
+            expiring(Permission::ManagedAttributedDoc(
+                doc(),
+                None,
+                actor(None, Some("ui")),
             )),
         ];
         let golden = golden_payloads();
@@ -943,18 +1328,54 @@ mod tests {
             full(Some(actor(Some("user-1"), None)))
         );
 
-        // A token of the production build that enforces user suspension. It verifies there
-        // against the user's revocation generation, which this build does not track: it is
-        // refused, never read as some other permission. Generation 0 is the case that was: with
-        // the attributed variant at index 2, these bytes were a valid attributed token for
-        // user-1 with full access.
-        for managed in [
-            "managed, user-1 at generation 7",
-            "managed, user-1 at generation 0",
-            "managed, no user",
+        // Tokens of the production build that enforces user suspension (4f1909b plus its
+        // patch). Without suspension enforcement they are refused, never read as some other
+        // permission. Generation 0 is the case that was: with the attributed variant at index
+        // 2, these bytes were a valid attributed token for user-1 with full access.
+        let verify_managed = |name: &str| {
+            let (_, payload) = golden_payloads()
+                .into_iter()
+                .find(|(golden, _)| *golden == name)
+                .unwrap();
+            authenticator.verify_managed_doc_access(&token_for(&payload), "doc", 1000)
+        };
+        let managed = |user: Option<(&str, u64)>, actor| {
+            Ok(ManagedDocAccess {
+                access: DocAccess {
+                    authorization: Authorization::Full,
+                    actor,
+                },
+                user: user.map(|(user, generation)| (user.to_string(), generation)),
+                deadline: Some(1000),
+                server_token: false,
+            })
+        };
+        for (name, user) in [
+            ("managed, user-1 at generation 7", Some(("user-1", 7))),
+            ("managed, user-1 at generation 0", Some(("user-1", 0))),
+            ("managed, no user", None),
         ] {
-            assert_eq!(verify(managed), Err(AuthError::Unsupported), "{managed}");
+            assert_eq!(verify(name), Err(AuthError::Unsupported), "{name}");
+            // With enforcement they are read exactly as that build wrote them.
+            assert_eq!(verify_managed(name), managed(user, None), "{name}");
         }
+        assert_eq!(
+            verify_managed("managed and attributed, user-1 at generation 7 as ui"),
+            managed(Some(("user-1", 7)), Some(actor(Some("user-1"), Some("ui"))))
+        );
+        assert_eq!(
+            verify_managed("managed and attributed, no user, writer only"),
+            managed(None, Some(actor(None, Some("ui"))))
+        );
+        assert_eq!(
+            verify("managed and attributed, user-1 at generation 7 as ui"),
+            Err(AuthError::Unsupported)
+        );
+        assert_eq!(
+            verify_managed("attributed, user-1 as ui"),
+            Err(AuthError::InvalidResource)
+        );
+        assert_eq!(verify_managed("doc"), Err(AuthError::InvalidResource));
 
         // Why the index matters: these two payloads differ in nothing but it.
         let golden = golden_payloads();
@@ -973,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn minting_still_produces_only_doc_and_attributed_tokens() {
+    fn each_mint_function_produces_its_pinned_token() {
         let authenticator = Authenticator::new(GOLDEN_KEY).unwrap();
         let expiry = ExpirationTimeEpochMillis(1000);
         let golden = golden_payloads();
@@ -991,6 +1412,27 @@ mod tests {
             token_for(&golden[5].1)
         );
         assert_eq!(authenticator.server_token(), token_for(&golden[0].1));
+        // What a server that enforces suspension mints: the production build's token, bit
+        // for bit, and the combined one only when there is an actor to carry.
+        let user = Some(("user-1".to_string(), 7));
+        assert_eq!(
+            authenticator.gen_managed_doc_token("doc", Authorization::Full, user.clone(), expiry),
+            token_for(&golden[2].1)
+        );
+        assert_eq!(
+            authenticator.gen_managed_doc_token("doc", Authorization::Full, None, expiry),
+            token_for(&golden[4].1)
+        );
+        assert_eq!(
+            authenticator.gen_managed_doc_token_with_actor(
+                "doc",
+                Authorization::Full,
+                user,
+                expiry,
+                Some(actor(Some("user-1"), Some("ui")))
+            ),
+            token_for(&golden[7].1)
+        );
     }
 
     #[test]
