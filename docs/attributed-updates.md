@@ -40,7 +40,10 @@ these ways:
   save fails; a save already sent is never abandoned, so an older snapshot cannot land over a
   newer one. A doc being written to is not unloaded. A writer waits at most 15 s for its doc
   (loading it, or waiting for one being unloaded), else `503`, so a hung store makes writes to
-  that doc fail fast rather than hang. Two requests
+  that doc fail fast rather than hang. The `503` means "try again": the load is not tied to
+  the request and carries on, so a doc that takes longer than 15 s to load answers `503`
+  until it is loaded and is then served; it is read from the store once, however many
+  requests gave up meanwhile. Two requests
   that load the same doc at once share one load; upstream could let the second replace the
   first while it was being written to, losing those writes.
 

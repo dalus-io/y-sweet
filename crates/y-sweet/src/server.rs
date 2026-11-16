@@ -16,8 +16,14 @@ use axum::{
     Json, Router,
 };
 use axum_extra::typed_header::TypedHeader;
-use dashmap::{mapref::one::MappedRef, DashMap};
-use futures::{SinkExt, StreamExt};
+use dashmap::{
+    mapref::{entry::Entry, one::MappedRef},
+    DashMap,
+};
+use futures::{
+    future::{BoxFuture, Shared},
+    FutureExt, SinkExt, StreamExt,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -103,40 +109,37 @@ impl ShutdownBudgets {
 
 /// How long a writer waits to get its doc (see [Server::live_doc]) before it gives up with
 /// `503`: loading it, waiting behind another load of it, or waiting for a doc GC retired to be
-/// dropped and loading it again.
+/// dropped and loading it again. Giving up does not stop the load.
 pub const DEFAULT_DOC_WAIT: Duration = Duration::from_secs(15);
 
-/// One user of a doc's load lock. Dropping it (on completion or cancellation) removes the lock
-/// from the map once no one else holds it; the count check and the removal happen together
-/// under the map's shard lock, which is also where new users take the lock.
-struct LoadSlot<'a> {
-    map: &'a DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    doc_id: &'a str,
-    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+/// A load of a doc that is under way. It runs in a task of its own; everyone who wants the doc
+/// meanwhile waits on a clone of this, and gets the load's result (the error as text, so that
+/// it can be shared).
+type SharedLoad = Shared<BoxFuture<'static, Result<(), String>>>;
+
+/// Removes a doc's entry from the map of loads under way when its load ends, however it ends.
+struct LoadDone {
+    loading: Arc<DashMap<String, SharedLoad>>,
+    doc_id: String,
 }
 
-impl<'a> LoadSlot<'a> {
-    fn new(map: &'a DashMap<String, Arc<tokio::sync::Mutex<()>>>, doc_id: &'a str) -> Self {
-        let lock = map.entry(doc_id.to_string()).or_default().clone();
-        Self {
-            map,
-            doc_id,
-            lock: Some(lock),
-        }
-    }
-
-    fn lock(&self) -> &tokio::sync::Mutex<()> {
-        self.lock.as_ref().expect("Taken only on drop.")
-    }
-}
-
-impl Drop for LoadSlot<'_> {
+impl Drop for LoadDone {
     fn drop(&mut self) {
-        drop(self.lock.take());
-        // Only the map's own reference left: no one is loading or waiting.
-        self.map
-            .remove_if(self.doc_id, |_, lock| Arc::strong_count(lock) == 1);
+        self.loading.remove(&self.doc_id);
     }
+}
+
+/// What loading a doc needs of the server, owned, so that a load can run in a task that
+/// outlives the request that started it.
+struct DocLoader {
+    docs: Arc<DashMap<String, DocWithSyncKv>>,
+    store: Option<Arc<Box<dyn Store>>>,
+    checkpoint_freq: Duration,
+    doc_gc: bool,
+    skip_gc: bool,
+    on_update: Option<UpdateCallback>,
+    doc_workers_token: CancellationToken,
+    doc_worker_tracker: TaskTracker,
 }
 
 /// Admission for writes to docs, closed once at shutdown before the final saves.
@@ -251,8 +254,9 @@ pub struct Server {
     shutdown_budgets: ShutdownBudgets,
     /// See [DEFAULT_DOC_WAIT].
     doc_wait: Duration,
-    /// One lock per doc being loaded, so that concurrent requests load it once.
-    loading: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// The loads under way, one per doc, so that concurrent requests load a doc once and a
+    /// load survives the requests waiting for it (see [Server::load_doc]).
+    loading: Arc<DashMap<String, SharedLoad>>,
 }
 
 impl Server {
@@ -286,7 +290,7 @@ impl Server {
             webhook_token: CancellationToken::new(),
             shutdown_budgets: ShutdownBudgets::default(),
             doc_wait: DEFAULT_DOC_WAIT,
-            loading: DashMap::new(),
+            loading: Arc::new(DashMap::new()),
         })
     }
 
@@ -344,20 +348,69 @@ impl Server {
 
     /// Loads a doc into the map, unless it is there already.
     ///
-    /// Loads of one doc are serialized: a request that finds a load under way waits for it and
+    /// A doc is loaded once at a time: a request that finds a load under way waits for it and
     /// then uses the doc it loaded. A second load replacing the first would drop the first
     /// doc's persistence subscription while writers still hold it, losing their writes.
+    ///
+    /// The load runs in a task of its own, not in the caller: a caller that stops waiting (a
+    /// writer gives up after [DEFAULT_DOC_WAIT], a client disconnects) does not cancel it. The
+    /// load goes on, and whoever asks for the doc next finds it loaded, or joins the same
+    /// load. Were it cancelled with its caller, a doc that takes longer to load than a writer
+    /// waits could never be opened: every attempt would start over and be cut off again.
     pub async fn load_doc(&self, doc_id: &str) -> Result<()> {
-        // Declared before the guard, so it is dropped after it.
-        let slot = LoadSlot::new(&self.loading, doc_id);
-        let _loading = slot.lock().lock().await;
         if self.docs.contains_key(doc_id) {
             return Ok(());
         }
-        self.load_doc_unlocked(doc_id).await
+        let load = match self.loading.entry(doc_id.to_string()) {
+            Entry::Occupied(load) => load.get().clone(),
+            Entry::Vacant(vacant) => {
+                let loader = DocLoader {
+                    docs: self.docs.clone(),
+                    store: self.store.clone(),
+                    checkpoint_freq: self.checkpoint_freq,
+                    doc_gc: self.doc_gc,
+                    skip_gc: self.skip_gc,
+                    on_update: self.on_update.clone(),
+                    doc_workers_token: self.doc_workers_token.clone(),
+                    doc_worker_tracker: self.doc_worker_tracker.clone(),
+                };
+                // The entry goes when the task ends, also if it panics. That cannot happen
+                // before the entry is in the map: removing it needs the shard lock held here.
+                let done = LoadDone {
+                    loading: self.loading.clone(),
+                    doc_id: doc_id.to_string(),
+                };
+                let doc_id = doc_id.to_string();
+                let task = tokio::spawn(
+                    async move {
+                        let _done = done;
+                        // With its context, as text: the result is shared by all waiters.
+                        loader.load(&doc_id).await.map_err(|e| format!("{e:#}"))
+                    }
+                    .in_current_span(),
+                );
+                let load = async move {
+                    task.await
+                        .unwrap_or_else(|e| Err(format!("The doc load did not finish: {e}")))
+                }
+                .boxed()
+                .shared();
+                vacant.insert(load.clone());
+                load
+            }
+        };
+        load.await.map_err(|e| anyhow!(e))
     }
+}
 
-    async fn load_doc_unlocked(&self, doc_id: &str) -> Result<()> {
+impl DocLoader {
+    /// Loads the doc and starts its workers, unless it is in the map already. Only ever run
+    /// by one task per doc at a time (see [Server::load_doc]).
+    async fn load(self, doc_id: &str) -> Result<()> {
+        // A load that finished between the caller's look at the map and this task.
+        if self.docs.contains_key(doc_id) {
+            return Ok(());
+        }
         let (send, recv) = channel(1024);
 
         let dwskv = DocWithSyncKv::new(
@@ -391,7 +444,7 @@ impl Server {
 
             // Spawn a task to save the document to the store when it changes.
             self.doc_worker_tracker.spawn(
-                Self::doc_persistence_worker(
+                Server::doc_persistence_worker(
                     recv,
                     sync_kv,
                     checkpoint_freq,
@@ -405,7 +458,7 @@ impl Server {
 
             if self.doc_gc {
                 self.doc_worker_tracker.spawn(
-                    Self::doc_gc_worker(
+                    Server::doc_gc_worker(
                         self.docs.clone(),
                         doc_id.clone(),
                         checkpoint_freq,
@@ -418,12 +471,14 @@ impl Server {
             }
         }
 
-        // Under the load lock the entry is empty here; `or_insert` keeps it that way should any
-        // other path have filled it, rather than replacing a doc writers may hold.
+        // One load per doc at a time, so the entry is empty here; `or_insert` keeps it that way
+        // should any other path have filled it, rather than replacing a doc writers may hold.
         self.docs.entry(doc_id.to_string()).or_insert(dwskv);
         Ok(())
     }
+}
 
+impl Server {
     async fn doc_gc_worker(
         docs: Arc<DashMap<String, DocWithSyncKv>>,
         doc_id: String,
@@ -613,8 +668,10 @@ impl Server {
     ///
     /// Holding the returned awareness keeps GC from retiring the doc, so writes made through it
     /// are saved. A doc that GC has retired but not yet dropped (it is still being saved) is
-    /// waited out, so that a reload reads what was saved. All of it, loads included, is bounded
-    /// by [DEFAULT_DOC_WAIT] and by shutdown; either ends it with `503`.
+    /// waited out, so that a reload reads what was saved. The wait for all of it, loads
+    /// included, is bounded by [DEFAULT_DOC_WAIT] and by shutdown; either ends it with `503`.
+    /// A load being waited for is not cancelled by that: it carries on (see
+    /// [Server::load_doc]), so a later attempt finds the doc.
     pub async fn live_doc(
         &self,
         doc_id: &str,
@@ -1983,6 +2040,10 @@ mod test {
         held_get_release: Arc<tokio::sync::Semaphore>,
         /// How many reads of the held key started.
         held_gets: Arc<std::sync::atomic::AtomicUsize>,
+        /// Every read takes this long, in milliseconds.
+        get_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// How many reads started, of any key.
+        gets: Arc<std::sync::atomic::AtomicUsize>,
         /// Writes fail while set.
         fail_sets: Arc<std::sync::atomic::AtomicBool>,
         /// Every write takes this long, in milliseconds.
@@ -2005,6 +2066,8 @@ mod test {
                 held_get_entered: Default::default(),
                 held_get_release: Arc::new(tokio::sync::Semaphore::new(0)),
                 held_gets: Default::default(),
+                get_delay_ms: Default::default(),
+                gets: Default::default(),
                 fail_sets: Default::default(),
                 set_delay_ms: Default::default(),
                 hold_sets: Default::default(),
@@ -2021,6 +2084,13 @@ mod test {
             Ok(())
         }
         async fn get(&self, key: &str) -> y_sweet_core::store::Result<Option<Vec<u8>>> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let delay = self
+                .get_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             let held = self.held_key.lock().unwrap().as_deref() == Some(key);
             if held {
                 self.held_gets
@@ -2849,7 +2919,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn the_load_lock_map_is_emptied_after_concurrent_and_cancelled_loads() {
+    async fn the_map_of_loads_is_emptied_after_concurrent_and_abandoned_loads() {
         let store = TestStore::default();
         let token = CancellationToken::new();
         let server = Arc::new(server_with_store(&store, &token).await);
@@ -2873,7 +2943,7 @@ mod test {
             "left behind after concurrent loads"
         );
 
-        // A load cancelled while it waits on the store, and one waiting behind it.
+        // A load whose callers both stop waiting, while it waits on the store.
         *store.held_key.lock().unwrap() = Some("b/data.ysweet".to_string());
         let first = tokio::spawn({
             let server = server.clone();
@@ -2889,10 +2959,157 @@ mod test {
         second.abort();
         let _ = first.await;
         let _ = second.await;
-        assert!(
-            server.loading.is_empty(),
-            "left behind after cancelled loads"
+
+        // The load is still under way: it belongs to no caller. When the store answers, the
+        // doc is there and the entry is gone.
+        assert!(server.loading.contains_key("b"));
+        assert!(!server.docs.contains_key("b"));
+        store.held_get_release.add_permits(1);
+        eventually("the abandoned load completes", || {
+            server.docs.contains_key("b")
+        })
+        .await;
+        eventually("its entry is removed", || server.loading.is_empty()).await;
+        assert_eq!(
+            store.held_gets.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one read per doc"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_is_reported_to_every_waiter_and_can_be_retried() {
+        /// A store whose reads fail while `failing` is set.
+        struct FailingStore {
+            inner: TestStore,
+            failing: Arc<std::sync::atomic::AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl Store for FailingStore {
+            async fn init(&self) -> y_sweet_core::store::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, key: &str) -> y_sweet_core::store::Result<Option<Vec<u8>>> {
+                let result = self.inner.get(key).await;
+                if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(y_sweet_core::store::StoreError::ConnectionError(
+                        "test failure".to_string(),
+                    ));
+                }
+                result
+            }
+            async fn set(&self, key: &str, value: Vec<u8>) -> y_sweet_core::store::Result<()> {
+                self.inner.set(key, value).await
+            }
+            async fn remove(&self, key: &str) -> y_sweet_core::store::Result<()> {
+                self.inner.remove(key).await
+            }
+            async fn exists(&self, key: &str) -> y_sweet_core::store::Result<bool> {
+                self.inner.exists(key).await
+            }
+        }
+
+        let inner = TestStore::default();
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        *inner.held_key.lock().unwrap() = Some("a/data.ysweet".to_string());
+        let server = Arc::new(
+            Server::new(
+                Some(Box::new(FailingStore {
+                    inner: inner.clone(),
+                    failing: failing.clone(),
+                })),
+                Duration::from_secs(3600),
+                None,
+                None,
+                CancellationToken::new(),
+                true,
+                None,
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let loads: Vec<_> = (0..2)
+            .map(|_| {
+                let server = server.clone();
+                tokio::spawn(async move { server.load_doc("a").await })
+            })
+            .collect();
+        inner.held_get_entered.notified().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        inner.held_get_release.add_permits(1);
+        for load in loads {
+            let error = load.await.unwrap().expect_err("the load failed");
+            assert!(format!("{error:#}").contains("test failure"), "{error:#}");
+        }
+        eventually("the failed load's entry is removed", || {
+            server.loading.is_empty()
+        })
+        .await;
+        assert!(!server.docs.contains_key("a"));
+
+        // The next request starts a load of its own.
+        failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        inner.held_get_release.add_permits(1);
+        server.load_doc("a").await.unwrap();
+        assert!(server.docs.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn a_doc_that_loads_slower_than_a_writer_waits_can_still_be_opened() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Reading the doc from the store takes several times longer than a writer waits.
+        let doc_wait = Duration::from_millis(200);
+        let load_time = Duration::from_millis(900);
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_gc(&store, &token, Duration::from_secs(3600), doc_wait).await;
+        let docs = server.docs.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+        store.get_delay_ms.store(load_time.as_millis() as u64, SeqCst);
+        let reads_before = store.gets.load(SeqCst);
+
+        // The first writer gives up, as it must.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            post_update(addr, "slow-doc", map_edit(1)).await.unwrap(),
+            Some(503)
+        );
+        assert!(started.elapsed() < load_time);
+
+        // Its load carries on without it, so retrying gets through once the load is done. If
+        // each attempt started the load over, none ever would.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut attempt = 1;
+        loop {
+            attempt += 1;
+            let status = post_update(addr, "slow-doc", map_edit(attempt)).await.unwrap();
+            if status == Some(200) {
+                break;
+            }
+            assert_eq!(status, Some(503));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the doc could not be opened after {attempt} attempts"
+            );
+        }
+        assert!(docs.contains_key("slow-doc"));
+        assert_eq!(
+            store.gets.load(SeqCst) - reads_before,
+            1,
+            "the doc was read from the store more than once"
+        );
+
+        token.cancel();
+        serving.await.unwrap().unwrap();
+        store.get_delay_ms.store(0, SeqCst);
+        assert!(stored_keys_of(&store, "slow-doc")
+            .await
+            .contains(&attempt.to_string()));
     }
 
     #[tokio::test]

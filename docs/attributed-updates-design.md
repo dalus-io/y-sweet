@@ -387,10 +387,16 @@ being applied at that moment was acknowledged and never saved. Now:
   dropped and loading it again. A doc that is there at once is taken even during shutdown, so in-flight
   requests can finish. A hung store thus holds up GC of that one doc and makes writes to it fail fast; it
   never reorders what is stored. Shutdown stays bounded by its stage budgets.
-- Loads of one doc are serialized by a per-doc lock, and a load never replaces a doc already in the map.
-  Upstream let two concurrent first requests both load the doc, the second replacing the first and dropping
-  its persistence subscription while the first request's writer held it. Each user of the lock removes it
-  from the lock map on the way out (also when cancelled) once no one else holds it.
+- A doc is loaded by a task of its own, one per doc at a time, and a load never replaces a doc already in
+  the map. Every request that wants the doc meanwhile waits on that one load and gets its result. Upstream
+  let two concurrent first requests both load the doc, the second replacing the first and dropping its
+  persistence subscription while the first request's writer held it.
+- The load belongs to no request. A writer that gives up after its 15 s, or a client that disconnects,
+  stops waiting and nothing else: the load runs on, and the next request finds the doc loaded or joins the
+  same load. (When the load ran inside the request that started it, the 15 s limit cancelled it, and the
+  retry started it over; a doc that took longer than 15 s to load could never be opened.) A load ends when
+  the store answers; with the S3 store that is bounded by its request timeout (below). A load that fails
+  reports the error to everyone waiting and is forgotten, so the next request starts a new one.
 
 This trades data loss for a narrower availability risk, which the operator doc lists: while the save of a
 retired doc is stalled, that one doc answers `503` (after the 15 s wait) until the write completes or
