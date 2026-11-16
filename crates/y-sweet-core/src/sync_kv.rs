@@ -1,14 +1,22 @@
-use crate::store::Store;
+use crate::store::{Store, StoreError};
 use anyhow::{Context, Result};
 use std::{
     collections::BTreeMap,
     convert::Infallible,
     ops::Bound,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
+
+/// How long a doc stays suspect after a save of it timed out (see [SyncKv::is_suspect]), at
+/// least. Longer when the timeout itself was long: [SUSPECT_WINDOW_TIMEOUTS] times it.
+pub const DEFAULT_SUSPECT_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// The suspect window is never shorter than this many times the timeout that started it.
+pub const SUSPECT_WINDOW_TIMEOUTS: u32 = 5;
 use yrs_kvstore::{DocOps, KVEntry};
 
 pub struct SyncKv {
@@ -20,6 +28,11 @@ pub struct SyncKv {
     saving: AtomicBool,
     dirty_callback: Box<dyn Fn() + Send + Sync>,
     shutdown: AtomicBool,
+    /// Set when a save timed out: until then, a write the store may still apply late can
+    /// replace what later saves stored. See [SyncKv::is_suspect].
+    suspect_until: Mutex<Option<Instant>>,
+    /// The least a suspect window lasts, in milliseconds ([DEFAULT_SUSPECT_WINDOW]).
+    suspect_window_ms: AtomicU64,
 }
 
 impl SyncKv {
@@ -49,7 +62,48 @@ impl SyncKv {
             saving: AtomicBool::new(false),
             dirty_callback: Box::new(callback),
             shutdown: AtomicBool::new(false),
+            suspect_until: Mutex::new(None),
+            suspect_window_ms: AtomicU64::new(DEFAULT_SUSPECT_WINDOW.as_millis() as u64),
         })
+    }
+
+    /// Sets the least a suspect window lasts (default [DEFAULT_SUSPECT_WINDOW]).
+    pub fn set_suspect_window(&self, window: Duration) {
+        self.suspect_window_ms
+            .store(window.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Whether a save of this doc timed out recently enough that the store may still apply
+    /// it.
+    ///
+    /// A save that times out has an unknown outcome: the store may have received the whole
+    /// write and apply it only later, after a newer save, and so put an older copy of the doc
+    /// back. Nothing can stop that write, so for a window after the timeout the doc is
+    /// treated as never safely stored: every save leaves it dirty, so that it is saved again
+    /// at the next checkpoint, over whatever landed meanwhile; and it must not be dropped
+    /// from memory, which holds the only copy known to be current. The first save that
+    /// starts after the window clears the doc as usual.
+    // `Instant::now` is reached only once a save has timed out. On wasm, where there is no
+    // clock behind `Instant`, no store times out, so it never is.
+    pub fn is_suspect(&self) -> bool {
+        let mut suspect_until = self.suspect_until.lock().unwrap();
+        match *suspect_until {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                *suspect_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Starts, or extends, the suspect window after a save timed out after `limit`.
+    fn mark_suspect(&self, limit: Duration) {
+        let window = Duration::from_millis(self.suspect_window_ms.load(Ordering::SeqCst))
+            .max(limit.saturating_mul(SUSPECT_WINDOW_TIMEOUTS));
+        let until = Instant::now() + window;
+        let mut suspect_until = self.suspect_until.lock().unwrap();
+        *suspect_until = Some(suspect_until.map_or(until, |current| current.max(until)));
     }
 
     fn mark_dirty(&self) {
@@ -63,7 +117,8 @@ impl SyncKv {
 
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
         /// Marks the doc dirty again unless disarmed: a save that fails, or is abandoned
-        /// mid-write (its future dropped, e.g. by a timeout), has not saved anything.
+        /// mid-write (its future dropped, e.g. by a timeout), has not saved anything. Left
+        /// armed on purpose by a save made while the doc is suspect.
         struct StillDirty<'a> {
             dirty: &'a AtomicBool,
             saving: &'a AtomicBool,
@@ -113,9 +168,19 @@ impl SyncKv {
                 saving: &self.saving,
                 armed: true,
             };
+            // Asked before the write is sent: a write sent inside the window may itself be
+            // applied before the stale one, so it does not settle anything.
+            let suspect = self.is_suspect();
             tracing::info!(size=?snapshot.len(), "Persisting snapshot");
-            store.set(&self.key, snapshot).await?;
-            still_dirty.armed = false;
+            if let Err(error) = store.set(&self.key, snapshot).await {
+                if let StoreError::Timeout { limit, .. } = &error {
+                    self.mark_suspect(*limit);
+                }
+                return Err(error.into());
+            }
+            // Saved. While suspect the doc stays dirty all the same (the guard sets it): the
+            // next checkpoint saves it again. No dirty callback, so that is the cadence.
+            still_dirty.armed = suspect;
         }
         Ok(())
     }
@@ -465,6 +530,8 @@ pub(crate) mod test {
         set_entered: Arc<tokio::sync::Notify>,
         set_release: Arc<tokio::sync::Semaphore>,
         fail_next_set: Arc<AtomicBool>,
+        /// The next write times out, after this long by the store's account.
+        time_out_next_set: Arc<Mutex<Option<Duration>>>,
     }
 
     impl HeldStore {
@@ -474,6 +541,7 @@ pub(crate) mod test {
                 set_entered: Default::default(),
                 set_release: Arc::new(tokio::sync::Semaphore::new(0)),
                 fail_next_set: Default::default(),
+                time_out_next_set: Default::default(),
             }
         }
 
@@ -495,6 +563,12 @@ pub(crate) mod test {
         async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
             self.set_entered.notify_one();
             self.set_release.acquire().await.unwrap().forget();
+            if let Some(limit) = self.time_out_next_set.lock().unwrap().take() {
+                return Err(StoreError::Timeout {
+                    limit,
+                    what: "waiting for",
+                });
+            }
             if self.fail_next_set.swap(false, Ordering::SeqCst) {
                 return Err(crate::store::StoreError::ConnectionError(
                     "test failure".to_string(),
@@ -555,6 +629,66 @@ pub(crate) mod test {
         store.set_release.add_permits(1);
         sync_kv.persist().await.unwrap();
         assert_eq!(store.stored().get(b"a".as_slice()), Some(&b"1".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn after_a_save_timed_out_saves_leave_the_doc_dirty_until_the_window_has_passed() {
+        let store = HeldStore::new();
+        store.set_release.add_permits(100);
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+            .await
+            .unwrap();
+        let window = Duration::from_millis(300);
+        sync_kv.set_suspect_window(window);
+        sync_kv.set(b"a", b"1");
+        assert!(!sync_kv.is_suspect());
+
+        // An ordinary failure does not make the doc suspect.
+        store.fail_next_set.store(true, Ordering::SeqCst);
+        assert!(sync_kv.persist().await.is_err());
+        assert!(!sync_kv.is_suspect());
+
+        // A timeout does: the store may still apply that write.
+        *store.time_out_next_set.lock().unwrap() = Some(Duration::from_millis(1));
+        assert!(sync_kv.persist().await.is_err());
+        let timed_out_at = Instant::now();
+        assert!(sync_kv.is_suspect());
+        assert!(sync_kv.has_unsaved_changes());
+
+        // Saves now succeed, and each leaves the doc dirty, so there is always another.
+        for _ in 0..2 {
+            sync_kv.persist().await.unwrap();
+            assert_eq!(store.stored().get(b"a".as_slice()), Some(&b"1".to_vec()));
+            assert!(sync_kv.dirty.load(Ordering::SeqCst));
+            assert!(!sync_kv.saving.load(Ordering::SeqCst));
+        }
+        assert!(timed_out_at.elapsed() < window, "the test ran too slowly");
+
+        // The first save that starts after the window clears the doc.
+        tokio::time::sleep(window).await;
+        assert!(!sync_kv.is_suspect());
+        assert!(sync_kv.dirty.load(Ordering::SeqCst));
+        sync_kv.persist().await.unwrap();
+        assert!(!sync_kv.has_unsaved_changes());
+    }
+
+    #[tokio::test]
+    async fn the_suspect_window_is_several_times_the_timeout_that_started_it() {
+        let store = HeldStore::new();
+        store.set_release.add_permits(100);
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+            .await
+            .unwrap();
+        sync_kv.set_suspect_window(Duration::ZERO);
+        sync_kv.set(b"a", b"1");
+
+        let limit = Duration::from_secs(600);
+        *store.time_out_next_set.lock().unwrap() = Some(limit);
+        assert!(sync_kv.persist().await.is_err());
+        let until = sync_kv.suspect_until.lock().unwrap().unwrap();
+        let window = until - Instant::now();
+        assert!(window > limit * (SUSPECT_WINDOW_TIMEOUTS - 1) && window <= limit * 5);
+        assert!(DEFAULT_SUSPECT_WINDOW >= crate::store::s3::DEFAULT_REQUEST_TIMEOUT * 5);
     }
 
     #[tokio::test]

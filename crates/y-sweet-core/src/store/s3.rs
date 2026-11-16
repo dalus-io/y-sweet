@@ -56,22 +56,19 @@ fn write_timeout(request_timeout: Duration, body_len: usize) -> Duration {
 #[cfg(not(target_arch = "wasm32"))]
 async fn within<T>(
     limit: Duration,
-    what: &str,
+    what: &'static str,
     request: impl std::future::Future<Output = T>,
 ) -> Result<T> {
-    tokio::time::timeout(limit, request).await.map_err(|_| {
-        StoreError::ConnectionError(format!(
-            "Timed out after {} ms {what} the S3-compatible API.",
-            limit.as_millis()
-        ))
-    })
+    tokio::time::timeout(limit, request)
+        .await
+        .map_err(|_| StoreError::Timeout { limit, what })
 }
 
 /// On wasm (the Cloudflare worker) there is no timer here; the platform bounds the request.
 #[cfg(target_arch = "wasm32")]
 async fn within<T>(
     _limit: Duration,
-    _what: &str,
+    _what: &'static str,
     request: impl std::future::Future<Output = T>,
 ) -> Result<T> {
     Ok(request.await)
@@ -460,9 +457,7 @@ mod tests {
 
     fn assert_timed_out<T: std::fmt::Debug>(result: Result<T>) {
         match result {
-            Err(StoreError::ConnectionError(message)) => {
-                assert!(message.contains("Timed out"), "{message}")
-            }
+            Err(StoreError::Timeout { .. }) => {}
             other => panic!("expected a timeout, got {other:?}"),
         }
     }

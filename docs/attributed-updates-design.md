@@ -390,7 +390,8 @@ being applied at that moment was acknowledged and never saved. Now:
   (S3 has no fencing here); abandoning it, letting the doc be written and saved again, would let the old
   write land last and overwrite newer state. The S3 store's own request timeout (below) is not such an
   abandonment: it closes the request's connection and returns an error, GC un-retires the doc, and the
-  next save starts only after that.
+  next save starts only after that. For the case where the store applies the timed-out write anyway, see
+  the suspect window below.
 - A writer takes its doc with `Server::live_doc`, and all of that is bounded by 15 s and by shutdown
   (`503` either way): loading the doc, waiting behind another load of it, and waiting for a retired doc to be
   dropped and loading it again. A doc that is there at once is taken even during shutdown, so in-flight
@@ -418,9 +419,32 @@ retries, so the "being unloaded" state ends after about a minute instead of last
 timeout is applied with a timer around the request, not through reqwest, whose wasm build has no timeout
 setting; the wasm build (the Cloudflare worker) applies none. Timing out drops the request, which closes
 its connection, before the error is returned, so the rule that a doc's saves never overlap holds for a
-timed-out save as it does for one that failed any other way. What it cannot rule out is a store that
-applies a fully received write after the connection is gone and after a later save; see the operator
-page. The waits that writers and shutdown depend on stay bounded independently of this, as above.
+timed-out save as it does for one that failed any other way. The waits that writers and shutdown depend on
+stay bounded independently of this, as above.
+
+**Suspect window.** Before the timeout existed a hung save never returned, so nothing was saved after it.
+Now it returns, the save lock is released, and a later save can succeed, while the store may still hold
+the timed-out write in full and apply it afterwards, over the newer copy. There is no fence for this that
+works on AWS S3, MinIO and LocalStack alike (conditional writes are not uniformly supported), so it is
+mitigated by saving again. The store reports a timeout as its own error (`StoreError::Timeout`, with the
+time the request was given). `SyncKv::persist` then marks the doc suspect until
+`max(5 min, 5 x that time)` from now. While a doc is suspect:
+
+- a successful save leaves the dirty flag set (the save's drop guard, which re-marks the doc dirty when a
+  save fails or is abandoned, is simply left armed), so the persistence worker saves again at the next
+  checkpoint and each save rewrites the current state over whatever landed. No dirty callback is fired:
+  the worker's checkpoint timer is what brings the next save, so the cadence is the checkpoint's and
+  nothing can spin. Whether a save counts is decided when it starts, not when it ends: one sent inside the
+  window may itself be applied before the stale write;
+- GC does not retire the doc, and does not drop a doc whose save succeeded if it turned suspect meanwhile
+  (the worker's save timing out just before GC's): it un-retires it instead;
+- the first save that starts after the window clears the flag normally.
+
+What is left is a stale write applied after the last save the process makes: after the final save at
+shutdown (the save is made as usual and the number of suspect docs is logged in one warning), after the
+window if a store holds a write that long, or in the gap of at most one checkpoint between a stale write
+landing and the next save if the process is killed there. The shutdown report of unsaved docs counts a
+suspect doc as unsaved even when its final save succeeded, which is the cautious reading.
 
 **Connection churn.** yrs 0.19 registers an observer with a compare-and-swap loop that does not reload
 the list head it compares against (`Observer::subscribe_with`); if the head is unregistered concurrently,

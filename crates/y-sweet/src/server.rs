@@ -140,6 +140,7 @@ struct DocLoader {
     on_update: Option<UpdateCallback>,
     doc_workers_token: CancellationToken,
     doc_worker_tracker: TaskTracker,
+    suspect_window: Duration,
 }
 
 /// Admission for writes to docs, closed once at shutdown before the final saves.
@@ -257,6 +258,9 @@ pub struct Server {
     /// The loads under way, one per doc, so that concurrent requests load a doc once and a
     /// load survives the requests waiting for it (see [Server::load_doc]).
     loading: Arc<DashMap<String, SharedLoad>>,
+    /// How long a doc stays suspect after a save of it timed out, at least (see
+    /// [SyncKv::is_suspect]).
+    suspect_window: Duration,
 }
 
 impl Server {
@@ -293,6 +297,7 @@ impl Server {
             shutdown_budgets: ShutdownBudgets::default(),
             doc_wait: DEFAULT_DOC_WAIT,
             loading: Arc::new(DashMap::new()),
+            suspect_window: y_sweet_core::sync_kv::DEFAULT_SUSPECT_WINDOW,
         })
     }
 
@@ -375,6 +380,7 @@ impl Server {
                     on_update: self.on_update.clone(),
                     doc_workers_token: self.doc_workers_token.clone(),
                     doc_worker_tracker: self.doc_worker_tracker.clone(),
+                    suspect_window: self.suspect_window,
                 };
                 // The entry goes when the task ends, also if it panics. That cannot happen
                 // before the entry is in the map: removing it needs the shard lock held here.
@@ -423,6 +429,7 @@ impl DocLoader {
             self.on_update.clone(),
         )
         .await?;
+        dwskv.sync_kv().set_suspect_window(self.suspect_window);
 
         dwskv
             .sync_kv()
@@ -510,10 +517,13 @@ impl Server {
                         }
                         // Retired only if, under the doc lock, nothing holds it: a writer that
                         // took the doc since the count above keeps it alive.
-                        (checkpoints_without_refs >= 2 && doc.retire_if_unused(), doc.sync_kv())
+                        // Nor while a save of it that timed out may still land: memory then
+                        // holds the only copy known to be current (see `SyncKv::is_suspect`).
+                        let retire = checkpoints_without_refs >= 2 && !doc.sync_kv().is_suspect();
+                        (retire && doc.retire_if_unused(), doc.sync_kv())
                     };
                     if checkpoints_without_refs >= 2 && !retired {
-                        // A writer got in first.
+                        // A writer got in first, or the doc is suspect.
                         checkpoints_without_refs = 0;
                     }
                     if !retired {
@@ -528,6 +538,10 @@ impl Server {
                     // and shutdown after its stage budget.
                     let saved = Self::compact_and_persist(&sync_kv, &persist_lock).await;
                     match saved {
+                        // A save by the persistence worker timed out just before this one.
+                        Ok(()) if sync_kv.is_suspect() => {
+                            tracing::warn!("a save of the doc being collected timed out; keeping it loaded");
+                        }
                         Ok(()) => {
                             tracing::info!("GCing doc");
                             docs.remove_if(&doc_id, |_, doc| doc.sync_kv().is_shutdown());
@@ -954,6 +968,21 @@ impl Server {
                     "shutdown stage did not finish in time"
                 );
             }
+        }
+
+        // Docs whose last saves include one that timed out: the final save above stored the
+        // current state, but nothing saves again after it, so a timed-out write that the
+        // store applies from here on would put an older copy back.
+        let suspect_docs = self
+            .docs
+            .iter()
+            .filter(|doc| doc.sync_kv().is_suspect())
+            .count();
+        if suspect_docs > 0 {
+            tracing::warn!(
+                suspect_docs,
+                "shutting down with docs a timed-out save of which may still be applied by the store"
+            );
         }
 
         tracing::info!(
@@ -2048,6 +2077,10 @@ mod test {
         gets: Arc<std::sync::atomic::AtomicUsize>,
         /// Writes fail while set.
         fail_sets: Arc<std::sync::atomic::AtomicBool>,
+        /// The next write times out as far as the caller can tell, but the store has all
+        /// of it: it is kept in `stale_write`, to be applied late by `land_stale_write`.
+        time_out_next_set: Arc<std::sync::atomic::AtomicBool>,
+        stale_write: Arc<std::sync::Mutex<Option<StoredWrite>>>,
         /// Every write takes this long, in milliseconds.
         set_delay_ms: Arc<std::sync::atomic::AtomicU64>,
         /// Writes wait for `set_release` while set.
@@ -2071,6 +2104,8 @@ mod test {
                 get_delay_ms: Default::default(),
                 gets: Default::default(),
                 fail_sets: Default::default(),
+                time_out_next_set: Default::default(),
+                stale_write: Default::default(),
                 set_delay_ms: Default::default(),
                 hold_sets: Default::default(),
                 detach_next_set: Default::default(),
@@ -2124,6 +2159,13 @@ mod test {
                 self.set_entered.notify_one();
                 self.set_release.acquire().await.unwrap().forget();
             }
+            if self.time_out_next_set.swap(false, SeqCst) {
+                *self.stale_write.lock().unwrap() = Some((key.to_string(), value));
+                return Err(y_sweet_core::store::StoreError::Timeout {
+                    limit: Duration::from_millis(1),
+                    what: "waiting for",
+                });
+            }
             if self.fail_sets.load(SeqCst) {
                 return Err(y_sweet_core::store::StoreError::ConnectionError(
                     "test failure".to_string(),
@@ -2139,6 +2181,157 @@ mod test {
         async fn exists(&self, key: &str) -> y_sweet_core::store::Result<bool> {
             Ok(self.data.contains_key(key))
         }
+    }
+
+    impl TestStore {
+        /// The store applies the write that timed out, over whatever was saved since.
+        /// Returns the bytes it stored.
+        fn land_stale_write(&self) -> Vec<u8> {
+            let (key, value) = self.stale_write.lock().unwrap().take().unwrap();
+            self.data.insert(key, value.clone());
+            value
+        }
+    }
+
+    /// A key and the value written to it.
+    type StoredWrite = (String, Vec<u8>);
+
+    /// The server's docs, the task serving it, and when the save timed out.
+    type TimedOutSave = (
+        Arc<DashMap<String, DocWithSyncKv>>,
+        tokio::task::JoinHandle<Result<()>>,
+        std::time::Instant,
+    );
+
+    /// A served server with a 50 ms checkpoint and GC, no doc loaded, whose next store write
+    /// times out. Returns once a save of `doc_id` holding edit 1 has timed out and a later
+    /// save, holding edits 1 and 2, has succeeded.
+    async fn server_after_a_timed_out_save(
+        store: &TestStore,
+        token: &CancellationToken,
+        doc_id: &str,
+        suspect_window: Duration,
+    ) -> TimedOutSave {
+        let mut server = Server::new(
+            Some(Box::new(store.clone())),
+            Duration::from_millis(50),
+            None,
+            None,
+            token.clone(),
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        server.suspect_window = suspect_window;
+        let docs = server.docs.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        store
+            .time_out_next_set
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            post_update(addr, doc_id, map_edit(1)).await.unwrap(),
+            Some(200)
+        );
+        eventually("a save times out", || {
+            store.stale_write.lock().unwrap().is_some()
+        })
+        .await;
+        let timed_out_at = std::time::Instant::now();
+        assert_eq!(
+            post_update(addr, doc_id, map_edit(2)).await.unwrap(),
+            Some(200)
+        );
+        wait_for_stored_key(store, doc_id, "2").await;
+        (docs, serving, timed_out_at)
+    }
+
+    async fn wait_for_stored_key(store: &TestStore, doc_id: &str, key: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !stored_keys_of(store, doc_id).await.contains(key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "key {key} of {doc_id} was never stored"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_save_that_lands_late_is_saved_over_and_the_doc_kept_meanwhile() {
+        const DOC: &str = "suspect-doc";
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let window = Duration::from_millis(2500);
+        let (docs, serving, timed_out_at) =
+            server_after_a_timed_out_save(&store, &token, DOC, window).await;
+        let unsaved = || docs.get(DOC).unwrap().sync_kv().has_unsaved_changes();
+
+        // (a) The save that succeeded did not leave the doc clean...
+        assert!(unsaved());
+        // ...so when the store now applies the write that timed out, over the newer save,
+        let stale = store.land_stale_write();
+        assert!(
+            !stored_keys_of(&store, DOC).await.contains("2") || {
+                // (unless a checkpoint has already saved over it)
+                *store.data.get(&format!("{DOC}/data.ysweet")).unwrap() != stale
+            }
+        );
+        // the next checkpoint puts the current state back.
+        wait_for_stored_key(&store, DOC, "2").await;
+
+        // (b) GC leaves the doc alone for as long as it is suspect, idle though it is: here
+        // for ten checkpoints, where two would do otherwise.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if timed_out_at.elapsed() < window - Duration::from_millis(200) {
+                assert!(docs.contains_key(DOC), "collected while suspect");
+                assert!(!is_retired(&docs, DOC), "retired while suspect");
+                assert!(unsaved());
+            }
+        }
+        assert!(
+            timed_out_at.elapsed() < window,
+            "the test ran too slowly to check anything"
+        );
+
+        // (c) After the window a save clears the doc, and GC collects it.
+        eventually("GC collects the doc after the window", || {
+            !docs.contains_key(DOC)
+        })
+        .await;
+        assert!(timed_out_at.elapsed() >= window);
+        let stored = stored_keys_of(&store, DOC).await;
+        assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
+
+        token.cancel();
+        serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_saves_a_suspect_doc_and_does_not_wait_out_its_window() {
+        const DOC: &str = "suspect-doc";
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let (docs, serving, _) =
+            server_after_a_timed_out_save(&store, &token, DOC, Duration::from_secs(3600)).await;
+        let doc = docs.get(DOC).unwrap();
+        apply_update_to(&doc.awareness(), &map_edit(3), None).unwrap();
+        drop(doc);
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("shutdown waited for the suspect doc")
+            .unwrap()
+            .unwrap();
+        let stored = stored_keys_of(&store, DOC).await;
+        assert!(stored.contains("3"), "{stored:?}");
+        assert!(docs.get(DOC).unwrap().sync_kv().is_suspect());
     }
 
     async fn server_with_store(store: &TestStore, token: &CancellationToken) -> Server {
