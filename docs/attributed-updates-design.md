@@ -165,8 +165,13 @@ The callback supplied by the dispatcher does three things, none of which block t
 
 1. If the update is larger than the event cap (8 MiB), drop it.
 2. Reserve its size against the global byte budget (section 4.2). If the budget is exhausted, drop it.
-3. `try_send` it into a bounded `mpsc` channel (4096 events). If the channel is full, release the
-   reservation and drop it.
+3. Copy it, and `try_send` the copy into a bounded `mpsc` channel (4096 events). If the channel is full,
+   release the reservation and drop it.
+
+The callback is lent the update (`ObservedUpdate`, a view of the buffer yrs built for the transaction) and
+copies it only in step 3. An update refused in step 1 or 2 is therefore never copied: copying first would
+spend time in proportion to the update under the doc lock, most of all for exactly the oversize updates
+that are then thrown away.
 
 Every drop increments an atomic per-reason counter (oversize, budget, channel full, closed) and inserts the
 doc id into a shared `Mutex<HashSet<String>>` of gapped docs. The dispatcher drains that set on every tick

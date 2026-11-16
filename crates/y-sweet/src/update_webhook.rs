@@ -51,7 +51,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use y_sweet_core::{
     auth::Actor,
-    update_events::{AttributedUpdate, UpdateCallback},
+    update_events::{AttributedUpdate, ObservedUpdate, UpdateCallback},
 };
 
 const MIB: usize = 1024 * 1024;
@@ -243,7 +243,12 @@ const EVENT_OVERHEAD_BYTES: usize = 256;
 ///
 /// Called by the observer under the doc lock: a few additions, no allocation.
 fn event_cost(event: &AttributedUpdate) -> usize {
-    let actor = event.actor.as_ref().map_or(0, |actor| {
+    observed_cost(&event.observed())
+}
+
+/// [event_cost] of an update that has not been copied yet.
+fn observed_cost(event: &ObservedUpdate<'_>) -> usize {
+    let actor = event.actor.map_or(0, |actor| {
         actor.user_id.as_ref().map_or(0, String::len) + actor.writer.as_ref().map_or(0, String::len)
     });
     event.update.len().div_ceil(3) * 4 + event.doc_id.len() + actor + EVENT_OVERHEAD_BYTES
@@ -259,15 +264,19 @@ struct UpdateSink {
 impl UpdateSink {
     /// Runs inside the yrs observer, under the doc write lock: no IO, no logging, no waiting.
     /// The dispatcher reports the drops recorded here on its next tick.
-    fn offer(&self, event: AttributedUpdate) {
+    ///
+    /// The update is lent. It is copied only once it has passed the size cap and has its
+    /// place in the budget: an update that is going to be dropped is not copied first, which
+    /// for an oversize one would be megabytes copied with the doc locked, for nothing.
+    fn offer(&self, event: ObservedUpdate<'_>) {
         if event.update.len() > self.max_event_bytes {
-            return self.shared.record_drop(&event.doc_id, DropReason::Oversize);
+            return self.shared.record_drop(event.doc_id, DropReason::Oversize);
         }
-        let cost = event_cost(&event);
+        let cost = observed_cost(&event);
         if !self.shared.try_reserve(cost) {
-            return self.shared.record_drop(&event.doc_id, DropReason::Budget);
+            return self.shared.record_drop(event.doc_id, DropReason::Budget);
         }
-        let (event, reason) = match self.tx.try_send(event) {
+        let (event, reason) = match self.tx.try_send(event.to_owned()) {
             Ok(()) => return,
             Err(TrySendError::Full(event)) => (event, DropReason::ChannelFull),
             // The dispatcher is gone: the server is shutting down.
@@ -1358,7 +1367,7 @@ pub fn start(
         batcher: Batcher::new(config, shared, instance_id),
         cancellation_token,
     };
-    let callback: UpdateCallback = Arc::new(move |event| sink.offer(event));
+    let callback: UpdateCallback = Arc::new(move |event: ObservedUpdate<'_>| sink.offer(event));
 
     Ok((callback, dispatcher.run()))
 }
@@ -1435,7 +1444,7 @@ mod tests {
 
         /// What the doc observer does.
         fn offer(&self, doc_id: &str, size: usize) {
-            self.sink.offer(event(doc_id, size));
+            self.sink.offer(event(doc_id, size).observed());
         }
 
         /// What the dispatcher does when the channel is readable.
@@ -1823,25 +1832,31 @@ mod tests {
     #[test]
     fn payload_carries_each_event_with_its_actor() {
         let mut p = Pipeline::new(test_config());
-        p.sink.offer(AttributedUpdate {
-            doc_id: "doc".to_string(),
-            actor: Some(Actor {
-                user_id: Some("user-1".to_string()),
-                writer: Some("ui".to_string()),
-            }),
-            update: vec![0, 1, 2, 250, 251, 252],
-            occurred_at: UNIX_EPOCH + Duration::from_millis(1_794_312_000_000),
-        });
-        p.sink.offer(AttributedUpdate {
-            doc_id: "doc".to_string(),
-            actor: Some(Actor {
-                user_id: None,
-                writer: Some("agent".to_string()),
-            }),
-            update: vec![3],
-            occurred_at: UNIX_EPOCH + Duration::from_millis(1_794_312_000_250),
-        });
-        p.sink.offer(event("doc", 2));
+        p.sink.offer(
+            AttributedUpdate {
+                doc_id: "doc".to_string(),
+                actor: Some(Actor {
+                    user_id: Some("user-1".to_string()),
+                    writer: Some("ui".to_string()),
+                }),
+                update: vec![0, 1, 2, 250, 251, 252],
+                occurred_at: UNIX_EPOCH + Duration::from_millis(1_794_312_000_000),
+            }
+            .observed(),
+        );
+        p.sink.offer(
+            AttributedUpdate {
+                doc_id: "doc".to_string(),
+                actor: Some(Actor {
+                    user_id: None,
+                    writer: Some("agent".to_string()),
+                }),
+                update: vec![3],
+                occurred_at: UNIX_EPOCH + Duration::from_millis(1_794_312_000_250),
+            }
+            .observed(),
+        );
+        p.sink.offer(event("doc", 2).observed());
         p.pump();
         p.advance(WINDOW);
 
@@ -2144,7 +2159,7 @@ mod tests {
 
     impl Running {
         fn emit(&self, doc_id: &str) {
-            (self.callback)(event(doc_id, 10));
+            (self.callback)(event(doc_id, 10).observed());
         }
     }
 
@@ -2454,7 +2469,7 @@ mod tests {
         );
 
         // After shutdown the observer still must not block or panic.
-        (running.callback)(event("a", 10));
+        (running.callback)(event("a", 10).observed());
     }
 
     #[tokio::test]
@@ -2578,7 +2593,7 @@ mod tests {
         };
         for round in 0..5 {
             for doc in 0..400 {
-                (running.callback)(big(doc));
+                (running.callback)(big(doc).observed());
             }
             // Let the dispatcher take them off the channel.
             tokio::time::sleep(Duration::from_millis(if round == 4 { 100 } else { 20 })).await;
@@ -2593,7 +2608,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut calls = 0u64;
                     while !stop.load(Ordering::SeqCst) {
-                        callback(big(1000 + producer));
+                        callback(big(1000 + producer).observed());
                         calls += 1;
                     }
                     calls
@@ -3116,7 +3131,7 @@ GZuNFD2CfzKu6mHIOnyE
         // The charge is at least what the event occupies once serialized.
         let batch = {
             let mut p = Pipeline::new(test_config());
-            p.sink.offer(attributed.clone());
+            p.sink.offer(attributed.observed());
             p.pump();
             p.advance(WINDOW);
             p.start_one()
@@ -3222,7 +3237,7 @@ GZuNFD2CfzKu6mHIOnyE
             ..event("doc", 1)
         };
         let estimate = event_cost(&escaped);
-        p.sink.offer(escaped);
+        p.sink.offer(escaped.observed());
         p.pump();
         assert_eq!(p.shared.held_bytes(), estimate);
         p.advance(WINDOW);

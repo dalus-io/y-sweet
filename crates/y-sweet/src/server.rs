@@ -1770,7 +1770,11 @@ mod test {
         let events: Arc<Mutex<Vec<AttributedUpdate>>> = Arc::default();
         server.on_update = Some({
             let events = events.clone();
-            Arc::new(move |event| events.lock().unwrap().push(event))
+            Arc::new(
+                move |event: y_sweet_core::update_events::ObservedUpdate<'_>| {
+                    events.lock().unwrap().push(event.to_owned())
+                },
+            )
         });
         // Docs pick the observer up when they are loaded.
         server.docs.remove(DOC_ID);
@@ -1858,7 +1862,11 @@ mod test {
             let events = Events::default();
             server.on_update = Some({
                 let events = events.clone();
-                Arc::new(move |event| events.lock().unwrap().push(event))
+                Arc::new(
+                    move |event: y_sweet_core::update_events::ObservedUpdate<'_>| {
+                        events.lock().unwrap().push(event.to_owned())
+                    },
+                )
             });
             server.load_doc(DOC_ID).await.unwrap();
 

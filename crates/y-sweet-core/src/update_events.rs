@@ -21,10 +21,48 @@ pub struct AttributedUpdate {
     pub occurred_at: SystemTime,
 }
 
-/// Receives every [AttributedUpdate] of a doc.
+/// An update as the doc's observer sees it: borrowed, not yet copied.
 ///
-/// It is called synchronously while the doc is locked for writing, so it must not block.
-pub type UpdateCallback = Arc<dyn Fn(AttributedUpdate) + Send + Sync>;
+/// The observer runs under the doc write lock and the update can be large, so whoever receives
+/// this decides whether the update is worth copying (its size is `update.len()`) before taking
+/// a copy with [ObservedUpdate::to_owned].
+#[derive(Debug, Clone, Copy)]
+pub struct ObservedUpdate<'a> {
+    pub doc_id: &'a str,
+    pub actor: Option<&'a Actor>,
+    pub update: &'a [u8],
+    pub occurred_at: SystemTime,
+}
+
+impl ObservedUpdate<'_> {
+    /// Copies the update out of the doc's observer.
+    pub fn to_owned(&self) -> AttributedUpdate {
+        AttributedUpdate {
+            doc_id: self.doc_id.to_string(),
+            actor: self.actor.cloned(),
+            update: self.update.to_vec(),
+            occurred_at: self.occurred_at,
+        }
+    }
+}
+
+impl AttributedUpdate {
+    /// This update as an observer would be handed it.
+    pub fn observed(&self) -> ObservedUpdate<'_> {
+        ObservedUpdate {
+            doc_id: &self.doc_id,
+            actor: self.actor.as_ref(),
+            update: &self.update,
+            occurred_at: self.occurred_at,
+        }
+    }
+}
+
+/// Receives every update of a doc.
+///
+/// It is called synchronously while the doc is locked for writing, so it must not block, and
+/// should not copy an update it is going to discard.
+pub type UpdateCallback = Arc<dyn for<'a> Fn(ObservedUpdate<'a>) + Send + Sync>;
 
 /// Calls `on_update` for every update applied to `doc` for as long as the returned subscription
 /// is alive.
@@ -39,10 +77,13 @@ pub fn observe_attributed_updates(
 ) -> anyhow::Result<Subscription> {
     let doc_id = doc_id.to_string();
     doc.observe_update_v1(move |txn, event| {
-        on_update(AttributedUpdate {
-            doc_id: doc_id.clone(),
-            actor: actor_from_origin(txn.origin()),
-            update: event.update.clone(),
+        // Lent, not cloned: the receiver may drop the update for its size, and a copy of a
+        // large update takes time in proportion, with the doc locked.
+        let actor = actor_from_origin(txn.origin());
+        on_update(ObservedUpdate {
+            doc_id: &doc_id,
+            actor: actor.as_ref(),
+            update: &event.update,
             occurred_at: SystemTime::now(),
         });
     })
@@ -74,7 +115,7 @@ mod tests {
         let events = Events::default();
         let on_update: UpdateCallback = {
             let events = events.clone();
-            Arc::new(move |event| events.lock().unwrap().push(event))
+            Arc::new(move |event: ObservedUpdate<'_>| events.lock().unwrap().push(event.to_owned()))
         };
         let doc = DocWithSyncKv::new("doc123", None, || {}, false, Some(on_update))
             .await
@@ -360,7 +401,7 @@ mod tests {
         let events = Events::default();
         let on_update: UpdateCallback = {
             let events = events.clone();
-            Arc::new(move |event| events.lock().unwrap().push(event))
+            Arc::new(move |event: ObservedUpdate<'_>| events.lock().unwrap().push(event.to_owned()))
         };
         let doc = DocWithSyncKv::new("doc123", store_handle(), || {}, false, Some(on_update))
             .await
@@ -375,12 +416,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_callback_is_lent_the_update_and_nothing_is_copied_for_it() {
+        // The callback sees the very buffer yrs built for the transaction, the one any other
+        // observer of the doc sees: no copy was made to call it. So a receiver that refuses an
+        // update for its size (the webhook's 8 MiB cap) costs the doc lock nothing for it.
+        let lent: Arc<Mutex<Vec<(usize, usize)>>> = Arc::default();
+        let on_update: UpdateCallback = {
+            let lent = lent.clone();
+            Arc::new(move |event: ObservedUpdate<'_>| {
+                lent.lock()
+                    .unwrap()
+                    .push((event.update.as_ptr() as usize, event.update.len()))
+            })
+        };
+        let doc = DocWithSyncKv::new("doc123", None, || {}, false, Some(on_update))
+            .await
+            .unwrap();
+        let seen: Arc<Mutex<Vec<(usize, usize)>>> = Arc::default();
+        let _subscription = {
+            let seen = seen.clone();
+            let awareness = doc.awareness();
+            let awareness = awareness.read().unwrap();
+            awareness
+                .doc()
+                .observe_update_v1(move |_, event| {
+                    seen.lock()
+                        .unwrap()
+                        .push((event.update.as_ptr() as usize, event.update.len()))
+                })
+                .unwrap()
+        };
+
+        let big = "x".repeat(1024 * 1024);
+        doc.apply_update(&Client::new(1).push(&big), None).unwrap();
+
+        let lent = lent.lock().unwrap();
+        assert_eq!(lent.len(), 1);
+        assert!(lent[0].1 > big.len());
+        assert_eq!(*lent, *seen.lock().unwrap());
+    }
+
+    #[tokio::test]
     async fn delete_only_update_emits_an_event_with_and_without_gc() {
         for skip_gc in [false, true] {
             let events = Events::default();
             let on_update: UpdateCallback = {
                 let events = events.clone();
-                Arc::new(move |event| events.lock().unwrap().push(event))
+                Arc::new(move |event: ObservedUpdate<'_>| {
+                    events.lock().unwrap().push(event.to_owned())
+                })
             };
             let doc = DocWithSyncKv::new("doc123", None, || {}, skip_gc, Some(on_update))
                 .await

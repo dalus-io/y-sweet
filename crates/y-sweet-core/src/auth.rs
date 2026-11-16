@@ -887,9 +887,8 @@ mod tests {
             doc_id: "doc".to_string(),
             authorization: Authorization::Full,
         };
-        let expiring = |permission| {
-            Payload::new_with_expiration(permission, ExpirationTimeEpochMillis(1000))
-        };
+        let expiring =
+            |permission| Payload::new_with_expiration(permission, ExpirationTimeEpochMillis(1000));
         let user = |generation| Some(("user-1".to_string(), generation));
         let built = [
             Payload::new(Permission::Server),
@@ -901,7 +900,10 @@ mod tests {
                 doc(),
                 actor(Some("user-1"), Some("ui")),
             )),
-            expiring(Permission::AttributedDoc(doc(), actor(Some("user-1"), None))),
+            expiring(Permission::AttributedDoc(
+                doc(),
+                actor(Some("user-1"), None),
+            )),
         ];
         let golden = golden_payloads();
         assert_eq!(built.len(), golden.len());
