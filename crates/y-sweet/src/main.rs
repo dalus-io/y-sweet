@@ -15,6 +15,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use url::Url;
 use y_sweet::cli::{print_auth_message, print_server_url};
 use y_sweet::stores::filesystem::FileSystemStore;
+use y_sweet::update_webhook::UpdateWebhookConfig;
 use y_sweet_core::{
     auth::Authenticator,
     store::{
@@ -33,6 +34,7 @@ struct Opts {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // Parsed once at startup; boxing the options buys nothing.
 enum ServSubcommand {
     Serve {
         #[clap(env = "Y_SWEET_STORE")]
@@ -59,6 +61,61 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "false", env = "Y_SWEET_SKIP_GC")]
         skip_gc: bool,
+
+        /// How long a graceful shutdown may take in all, in seconds. Docs are saved until
+        /// then; set it a little below the time the platform allows between the stop signal
+        /// and killing the process. Defaults to 110.
+        // Text, not a number, so that clap does not refuse to start on a value that is empty
+        // (an env file that passes the variable through unset) or malformed: see
+        // [shutdown_timeout_from_opt].
+        #[clap(long, env = "Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS")]
+        shutdown_timeout_seconds: Option<String>,
+
+        /// Mint doc tokens that carry the `userId` and `writer` of the auth request, so that
+        /// updates can be attributed. Only turn this on once every server that verifies the
+        /// tokens runs a version that understands them. Accepts `true` or `false`, either as
+        /// the next argument or after `=`; on its own (as the last argument) it means `true`.
+        ///
+        /// The next argument is always read as the value, so `--attributed-tokens false` is
+        /// off, and `--attributed-tokens /data` is an error rather than "on, store `/data`".
+        #[clap(
+            long,
+            env = "Y_SWEET_ATTRIBUTED_TOKENS",
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_value = "false",
+            default_missing_value = "true",
+            value_parser = parse_switch,
+        )]
+        attributed_tokens: bool,
+
+        /// URL that receives attributed doc updates. Unset (or empty) disables the webhook.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_URL")]
+        update_webhook_url: Option<String>,
+
+        /// Secret the update webhook requests are signed with. Required with the URL.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_SECRET", hide_env_values = true)]
+        update_webhook_secret: Option<String>,
+
+        /// How long updates to one doc are collected into a batch, in milliseconds.
+        /// Defaults to 1000.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_BATCH_MS")]
+        update_webhook_batch_ms: Option<String>,
+
+        /// Upper bound, in bytes, on the updates held in memory awaiting delivery.
+        /// Defaults to 268435456.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES")]
+        update_webhook_max_bytes: Option<String>,
+
+        /// How many update webhook requests may be in flight at once, across all docs.
+        /// Defaults to 16.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY")]
+        update_webhook_concurrency: Option<String>,
+
+        /// PEM file of extra CA certificates to trust for the update webhook URL, in addition
+        /// to the bundled public roots.
+        #[clap(long, env = "Y_SWEET_UPDATE_WEBHOOK_CA_FILE")]
+        update_webhook_ca_file: Option<String>,
     },
 
     GenAuth {
@@ -142,6 +199,202 @@ fn parse_s3_config_from_env_and_args(
     })
 }
 
+/// Parses an on/off switch. An empty value is off, so that an environment that passes the
+/// variable through unset (`VAR=`) behaves like one that does not pass it at all.
+fn parse_switch(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "false" | "0" | "no" | "off" => Ok(false),
+        "true" | "1" | "yes" | "on" => Ok(true),
+        other => Err(format!(
+            "expected `true` or `false`, got `{other}`. A value after `--attributed-tokens` \
+             is read as the switch's value: to turn it on and also pass a store, write \
+             `--attributed-tokens=true` or `--attributed-tokens true` before the store."
+        )),
+    }
+}
+
+/// `None` for an option that is unset or set to nothing.
+fn non_empty(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+}
+
+fn parse_number<T: std::str::FromStr>(name: &str, value: &Option<String>) -> Result<Option<T>> {
+    non_empty(value)
+        .map(|v| {
+            v.parse::<T>()
+                .map_err(|_| anyhow::anyhow!("{name} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+/// The longest timeout accepted, in seconds: one day. Far beyond any useful value, and small
+/// enough that deadlines computed from it cannot overflow.
+const MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+
+/// A timeout setting given in seconds. Unset or empty means the default. A value that is not
+/// a whole number of seconds is reported and replaced by the default rather than keeping the
+/// server from starting: this server is the only copy of the sync service, and the default is
+/// a safe value. A number is kept within 1 s and one day.
+fn seconds_or_default(
+    setting: &'static str,
+    value: Option<&str>,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    match value.parse::<u64>() {
+        Ok(seconds) => std::time::Duration::from_secs(seconds.clamp(1, MAX_TIMEOUT_SECONDS)),
+        Err(_) => {
+            // The value is not echoed: nothing read from the environment is, in case the
+            // wrong variable ended up here.
+            tracing::error!(
+                setting,
+                default_seconds = default.as_secs(),
+                "timeout setting is not a whole number of seconds; using the default"
+            );
+            default
+        }
+    }
+}
+
+/// The shutdown timeout to run with (`Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS`).
+fn shutdown_timeout_from_opt(value: &Option<String>) -> std::time::Duration {
+    seconds_or_default(
+        "Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS",
+        value.as_deref(),
+        y_sweet::server::DEFAULT_SHUTDOWN_TIMEOUT,
+    )
+}
+
+const S3_REQUEST_TIMEOUT: &str = "Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS";
+
+/// The S3 store's request timeout (`Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS`), read from the
+/// environment like the rest of the S3 settings.
+fn s3_request_timeout_from_env() -> std::time::Duration {
+    seconds_or_default(
+        S3_REQUEST_TIMEOUT,
+        env::var(S3_REQUEST_TIMEOUT).ok().as_deref(),
+        y_sweet_core::store::s3::DEFAULT_REQUEST_TIMEOUT,
+    )
+}
+
+/// Builds the update webhook configuration from the `serve` options. `Ok(None)` means the
+/// webhook is not configured.
+fn update_webhook_config_from_opts(
+    url: &Option<String>,
+    secret: &Option<String>,
+    batch_ms: &Option<String>,
+    max_bytes: &Option<String>,
+    concurrency: &Option<String>,
+    ca_file: &Option<String>,
+) -> Result<Option<UpdateWebhookConfig>> {
+    let Some(url) = non_empty(url) else {
+        if non_empty(secret).is_some() {
+            tracing::warn!(
+                "Y_SWEET_UPDATE_WEBHOOK_SECRET is set but Y_SWEET_UPDATE_WEBHOOK_URL is not; the update webhook stays disabled."
+            );
+        }
+        return Ok(None);
+    };
+
+    // Errors never echo the URL: it may carry credentials.
+    let url = Url::parse(url).map_err(|e| anyhow::anyhow!("Invalid update webhook URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        anyhow::bail!("The update webhook URL must be an http or https URL");
+    }
+    // Whitespace decides only whether a secret was given. The key is the value exactly as
+    // configured: trimming it would make the server sign with a different key than the receiver.
+    let Some(secret) = secret.as_deref().filter(|s| !s.trim().is_empty()) else {
+        anyhow::bail!(
+            "Y_SWEET_UPDATE_WEBHOOK_SECRET is required when Y_SWEET_UPDATE_WEBHOOK_URL is set"
+        );
+    };
+
+    let mut config = UpdateWebhookConfig::new(url, secret.to_string());
+    if let Some(batch_ms) = parse_number::<u64>("Y_SWEET_UPDATE_WEBHOOK_BATCH_MS", batch_ms)? {
+        config.batch_window = std::time::Duration::from_millis(batch_ms.max(1));
+    }
+    if let Some(max_bytes) = parse_number::<usize>("Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES", max_bytes)? {
+        config.max_held_bytes = max_bytes;
+    }
+    if let Some(concurrency) =
+        parse_number::<usize>("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY", concurrency)?
+    {
+        let max = y_sweet::update_webhook::MAX_CONCURRENT_DELIVERIES;
+        if !(1..=max).contains(&concurrency) {
+            anyhow::bail!("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY must be between 1 and {max}");
+        }
+        config.max_concurrent_deliveries = concurrency;
+    }
+    config.ca_file = non_empty(ca_file).map(PathBuf::from);
+    Ok(Some(config))
+}
+
+/// Resolves when the process is asked to stop: on `SIGINT` (Ctrl+C) or, on Unix, `SIGTERM`
+/// (what `docker stop` and ECS send). Returns the signal's name.
+///
+/// The handlers are installed when this is called, not when the future is first polled, so a
+/// signal that arrives between the two is not missed (and does not kill the process outright).
+fn shutdown_signal() -> impl std::future::Future<Output = &'static str> {
+    #[cfg(unix)]
+    let mut handlers = {
+        use tokio::signal::unix::{signal, SignalKind};
+        let install = |kind: SignalKind, name: &str| {
+            signal(kind)
+                .map_err(|e| tracing::error!("Failed to install {name} handler: {e}"))
+                .ok()
+        };
+        (
+            install(SignalKind::interrupt(), "SIGINT"),
+            install(SignalKind::terminate(), "SIGTERM"),
+        )
+    };
+
+    async move {
+        #[cfg(unix)]
+        {
+            async fn recv(signal: &mut Option<tokio::signal::unix::Signal>) {
+                match signal {
+                    Some(signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                _ = recv(&mut handlers.0) => "SIGINT",
+                _ = recv(&mut handlers.1) => "SIGTERM",
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C signal handler");
+            "SIGINT"
+        }
+    }
+}
+
+/// The webhook configuration to run with: none if it could not be built. The error is logged
+/// once; it never contains the URL or the secret (see [update_webhook_config_from_opts]).
+fn update_webhook_or_disabled(
+    config: Result<Option<UpdateWebhookConfig>>,
+) -> Option<UpdateWebhookConfig> {
+    match config {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "update webhook configuration is invalid; starting with the update webhook DISABLED"
+            );
+            None
+        }
+    }
+}
+
 fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
     if store_path.starts_with("s3://") {
         let url = url::Url::parse(store_path)?;
@@ -152,15 +405,26 @@ fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
         let bucket_prefix = url.path().trim_start_matches('/').to_owned();
         let bucket_prefix = (!bucket_prefix.is_empty()).then_some(bucket_prefix); // "" => None
         let config = parse_s3_config_from_env_and_args(bucket, bucket_prefix)?;
-        let store = S3Store::new(config);
+        let store = S3Store::new(config).with_request_timeout(s3_request_timeout_from_env());
         Ok(Box::new(store))
     } else {
         Ok(Box::new(FileSystemStore::new(PathBuf::from(store_path))?))
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // Dropping the runtime would wait for blocking work that is still running, with no limit:
+    // a compaction of a large doc that outlived the shutdown budget, say. Everything that
+    // could be saved within the budget has been; do not let that hold the exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
+
+async fn run() -> Result<()> {
     let opts = Opts::parse();
 
     let filter = EnvFilter::builder()
@@ -182,48 +446,134 @@ async fn main() -> Result<()> {
             prod,
             max_body_size,
             skip_gc,
+            shutdown_timeout_seconds,
+            attributed_tokens,
+            update_webhook_url,
+            update_webhook_secret,
+            update_webhook_batch_ms,
+            update_webhook_max_bytes,
+            update_webhook_concurrency,
+            update_webhook_ca_file,
         } => {
-            let auth = if let Some(auth) = auth {
-                Some(Authenticator::new(auth)?)
-            } else {
-                tracing::warn!("No auth key set. Only use this for local development!");
-                None
+            // Before anything else, so a stop request during startup is not lost either. Once
+            // installed, the handlers replace the default "terminate the process", so the
+            // startup below races them: a signal while the store is initialising (an S3 endpoint
+            // that never answers, say) abandons startup instead of being held until it is done.
+            let mut shutdown = Box::pin(shutdown_signal());
+
+            let shutdown_timeout = shutdown_timeout_from_opt(shutdown_timeout_seconds);
+
+            let startup = async {
+                // The webhook is an optional feature and this server is the only copy of the
+                // sync service: a mistake in the webhook's settings disables the webhook, with
+                // an error in the log, rather than keeping the server from starting.
+                let update_webhook = update_webhook_or_disabled(update_webhook_config_from_opts(
+                    update_webhook_url,
+                    update_webhook_secret,
+                    update_webhook_batch_ms,
+                    update_webhook_max_bytes,
+                    update_webhook_concurrency,
+                    update_webhook_ca_file,
+                ));
+
+                let auth = if let Some(auth) = auth {
+                    Some(Authenticator::new(auth)?)
+                } else {
+                    tracing::warn!("No auth key set. Only use this for local development!");
+                    None
+                };
+                let server_has_no_auth = auth.is_none();
+
+                let addr = SocketAddr::new(
+                    host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                    *port,
+                );
+
+                let listener = TcpListener::bind(addr).await?;
+                let addr = listener.local_addr()?;
+
+                let store = if let Some(store) = store {
+                    let store = get_store_from_opts(store)?;
+                    store.init().await?;
+                    Some(store)
+                } else {
+                    tracing::warn!("No store set. Documents will be stored in memory only.");
+                    None
+                };
+
+                if !prod {
+                    print_server_url(auth.as_ref(), url_prefix.as_ref(), addr);
+                }
+
+                let token = CancellationToken::new();
+
+                let server = y_sweet::server::Server::new(
+                    store,
+                    std::time::Duration::from_secs(*checkpoint_freq_seconds),
+                    auth,
+                    url_prefix.clone(),
+                    token.clone(),
+                    true,
+                    *max_body_size,
+                    *skip_gc,
+                )
+                .await?
+                .with_shutdown_budgets(y_sweet::server::ShutdownBudgets::with_total(
+                    shutdown_timeout,
+                ))
+                .with_attributed_tokens(*attributed_tokens);
+                let mut server = server;
+                // Set up here, before the configuration line below, so that the line reports
+                // what is actually running. Fails on an unreadable or empty CA file, for one.
+                let update_webhook = update_webhook.and_then(|config| {
+                    update_webhook_or_disabled(
+                        server
+                            .enable_update_webhook(config.clone())
+                            .map(|()| Some(config)),
+                    )
+                });
+
+                // One line that says what this process will do about attribution. The host only:
+                // the rest of the URL and the secret are never logged.
+                tracing::info!(
+                    attributed_tokens = *attributed_tokens,
+                    shutdown_timeout_seconds = shutdown_timeout.as_secs(),
+                    update_webhook_enabled = update_webhook.is_some(),
+                    update_webhook_host = update_webhook
+                        .as_ref()
+                        .and_then(|config| config.url.host_str()),
+                    update_webhook_batch_ms = update_webhook
+                        .as_ref()
+                        .map(|config| config.batch_window.as_millis() as u64),
+                    update_webhook_max_bytes = update_webhook
+                        .as_ref()
+                        .map(|config| config.max_held_bytes as u64),
+                    update_webhook_concurrency = update_webhook
+                        .as_ref()
+                        .map(|config| config.max_concurrent_deliveries as u64),
+                    update_webhook_ca_file = update_webhook
+                        .as_ref()
+                        .map(|config| config.ca_file.is_some()),
+                    "attributed updates configuration"
+                );
+                if *attributed_tokens && server_has_no_auth {
+                    tracing::warn!(
+                    "Attributed tokens are enabled but no auth key is set, so no tokens are minted and every update is unattributed."
+                );
+                }
+
+                Ok::<_, anyhow::Error>((server, listener, addr, token))
             };
 
-            let addr = SocketAddr::new(
-                host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-                *port,
-            );
-
-            let listener = TcpListener::bind(addr).await?;
-            let addr = listener.local_addr()?;
-
-            let store = if let Some(store) = store {
-                let store = get_store_from_opts(store)?;
-                store.init().await?;
-                Some(store)
-            } else {
-                tracing::warn!("No store set. Documents will be stored in memory only.");
-                None
+            let (server, listener, addr, token) = tokio::select! {
+                started = startup => started?,
+                signal = &mut shutdown => {
+                    // Nothing is serving yet: no doc is loaded and no update was accepted, so
+                    // there is nothing to persist or flush.
+                    tracing::info!(signal, "Received {signal} during startup, exiting.");
+                    return Ok(());
+                }
             };
-
-            if !prod {
-                print_server_url(auth.as_ref(), url_prefix.as_ref(), addr);
-            }
-
-            let token = CancellationToken::new();
-
-            let server = y_sweet::server::Server::new(
-                store,
-                std::time::Duration::from_secs(*checkpoint_freq_seconds),
-                auth,
-                url_prefix.clone(),
-                token.clone(),
-                true,
-                *max_body_size,
-                *skip_gc,
-            )
-            .await?;
 
             let prod = *prod;
             let handle = tokio::spawn(async move {
@@ -232,11 +582,11 @@ async fn main() -> Result<()> {
 
             tracing::info!("Listening on ws://{}", addr);
 
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install CTRL+C signal handler");
+            let signal = shutdown.await;
 
-            tracing::info!("Shutting down.");
+            // Cancelling stops the listener and every doc worker; `serve` returns once docs are
+            // persisted and the update webhook has made its final flush.
+            tracing::info!(signal, "Shutting down.");
             token.cancel();
 
             handle.await?;
@@ -300,7 +650,8 @@ async fn main() -> Result<()> {
                 };
 
                 let s3_config = parse_s3_config_from_env_and_args(bucket, prefix)?;
-                let store = S3Store::new(s3_config);
+                let store =
+                    S3Store::new(s3_config).with_request_timeout(s3_request_timeout_from_env());
                 let store: Box<dyn Store> = Box::new(store);
                 store.init().await?;
                 Some(store)
@@ -345,26 +696,8 @@ async fn main() -> Result<()> {
 
             tracing::info!("Listening on http://{}", addr);
 
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Received Ctrl+C, shutting down.");
-                },
-                _ = async {
-                    #[cfg(unix)]
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                        Ok(mut signal) => signal.recv().await,
-                        Err(e) => {
-                            tracing::error!("Failed to install SIGTERM handler: {}", e);
-                            std::future::pending::<Option<()>>().await
-                        }
-                    }
-
-                    #[cfg(not(unix))]
-                    std::future::pending::<Option<()>>().await
-                } => {
-                    tracing::info!("Received SIGTERM, shutting down.");
-                }
-            }
+            let signal = shutdown_signal().await;
+            tracing::info!(signal, "Received {signal}, shutting down.");
 
             cancellation_token.cancel();
             tracing::info!("Server shut down.");
@@ -372,4 +705,339 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opt(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn switch_parsing() {
+        for on in ["true", "TRUE", "1", "yes", "on", " true "] {
+            assert_eq!(parse_switch(on), Ok(true), "{on}");
+        }
+        for off in ["", "false", "False", "0", "no", "off"] {
+            assert_eq!(parse_switch(off), Ok(false), "{off}");
+        }
+        assert!(parse_switch("maybe").is_err());
+    }
+
+    #[test]
+    fn switch_treats_blank_as_off() {
+        for blank in ["", " ", "\t", " \n"] {
+            assert_eq!(parse_switch(blank), Ok(false), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn shutdown_timeout_parsing() {
+        let default = y_sweet::server::DEFAULT_SHUTDOWN_TIMEOUT;
+        let seconds = std::time::Duration::from_secs;
+        assert_eq!(default, seconds(110));
+        assert_eq!(shutdown_timeout_from_opt(&None), default);
+        // Passed through empty: unset.
+        for blank in ["", " ", "\t\n"] {
+            assert_eq!(shutdown_timeout_from_opt(&opt(blank)), default, "{blank:?}");
+        }
+        assert_eq!(shutdown_timeout_from_opt(&opt("25")), seconds(25));
+        assert_eq!(shutdown_timeout_from_opt(&opt(" 25\n")), seconds(25));
+        // Not a number: the default, not a refusal to start.
+        for invalid in ["soon", "-1", "1.5", "30s", "18446744073709551616"] {
+            assert_eq!(
+                shutdown_timeout_from_opt(&opt(invalid)),
+                default,
+                "{invalid}"
+            );
+        }
+        // Kept within bounds, so no deadline computed from it can overflow.
+        assert_eq!(shutdown_timeout_from_opt(&opt("0")), seconds(1));
+        assert_eq!(
+            shutdown_timeout_from_opt(&opt("18446744073709551615")),
+            seconds(MAX_TIMEOUT_SECONDS)
+        );
+    }
+
+    #[test]
+    fn s3_request_timeout_parsing() {
+        let default = y_sweet_core::store::s3::DEFAULT_REQUEST_TIMEOUT;
+        let parsed = |value| seconds_or_default(S3_REQUEST_TIMEOUT, value, default);
+        assert_eq!(default, std::time::Duration::from_secs(60));
+        for unset in [None, Some(""), Some(" ")] {
+            assert_eq!(parsed(unset), default);
+        }
+        assert_eq!(parsed(Some("15")), std::time::Duration::from_secs(15));
+        assert_eq!(parsed(Some("fast")), default);
+        assert_eq!(parsed(Some("0")), std::time::Duration::from_secs(1));
+    }
+
+    /// Every setting this fork adds, given as an empty or blank flag value (which is what clap
+    /// makes of an empty environment variable), parses and means "unset".
+    #[test]
+    fn blank_values_of_the_new_settings_parse_as_unset() {
+        for blank in ["", " "] {
+            let args: Vec<String> = [
+                "--shutdown-timeout-seconds",
+                "--attributed-tokens",
+                "--update-webhook-url",
+                "--update-webhook-secret",
+                "--update-webhook-batch-ms",
+                "--update-webhook-max-bytes",
+                "--update-webhook-concurrency",
+                "--update-webhook-ca-file",
+            ]
+            .iter()
+            .map(|flag| format!("{flag}={blank}"))
+            .collect();
+            let opts = Opts::try_parse_from(
+                ["y-sweet", "serve"]
+                    .into_iter()
+                    .chain(args.iter().map(String::as_str)),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            let ServSubcommand::Serve {
+                shutdown_timeout_seconds,
+                attributed_tokens,
+                update_webhook_url,
+                update_webhook_secret,
+                update_webhook_batch_ms,
+                update_webhook_max_bytes,
+                update_webhook_concurrency,
+                update_webhook_ca_file,
+                ..
+            } = opts.subcmd
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                shutdown_timeout_from_opt(&shutdown_timeout_seconds),
+                y_sweet::server::DEFAULT_SHUTDOWN_TIMEOUT
+            );
+            assert!(!attributed_tokens);
+            assert!(update_webhook_config_from_opts(
+                &update_webhook_url,
+                &update_webhook_secret,
+                &update_webhook_batch_ms,
+                &update_webhook_max_bytes,
+                &update_webhook_concurrency,
+                &update_webhook_ca_file,
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
+
+    /// `(attributed_tokens, store)` as parsed from `y-sweet serve <args>`.
+    fn parse_serve(args: &[&str]) -> Result<(bool, Option<String>), String> {
+        let opts = Opts::try_parse_from([&["y-sweet", "serve"], args].concat())
+            .map_err(|e| e.to_string())?;
+        match opts.subcmd {
+            ServSubcommand::Serve {
+                attributed_tokens,
+                store,
+                ..
+            } => Ok((attributed_tokens, store)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn attributed_tokens_flag() {
+        // The environment variable is not set under `cargo test`, so these see only the flag.
+        let parsed = |args: &[&str]| parse_serve(args).unwrap();
+        let data = Some("/data".to_string());
+        assert_eq!(parsed(&[]), (false, None));
+        assert_eq!(parsed(&["--attributed-tokens"]), (true, None));
+        assert_eq!(parsed(&["--attributed-tokens=true"]), (true, None));
+        assert_eq!(parsed(&["--attributed-tokens=false"]), (false, None));
+
+        // With a space, the value is the switch's, never the store.
+        assert_eq!(parsed(&["--attributed-tokens", "false"]), (false, None));
+        assert_eq!(parsed(&["--attributed-tokens", "true"]), (true, None));
+        assert_eq!(
+            parsed(&["--attributed-tokens", "false", "/data"]),
+            (false, data.clone())
+        );
+        assert_eq!(
+            parsed(&["/data", "--attributed-tokens"]),
+            (true, data.clone())
+        );
+        assert_eq!(
+            parsed(&["--attributed-tokens=true", "/data"]),
+            (true, data.clone())
+        );
+
+        // A store path right after a bare flag is an error that says what to write instead,
+        // not a silent "on".
+        let error = parse_serve(&["--attributed-tokens", "/data"]).unwrap_err();
+        assert!(error.contains("--attributed-tokens=true"), "{error}");
+    }
+
+    #[test]
+    fn webhook_is_off_without_a_url() {
+        assert!(
+            update_webhook_config_from_opts(&None, &None, &None, &None, &None, &None)
+                .unwrap()
+                .is_none()
+        );
+        // Variables passed through empty count as unset.
+        assert!(update_webhook_config_from_opts(
+            &opt(""),
+            &opt(""),
+            &opt(""),
+            &opt(""),
+            &opt(""),
+            &opt("")
+        )
+        .unwrap()
+        .is_none());
+        // A secret alone does not enable anything.
+        assert!(
+            update_webhook_config_from_opts(&None, &opt("secret"), &None, &None, &None, &None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn webhook_defaults_and_overrides() {
+        let url = opt("https://app.example.com/api/internal/y-sweet/updates");
+        let config =
+            update_webhook_config_from_opts(&url, &opt("secret"), &None, &opt(""), &None, &None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(config.url.host_str(), Some("app.example.com"));
+        assert_eq!(config.secret, "secret");
+        assert_eq!(config.batch_window, std::time::Duration::from_millis(1000));
+        assert_eq!(config.max_held_bytes, 268_435_456);
+        assert_eq!(config.max_concurrent_deliveries, 16);
+        assert_eq!(config.ca_file, None);
+
+        let config = update_webhook_config_from_opts(
+            &url,
+            &opt("secret"),
+            &opt("250"),
+            &opt("1048576"),
+            &opt("4"),
+            &opt("/etc/ssl/private-ca.pem"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.batch_window, std::time::Duration::from_millis(250));
+        assert_eq!(config.max_held_bytes, 1_048_576);
+        assert_eq!(config.max_concurrent_deliveries, 4);
+        assert_eq!(
+            config.ca_file,
+            Some(PathBuf::from("/etc/ssl/private-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn webhook_secret_is_used_exactly_as_given() {
+        let url = opt("https://app.example.com/hook");
+        for secret in [" padded ", "trailing-newline\n", "\tin ner "] {
+            let config =
+                update_webhook_config_from_opts(&url, &opt(secret), &None, &None, &None, &None)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(config.secret, secret);
+            // And that exact value is the HMAC key.
+            assert_eq!(
+                y_sweet::update_webhook::sign(config.secret.as_bytes(), 1, b"{}"),
+                y_sweet::update_webhook::sign(secret.as_bytes(), 1, b"{}"),
+            );
+            assert_ne!(
+                y_sweet::update_webhook::sign(config.secret.as_bytes(), 1, b"{}"),
+                y_sweet::update_webhook::sign(secret.trim().as_bytes(), 1, b"{}"),
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_misconfiguration_disables_the_webhook_instead_of_failing() {
+        let url = opt("https://app.example.com/hook");
+        for (url, secret, batch_ms, max_bytes, concurrency) in [
+            (opt("not a url"), opt("s"), None, None, None),
+            (opt("ftp://example.com/x"), opt("s"), None, None, None),
+            (url.clone(), None, None, None, None),
+            (url.clone(), opt("s"), opt("soon"), None, None),
+            (url.clone(), opt("s"), None, opt("-1"), None),
+            (url.clone(), opt("s"), None, None, opt("0")),
+            (
+                url.clone(),
+                opt("s"),
+                None,
+                None,
+                opt("18446744073709551615"),
+            ),
+        ] {
+            let config = update_webhook_or_disabled(update_webhook_config_from_opts(
+                &url,
+                &secret,
+                &batch_ms,
+                &max_bytes,
+                &concurrency,
+                &None,
+            ));
+            assert!(config.is_none());
+        }
+        // A good configuration passes through.
+        let config = update_webhook_or_disabled(update_webhook_config_from_opts(
+            &url,
+            &opt("s"),
+            &None,
+            &None,
+            &None,
+            &None,
+        ));
+        assert!(config.is_some());
+    }
+
+    #[test]
+    fn webhook_misconfiguration_is_reported() {
+        let url = opt("https://app.example.com/hook");
+        fn error(
+            url: &Option<String>,
+            secret: &Option<String>,
+            batch_ms: &Option<String>,
+            max_bytes: &Option<String>,
+        ) -> String {
+            update_webhook_config_from_opts(url, secret, batch_ms, max_bytes, &None, &None)
+                .err()
+                .expect("expected an error")
+                .to_string()
+        }
+
+        assert!(error(&url, &None, &None, &None).contains("SECRET is required"));
+        assert!(error(&url, &opt(" "), &None, &None).contains("SECRET is required"));
+        assert!(error(&url, &opt("s"), &opt("soon"), &None).contains("BATCH_MS"));
+        assert!(error(&url, &opt("s"), &None, &opt("-1")).contains("MAX_BYTES"));
+        assert!(error(&opt("ftp://example.com/x"), &opt("s"), &None, &None).contains("http"));
+        for concurrency in ["0", "-1", "many", "1025", "18446744073709551615"] {
+            let message = update_webhook_config_from_opts(
+                &url,
+                &opt("s"),
+                &None,
+                &None,
+                &opt(concurrency),
+                &None,
+            )
+            .err()
+            .expect("expected an error")
+            .to_string();
+            assert!(message.contains("CONCURRENCY"), "{message}");
+        }
+
+        // The message does not repeat the URL, which may carry credentials.
+        let message = error(
+            &opt("https://user:hunter2@exa mple.com"),
+            &opt("s"),
+            &None,
+            &None,
+        );
+        assert!(!message.contains("hunter2"), "{message}");
+    }
 }
