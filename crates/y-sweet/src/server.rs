@@ -15,7 +15,10 @@ use axum::{
     Json, Router,
 };
 use axum_extra::typed_header::TypedHeader;
-use dashmap::{mapref::one::MappedRef, DashMap};
+use dashmap::{
+    mapref::{entry::Entry, one::MappedRef},
+    DashMap,
+};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -26,6 +29,7 @@ use std::{
 use tokio::{
     net::TcpListener,
     sync::mpsc::{channel, Receiver},
+    task::JoinHandle,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{span, Instrument, Level};
@@ -80,8 +84,58 @@ impl std::fmt::Display for AppError {
     }
 }
 
+/// A request's or an unload's place in a document's lock. The lock table has an entry for a
+/// document only while someone holds or waits on its lock; dropping this releases the lock and
+/// removes the entry if nobody else holds or waits on it.
+struct DocLock {
+    doc_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    doc_id: String,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl DocLock {
+    fn new(doc_locks: &Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>, doc_id: &str) -> Self {
+        let lock = doc_locks.entry(doc_id.to_string()).or_default().clone();
+        Self {
+            doc_locks: doc_locks.clone(),
+            doc_id: doc_id.to_string(),
+            lock: Some(lock),
+            guard: None,
+        }
+    }
+
+    /// Waits for the lock. No table guard is held meanwhile, only this `DocLock`'s own clone.
+    async fn lock(&mut self) {
+        if let Some(lock) = &self.lock {
+            self.guard = Some(lock.clone().lock_owned().await);
+        }
+    }
+}
+
+impl Drop for DocLock {
+    fn drop(&mut self) {
+        self.guard = None;
+        // Everyone drops their clone while holding the table entry, so whoever leaves last sees
+        // only the table's clone and its own, and removes the entry.
+        let lock = self.lock.take();
+        if let Entry::Occupied(entry) = self.doc_locks.entry(self.doc_id.clone()) {
+            let last = Arc::strong_count(entry.get()) == 2;
+            drop(lock);
+            if last {
+                entry.remove();
+            }
+        }
+    }
+}
+
 pub struct Server {
     docs: Arc<DashMap<String, DocWithSyncKv>>,
+    /// One lock per document id, held while that document is loaded into memory or unloaded
+    /// from it, so that a document never has two copies in memory at once.
+    doc_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// How long a request waits for another load or unload of the same document before it fails.
+    doc_lock_wait: Duration,
     doc_worker_tracker: TaskTracker,
     store: Option<Arc<Box<dyn Store>>>,
     checkpoint_freq: Duration,
@@ -111,6 +165,8 @@ impl Server {
             docs: Arc::new(DashMap::new()),
             doc_worker_tracker: TaskTracker::new(),
             store: store.map(Arc::new),
+            doc_locks: Arc::new(DashMap::new()),
+            doc_lock_wait: Duration::from_secs(30),
             checkpoint_freq,
             authenticator,
             url_prefix,
@@ -142,6 +198,11 @@ impl Server {
         Ok(doc_id)
     }
 
+    /// Loads a document from the store into memory and starts its save and unload tasks.
+    ///
+    /// The caller makes sure no other copy of `doc_id` can be loaded at the same time:
+    /// `get_or_create_doc` calls this under the document's lock, and `create_doc` and the
+    /// single-document start call it for an id that no request can know yet.
     pub async fn load_doc(&self, doc_id: &str) -> Result<()> {
         let (send, recv) = channel(1024);
 
@@ -168,7 +229,7 @@ impl Server {
             let cancellation_token = self.cancellation_token.clone();
 
             // Spawn a task to save the document to the store when it changes.
-            self.doc_worker_tracker.spawn(
+            let save_loop = self.doc_worker_tracker.spawn(
                 Self::doc_persistence_worker(
                     recv,
                     sync_kv,
@@ -183,8 +244,10 @@ impl Server {
                 self.doc_worker_tracker.spawn(
                     Self::doc_gc_worker(
                         self.docs.clone(),
+                        self.doc_locks.clone(),
                         doc_id.clone(),
                         checkpoint_freq,
+                        save_loop,
                         cancellation_token,
                     )
                     .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
@@ -198,8 +261,10 @@ impl Server {
 
     async fn doc_gc_worker(
         docs: Arc<DashMap<String, DocWithSyncKv>>,
+        doc_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
         doc_id: String,
         checkpoint_freq: Duration,
+        mut save_loop: JoinHandle<()>,
         cancellation_token: CancellationToken,
     ) {
         let mut checkpoints_without_refs = 0;
@@ -221,12 +286,30 @@ impl Server {
                     }
 
                     if checkpoints_without_refs >= 2 {
-                        tracing::info!("GCing doc");
-                        if let Some(doc) = docs.get(&doc_id) {
-                            doc.sync_kv().shutdown();
-                        }
+                        // Under the document's lock, no request can load a second copy while
+                        // this one leaves memory and writes its last save.
+                        let mut lock = DocLock::new(&doc_locks, &doc_id);
+                        lock.lock().await;
 
-                        docs.remove(&doc_id);
+                        // Checked again as part of the removal: a request takes its handle under
+                        // the table's read lock, so it either holds the doc now (and the doc
+                        // stays) or finds it gone and loads it again after this unload.
+                        let Some((_, doc)) = docs.remove_if(&doc_id, |_, doc| {
+                            let awareness = Arc::downgrade(&doc.awareness());
+                            awareness.strong_count() <= 1
+                        }) else {
+                            checkpoints_without_refs = 0;
+                            tracing::info!("doc was opened again before unloading, keeping it");
+                            continue;
+                        };
+
+                        tracing::info!("GCing doc");
+                        doc.sync_kv().shutdown();
+                        drop(doc);
+                        // A new copy reads the store, so it must not load before this last save.
+                        if let Err(e) = (&mut save_loop).await {
+                            tracing::error!(?e, "Save loop failed while unloading.");
+                        }
                         break;
                     }
                 }
@@ -248,13 +331,16 @@ impl Server {
         let mut last_save = std::time::Instant::now();
 
         loop {
-            let is_done = tokio::select! {
+            let mut is_done = tokio::select! {
                 v = recv.recv() => v.is_none(),
                 _ = cancellation_token.cancelled() => true,
                 _ = tokio::time::sleep(checkpoint_freq) => {
                     sync_kv.is_shutdown()
                 }
             };
+            // An unloaded doc gets its last save right away, with no throttle wait: a new copy of
+            // the doc waits for that save before it reads the store.
+            is_done |= sync_kv.is_shutdown();
 
             tracing::info!("Received signal. done: {}", is_done);
             let now = std::time::Instant::now();
@@ -271,6 +357,10 @@ impl Server {
                         v = recv.recv() => {
                             tracing::info!("Received dirty while throttling.");
                             if v.is_none() {
+                                break;
+                            }
+                            if sync_kv.is_shutdown() {
+                                is_done = true;
                                 break;
                             }
                         }
@@ -309,6 +399,28 @@ impl Server {
         &self,
         doc_id: &str,
     ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
+        if let Some(doc) = self.docs.get(doc_id) {
+            return Ok(doc.map(|d| d));
+        }
+
+        // Not in memory. Load it under the document's lock, so requests that arrive together
+        // load it once and share that copy, and a load waits for an unload of the same doc to
+        // finish its last save.
+        let mut lock = DocLock::new(&self.doc_locks, doc_id);
+        if tokio::time::timeout(self.doc_lock_wait, lock.lock())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                doc_id=?doc_id,
+                wait=?self.doc_lock_wait,
+                "Timed out waiting for a document that is still loading or saving"
+            );
+            return Err(anyhow!(
+                "Timed out after {:?} waiting for this document to finish loading or saving",
+                self.doc_lock_wait
+            ));
+        }
         if !self.docs.contains_key(doc_id) {
             tracing::info!(doc_id=?doc_id, "Loading doc");
             self.load_doc(doc_id).await?;
@@ -915,5 +1027,322 @@ mod test {
         assert_eq!(token.url, expected_url);
         assert_eq!(token.doc_id, doc_id);
         assert!(token.token.is_none());
+    }
+
+    /// In-memory store whose reads and writes can be held back, so a test can fix the order
+    /// in which loads, saves and unloads meet.
+    #[derive(Clone)]
+    struct HeldStore {
+        data: Arc<DashMap<String, Vec<u8>>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        read_gate: Arc<tokio::sync::Semaphore>,
+        write_gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl HeldStore {
+        fn new(reads_open: bool, writes_open: bool) -> Self {
+            let gate = |open: bool| {
+                Arc::new(tokio::sync::Semaphore::new(if open {
+                    tokio::sync::Semaphore::MAX_PERMITS
+                } else {
+                    0
+                }))
+            };
+            Self {
+                data: Default::default(),
+                reads: Default::default(),
+                read_gate: gate(reads_open),
+                write_gate: gate(writes_open),
+            }
+        }
+
+        fn open_reads(&self) {
+            self.read_gate.add_permits(1 << 20);
+        }
+
+        fn open_writes(&self) {
+            self.write_gate.add_permits(1 << 20);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Store for HeldStore {
+        async fn init(&self) -> y_sweet_core::store::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> y_sweet_core::store::Result<Option<Vec<u8>>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _open = self.read_gate.acquire().await.unwrap();
+            let value = self.data.get(key).map(|v| v.clone());
+            Ok(value)
+        }
+
+        async fn set(&self, key: &str, value: Vec<u8>) -> y_sweet_core::store::Result<()> {
+            let _open = self.write_gate.acquire().await.unwrap();
+            self.data.insert(key.to_owned(), value);
+            Ok(())
+        }
+
+        async fn remove(&self, key: &str) -> y_sweet_core::store::Result<()> {
+            self.data.remove(key);
+            Ok(())
+        }
+
+        async fn exists(&self, key: &str) -> y_sweet_core::store::Result<bool> {
+            Ok(self.data.contains_key(key))
+        }
+    }
+
+    async fn server_on(store: &HeldStore, checkpoint_freq: Duration) -> Server {
+        Server::new(
+            Some(Box::new(store.clone())),
+            checkpoint_freq,
+            None,
+            None,
+            CancellationToken::new(),
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Stops the server the way a shutdown does and waits for every document's final save.
+    async fn stop(server: &Server) {
+        server.cancellation_token.cancel();
+        server.doc_worker_tracker.close();
+        server.doc_worker_tracker.wait().await;
+    }
+
+    async fn wait_until(done: impl Fn() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "never {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn push_item(awareness: &Arc<RwLock<Awareness>>, item: &str) {
+        use yrs::{Array, Transact};
+        let guard = awareness.write().unwrap();
+        let list = guard.doc.get_or_insert_array("list");
+        let mut txn = guard.doc.transact_mut();
+        list.push_back(&mut txn, item);
+    }
+
+    fn items(awareness: &Arc<RwLock<Awareness>>) -> Vec<String> {
+        use yrs::{Array, Transact};
+        let guard = awareness.read().unwrap();
+        let list = guard.doc.get_or_insert_array("list");
+        let txn = guard.doc.transact();
+        list.iter(&txn).map(|v| v.to_string(&txn)).collect()
+    }
+
+    async fn saved_items(store: &HeldStore) -> Vec<String> {
+        let server = server_on(store, Duration::from_secs(60)).await;
+        let items = items(&server.get_or_create_doc("doc").await.unwrap().awareness());
+        stop(&server).await;
+        items
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_for_an_unloaded_doc_share_one_copy() {
+        let store = HeldStore::new(false, true);
+        let server = server_on(&store, Duration::from_secs(60)).await;
+
+        let requests =
+            (0..8).map(|_| async { server.get_or_create_doc("doc").await.unwrap().awareness() });
+        let mut requests = Box::pin(futures::future::join_all(requests));
+        // Every request is now waiting, either on the store read or behind the one load.
+        assert!(futures::poll!(&mut requests).is_pending());
+        store.open_reads();
+        let copies = requests.await;
+
+        assert_eq!(
+            store.reads(),
+            1,
+            "the document was read from the store more than once"
+        );
+        assert!(copies.iter().all(|c| Arc::ptr_eq(c, &copies[0])));
+    }
+
+    #[tokio::test]
+    async fn edits_through_concurrent_requests_are_all_saved() {
+        let store = HeldStore::new(false, true);
+        let server = server_on(&store, Duration::from_secs(60)).await;
+
+        let requests =
+            (0..2).map(|_| async { server.get_or_create_doc("doc").await.unwrap().awareness() });
+        let mut requests = Box::pin(futures::future::join_all(requests));
+        assert!(futures::poll!(&mut requests).is_pending());
+        store.open_reads();
+        let copies = requests.await;
+
+        push_item(&copies[0], "first");
+        push_item(&copies[1], "second");
+        stop(&server).await;
+
+        assert_eq!(saved_items(&store).await, vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn reload_during_unload_waits_for_the_last_save() {
+        let store = HeldStore::new(true, false);
+        let server = server_on(&store, Duration::from_millis(20)).await;
+
+        push_item(
+            &server.get_or_create_doc("doc").await.unwrap().awareness(),
+            "before unload",
+        );
+        // The save of that edit is held in the store while the idle doc is unloaded.
+        wait_until(|| !server.docs.contains_key("doc"), "unloaded").await;
+
+        let (reloaded, ()) = tokio::join!(
+            async { server.get_or_create_doc("doc").await.unwrap().awareness() },
+            async {
+                // A reload that does not wait for the last save has read the store by now.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                store.open_writes();
+            }
+        );
+
+        assert_eq!(items(&reloaded), vec!["before unload"]);
+
+        push_item(&reloaded, "after reload");
+        stop(&server).await;
+
+        assert_eq!(
+            saved_items(&store).await,
+            vec!["before unload", "after reload"]
+        );
+    }
+
+    #[tokio::test]
+    async fn doc_in_use_stays_loaded_and_unloads_once_released() {
+        let store = HeldStore::new(true, true);
+        let server = server_on(&store, Duration::from_millis(20)).await;
+
+        let socket = server.get_or_create_doc("doc").await.unwrap().awareness();
+        assert!(
+            server.doc_locks.is_empty(),
+            "lock kept after the load returned"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(server.docs.contains_key("doc"), "a doc in use was unloaded");
+
+        drop(socket);
+        wait_until(|| !server.docs.contains_key("doc"), "unloaded").await;
+        wait_until(|| server.doc_locks.is_empty(), "released the lock").await;
+
+        server.get_or_create_doc("doc").await.unwrap();
+        assert_eq!(store.reads(), 2);
+        stop(&server).await;
+    }
+
+    #[tokio::test]
+    async fn request_dropped_while_loading_leaves_no_lock_behind() {
+        let store = HeldStore::new(false, true);
+        let server = server_on(&store, Duration::from_secs(60)).await;
+
+        {
+            let request = server.get_or_create_doc("doc");
+            tokio::pin!(request);
+            assert!(futures::poll!(&mut request).is_pending());
+            assert_eq!(store.reads(), 1, "the request is not reading the store");
+            // The client goes away while the store read is still running.
+        }
+        assert!(
+            server.doc_locks.is_empty(),
+            "lock kept after the request was dropped"
+        );
+
+        store.open_reads();
+        server.get_or_create_doc("doc").await.unwrap();
+        assert_eq!(store.reads(), 2);
+        stop(&server).await;
+    }
+
+    /// Unloads an idle doc with a 2 s save interval and returns how long a request made right
+    /// after the unload takes to get the doc back. The first save is held until 1 s before the
+    /// unload (the second idle check, 4 s after loading), so the save loop's throttle runs until
+    /// 1 s after it. With `edit_while_throttled`, a second edit 0.2 s after that save puts the
+    /// save loop inside its throttle at the unload; without it, the save loop is idle.
+    async fn reload_time_after_unload(edit_while_throttled: bool) -> Duration {
+        let store = HeldStore::new(true, false);
+        let server = server_on(&store, Duration::from_secs(2)).await;
+        let loaded = tokio::time::Instant::now();
+        push_item(
+            &server.get_or_create_doc("doc").await.unwrap().awareness(),
+            "first",
+        );
+
+        tokio::time::sleep_until(loaded + Duration::from_secs(3)).await;
+        store.open_writes();
+        if edit_while_throttled {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            push_item(
+                &server.get_or_create_doc("doc").await.unwrap().awareness(),
+                "second",
+            );
+        }
+
+        wait_until(|| !server.docs.contains_key("doc"), "unloaded").await;
+        let start = tokio::time::Instant::now();
+        server.get_or_create_doc("doc").await.unwrap();
+        let elapsed = start.elapsed();
+        stop(&server).await;
+        elapsed
+    }
+
+    #[tokio::test]
+    async fn reload_right_after_unload_does_not_wait_for_the_save_interval() {
+        let (idle, throttled) = tokio::join!(
+            reload_time_after_unload(false),
+            reload_time_after_unload(true)
+        );
+        assert!(
+            idle < Duration::from_millis(500),
+            "save loop idle at unload: reload took {idle:?}"
+        );
+        assert!(
+            throttled < Duration::from_millis(500),
+            "save loop throttling at unload: reload took {throttled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_for_doc_with_stuck_last_save_fails_after_the_wait_and_loads_once_saved() {
+        let store = HeldStore::new(true, false);
+        let mut server = server_on(&store, Duration::from_millis(20)).await;
+        server.doc_lock_wait = Duration::from_millis(200);
+
+        push_item(
+            &server.get_or_create_doc("doc").await.unwrap().awareness(),
+            "before unload",
+        );
+        // The save of that edit is stuck in the store while the idle doc is unloaded.
+        wait_until(|| !server.docs.contains_key("doc"), "unloaded").await;
+
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            server.get_or_create_doc("doc").await.is_err()
+        })
+        .await;
+        assert_eq!(failed, Ok(true), "the request did not fail after the wait");
+        assert_eq!(store.reads(), 1, "a copy was loaded before the last save");
+
+        // Other documents load as usual meanwhile.
+        server.get_or_create_doc("other").await.unwrap();
+
+        store.open_writes();
+        wait_until(|| server.doc_locks.is_empty(), "released the lock").await;
+        let reloaded = server.get_or_create_doc("doc").await.unwrap().awareness();
+        assert_eq!(items(&reloaded), vec!["before unload"]);
+        stop(&server).await;
     }
 }
