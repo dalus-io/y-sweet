@@ -1400,21 +1400,50 @@ async fn new_doc(
     Ok(Json(NewDocResponse { doc_id }))
 }
 
+/// The body of an auth request. An empty body asks for the defaults (a full-access token), as
+/// upstream allows. Any other body must be a JSON [AuthDocRequest]; one that is not is refused,
+/// never read as the defaults, which would mint a full-access token for a request that may have
+/// asked for read-only.
+fn parse_auth_request(headers: &HeaderMap, body: &Bytes) -> Result<AuthDocRequest, AppError> {
+    if body.is_empty() {
+        return Ok(AuthDocRequest::default());
+    }
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let essence = value.split(';').next().unwrap_or("").trim();
+            essence.eq_ignore_ascii_case("application/json")
+                || (essence.starts_with("application/") && essence.ends_with("+json"))
+        })
+        .unwrap_or(false);
+    if !is_json {
+        return Err(AppError(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            anyhow!("Expected request with `Content-Type: application/json`"),
+        ));
+    }
+    Json::<AuthDocRequest>::from_bytes(body)
+        .map(|Json(request)| request)
+        .map_err(|rejection| AppError(rejection.status(), anyhow!(rejection.body_text())))
+}
+
 async fn auth_doc(
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
     TypedHeader(host): TypedHeader<headers::Host>,
     State(server_state): State<Arc<Server>>,
     Path(doc_id): Path<String>,
-    body: Option<Json<AuthDocRequest>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<ClientToken>, AppError> {
     server_state.check_auth(auth_header)?;
 
-    let Json(AuthDocRequest {
+    let AuthDocRequest {
         authorization,
         valid_for_seconds,
         user_id,
         writer,
-    }) = body.unwrap_or_default();
+    } = parse_auth_request(&headers, &body)?;
 
     let actor_requested = user_id.is_some() || writer.is_some();
     let (user_id_bytes, writer_bytes) = (
@@ -1556,12 +1585,8 @@ mod test {
             ))),
             State(Arc::new(server_state)),
             Path(doc_id.clone()),
-            Some(Json(AuthDocRequest {
-                authorization: Authorization::Full,
-                user_id: None,
-                writer: None,
-                valid_for_seconds: None,
-            })),
+            json_headers(),
+            Bytes::from_static(br#"{"authorization": "full"}"#),
         )
         .await
         .unwrap();
@@ -1597,7 +1622,8 @@ mod test {
             ))),
             State(Arc::new(server_state)),
             Path(doc_id.clone()),
-            None,
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap();
@@ -1654,7 +1680,8 @@ mod test {
             localhost(),
             State(server.clone()),
             Path(DOC_ID.to_string()),
-            request.map(Json),
+            json_headers(),
+            Bytes::from(json_body(request).to_string()),
         )
         .await;
         match response {
@@ -1667,6 +1694,28 @@ mod test {
                 .unwrap()),
             Err(AppError(status, _)) => Err(status),
         }
+    }
+
+    fn json_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        headers
+    }
+
+    /// `request` as a client sends it; `None` is the empty object.
+    fn json_body(request: Option<AuthDocRequest>) -> Value {
+        let Some(request) = request else {
+            return json!({});
+        };
+        json!({
+            "authorization": request.authorization,
+            "userId": request.user_id,
+            "writer": request.writer,
+            "validForSeconds": request.valid_for_seconds,
+        })
     }
 
     fn request(user_id: Option<&str>, writer: Option<&str>) -> Option<AuthDocRequest> {
@@ -1690,6 +1739,74 @@ mod test {
         assert_eq!(request.writer, None);
         let request: AuthDocRequest = serde_json::from_str("{}").unwrap();
         assert_eq!((request.user_id, request.writer), (None, None));
+    }
+
+    /// Posts `body` to the auth endpoint of a served server. Returns the status, and on `200`
+    /// the authorization the minted token grants.
+    async fn auth_over_http(
+        content_type: Option<&str>,
+        body: &'static str,
+    ) -> (u16, Option<Authorization>) {
+        let (server, verifier) = server_with_auth(true).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(server.serve(listener, false));
+
+        let mut request = reqwest::Client::new()
+            .post(format!("http://{addr}/doc/{DOC_ID}/auth"))
+            .bearer_auth(verifier.server_token())
+            .body(body);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        if status != 200 {
+            return (status, None);
+        }
+        let token: ClientToken = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        let access = verifier
+            .verify_doc_token(&token.token.unwrap(), DOC_ID, current_time_epoch_millis())
+            .unwrap();
+        (status, Some(access.authorization))
+    }
+
+    #[tokio::test]
+    async fn auth_without_a_body_mints_a_full_token() {
+        // What upstream accepts, e.g. `curl -X POST` with no body.
+        assert_eq!(
+            auth_over_http(None, "").await,
+            (200, Some(Authorization::Full))
+        );
+        assert_eq!(
+            auth_over_http(Some("application/json"), "{}").await,
+            (200, Some(Authorization::Full))
+        );
+        assert_eq!(
+            auth_over_http(Some("application/json"), r#"{"authorization": "read-only"}"#).await,
+            (200, Some(Authorization::ReadOnly))
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_with_a_malformed_body_is_refused_not_defaulted_to_full() {
+        // Each asks for read-only; none may come back with a token, least of all a full one.
+        let json = Some("application/json");
+        let cases: [(Option<&str>, &'static str, u16); 6] = [
+            (json, r#"{"authorization": "read-only", "userId": 7}"#, 422),
+            (json, r#"{"authorization": "read-only", "writer": {"kind": "ui"}}"#, 422),
+            (json, r#"{"authorization": "read-only-ish"}"#, 422),
+            (json, r#"{"authorization": "read-only""#, 400),
+            (Some("text/plain"), r#"{"authorization": "read-only"}"#, 415),
+            (None, r#"{"authorization": "read-only"}"#, 415),
+        ];
+        for (content_type, body, status) in cases {
+            assert_eq!(
+                auth_over_http(content_type, body).await,
+                (status, None),
+                "{content_type:?} {body}"
+            );
+        }
     }
 
     #[tokio::test]

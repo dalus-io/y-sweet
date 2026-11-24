@@ -264,6 +264,12 @@ ignored, as upstream does, and the request succeeds with a plain token; the serv
 `auth request actor too long` (warn, with the lengths only, never the values) so that the
 problem shows up before the switch is turned on. The response (`ClientToken`) is unchanged.
 
+A body that is not a valid request is refused, whatever the switch: `415` without
+`Content-Type: application/json`, `400` for JSON that does not parse, `422` for a field of the
+wrong type or an unknown `authorization` (a numeric `userId`, an object as `writer`). Upstream
+read any of these as an empty request and minted a full-access token, even for a request that
+asked for `read-only`. An empty body is still the default request (full access), as upstream.
+
 What gets minted:
 
 | `Y_SWEET_ATTRIBUTED_TOKENS` | Request has `userId` or `writer` | Token |
