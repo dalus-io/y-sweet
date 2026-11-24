@@ -72,19 +72,19 @@ async fn within<T>(
 ///
 /// The error's URL is left out of the message: it is presigned, so it carries a signature.
 #[cfg(not(target_arch = "wasm32"))]
-fn request_error(error: reqwest::Error) -> StoreError {
+fn request_error(error: reqwest::Error, limit: Duration) -> StoreError {
     let never_sent = error.is_connect() || error.is_builder();
     let message = error.without_url().to_string();
     if never_sent {
         StoreError::ConnectionError(message)
     } else {
-        StoreError::Interrupted(message)
+        StoreError::Interrupted { message, limit }
     }
 }
 
 /// On wasm the kinds cannot be told apart, and nothing acts on the difference there.
 #[cfg(target_arch = "wasm32")]
-fn request_error(error: reqwest::Error) -> StoreError {
+fn request_error(error: reqwest::Error, _limit: Duration) -> StoreError {
     StoreError::ConnectionError(error.without_url().to_string())
 }
 
@@ -176,7 +176,7 @@ impl S3Store {
 
         let response = match response {
             Ok(response) => response,
-            Err(e) => return Err(request_error(e)),
+            Err(e) => return Err(request_error(e, limit)),
         };
 
         match response.status() {
@@ -192,9 +192,12 @@ impl S3Store {
             )),
             // The endpoint had the request and failed on its side: whether it applied a
             // write is not something the status settles.
-            status if status.is_server_error() && cfg!(not(target_arch = "wasm32")) => Err(
-                StoreError::Interrupted(format!("Received {status} from S3-compatible API.")),
-            ),
+            status if status.is_server_error() && cfg!(not(target_arch = "wasm32")) => {
+                Err(StoreError::Interrupted {
+                    message: format!("Received {status} from S3-compatible API."),
+                    limit,
+                })
+            }
             _ => Err(StoreError::ConnectionError(format!(
                 "Received {} from S3-compatible API.",
                 response.status()
@@ -210,7 +213,7 @@ impl S3Store {
         loop {
             let chunk = within(self.request_timeout, "reading from", response.chunk())
                 .await?
-                .map_err(request_error)?;
+                .map_err(|error| request_error(error, self.request_timeout))?;
             match chunk {
                 Some(chunk) if body.is_empty() => body = Vec::from(chunk),
                 Some(chunk) => body.extend_from_slice(&chunk),
@@ -558,18 +561,23 @@ mod tests {
             watched(store(url, timeout).set("doc/data.ysweet", vec![7; 4096])).await
         };
 
+        // What the write was given, as for a timeout: the store may sit on an interrupted
+        // write as long as on one it never answered, so the suspect window scales with it.
+        let given = write_timeout(timeout, 4096);
+
         // The endpoint took the whole request and dropped the connection: it may apply it.
         let (url, _) = endpoint(Behaviour::HangUp);
         let error = write(url).await.unwrap_err();
-        assert!(matches!(error, StoreError::Interrupted(_)), "{error:?}");
-        assert_eq!(error.write_may_still_land(), Some(Duration::ZERO));
+        assert!(matches!(error, StoreError::Interrupted { .. }), "{error:?}");
+        assert_eq!(error.write_may_still_land(), Some(given));
         // The message does not carry the presigned URL.
         assert!(!error.to_string().contains("X-Amz"), "{error}");
 
         // It failed on its side.
         let (url, _) = endpoint(Behaviour::Status(503));
         let error = write(url).await.unwrap_err();
-        assert!(matches!(error, StoreError::Interrupted(_)), "{error:?}");
+        assert!(matches!(error, StoreError::Interrupted { .. }), "{error:?}");
+        assert_eq!(error.write_may_still_land(), Some(given));
 
         // It refused the request: nothing was applied.
         let (url, _) = endpoint(Behaviour::Status(403));

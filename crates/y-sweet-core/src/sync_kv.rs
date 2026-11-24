@@ -730,7 +730,10 @@ pub(crate) mod test {
 
             // A timeout does, and so does a connection lost after the request went out.
             *store.fail_next_set_with.lock().unwrap() = Some(if interrupted {
-                StoreError::Interrupted("reset".to_string())
+                StoreError::Interrupted {
+                    message: "reset".to_string(),
+                    limit: Duration::from_millis(1),
+                }
             } else {
                 StoreError::Timeout {
                     limit: Duration::from_millis(1),
@@ -786,23 +789,34 @@ pub(crate) mod test {
 
     #[tokio::test]
     async fn the_suspect_window_is_several_times_the_timeout_that_started_it() {
-        let store = HeldStore::new();
-        store.set_release.add_permits(100);
-        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
-            .await
-            .unwrap();
-        sync_kv.set_suspect_window(Duration::ZERO, Duration::ZERO);
-        sync_kv.set(b"a", b"1");
-
+        // The same for a save that timed out and one cut off sooner (reset, `5xx`): both may
+        // be held by the store for as long as the request was given.
         let limit = Duration::from_secs(600);
-        *store.fail_next_set_with.lock().unwrap() = Some(StoreError::Timeout {
-            limit,
-            what: "waiting for",
-        });
-        assert!(sync_kv.persist().await.is_err());
-        let until = sync_kv.suspect.lock().unwrap().as_ref().unwrap().until;
-        let window = until - Instant::now();
-        assert!(window > limit * (SUSPECT_WINDOW_TIMEOUTS - 1) && window <= limit * 5);
+        let failures = [
+            StoreError::Timeout {
+                limit,
+                what: "waiting for",
+            },
+            StoreError::Interrupted {
+                message: "reset".to_string(),
+                limit,
+            },
+        ];
+        for failure in failures {
+            let store = HeldStore::new();
+            store.set_release.add_permits(100);
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+                .await
+                .unwrap();
+            sync_kv.set_suspect_window(Duration::ZERO, Duration::ZERO);
+            sync_kv.set(b"a", b"1");
+
+            *store.fail_next_set_with.lock().unwrap() = Some(failure);
+            assert!(sync_kv.persist().await.is_err());
+            let until = sync_kv.suspect.lock().unwrap().as_ref().unwrap().until;
+            let window = until - Instant::now();
+            assert!(window > limit * (SUSPECT_WINDOW_TIMEOUTS - 1) && window <= limit * 5);
+        }
         assert!(DEFAULT_SUSPECT_WINDOW >= crate::store::s3::DEFAULT_REQUEST_TIMEOUT * 5);
     }
 

@@ -16,8 +16,13 @@ pub enum StoreError {
     /// The request failed after it may have been sent in full: the connection broke, or the
     /// endpoint answered with a server error. Like [StoreError::Timeout], and unlike the
     /// errors above, this leaves the outcome of a write unknown.
-    #[error("The request to the store was interrupted. {0}")]
-    Interrupted(String),
+    #[error("The request to the store was interrupted. {message}")]
+    Interrupted {
+        message: String,
+        /// How long the request was given, as for [StoreError::Timeout]. It failed sooner, but
+        /// the store may hold the write as long as one it never answered.
+        limit: std::time::Duration,
+    },
     /// The store gave up waiting on a request after `limit`. This leaves the outcome of a
     /// write unknown: the endpoint may have received all of it and may still apply it,
     /// later (see `SyncKv::persist`).
@@ -36,8 +41,9 @@ impl StoreError {
     /// never left (no connection), or the endpoint refused it.
     pub fn write_may_still_land(&self) -> Option<std::time::Duration> {
         match self {
-            StoreError::Timeout { limit, .. } => Some(*limit),
-            StoreError::Interrupted(_) => Some(std::time::Duration::ZERO),
+            StoreError::Timeout { limit, .. } | StoreError::Interrupted { limit, .. } => {
+                Some(*limit)
+            }
             StoreError::BucketDoesNotExist(_)
             | StoreError::DoesNotExist(_)
             | StoreError::NotAuthorized(_)

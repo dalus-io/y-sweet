@@ -450,8 +450,11 @@ connection is reset after the body went out, or that the store answers with a `5
 this that works on AWS S3, MinIO and LocalStack alike (conditional writes are not uniformly supported), so
 it is mitigated by saving again.
 
-The store sorts its failures (`StoreError::write_may_still_land`). `Timeout` (with the time the request
-was given) and `Interrupted` may have left a write behind. `ConnectionError` and the refusals cannot have:
+The store sorts its failures (`StoreError::write_may_still_land`). `Timeout` and `Interrupted` may have
+left a write behind; both carry the time the request was given. An interrupted request failed sooner than
+that, but how long the store may sit on a body it received does not depend on how our side of the
+connection ended, so the window is sized the same way (it used to count an interruption as zero, which
+left a large doc or a raised request timeout with only the 5 min floor). `ConnectionError` and the refusals cannot have:
 reqwest reports failures of the connect phase and of building the request as such (`is_connect`,
 `is_builder`), and a request that never got a connection sent no body; everything else reqwest reports is
 treated as possibly sent. `SyncKv::persist` marks the doc suspect on the first kind, until

@@ -165,8 +165,9 @@ connection could not be made (refused, DNS, TLS, the connect timeout), or the st
 request (`401`, `403`, `404`). After a failure that counts, the doc is *suspect* for a window:
 
 - The window is 5 minutes from the failure, or 5 times the time that request was given if
-  that is longer (a higher `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS`, or a large doc). Another
-  such failure inside the window extends it.
+  that is longer (a higher `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS`, or a large doc). This holds
+  for a reset or a `5xx` as for a timeout: the request failed sooner, but the store may hold
+  it as long. Another such failure inside the window extends it.
 - A successful save of a suspect doc does not count as having saved it. The doc is saved
   again **every 60 s** during the window although nothing in it changed, so a stale write
   that lands is overwritten with the current state within a minute. A doc that does change
