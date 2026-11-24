@@ -434,6 +434,26 @@ is taken as it. And a build that knows only the single object, running at the sa
 this one, can still overwrite that object with an older state that it alone will read; two
 servers on one store are forbidden for this among other reasons.
 
+#### Rolling back to the production build
+
+The production build is 4f1909b with `user-suspension.patch`. What it does with what this build
+leaves behind:
+
+- **Tokens.** It decodes the server token and `ManagedDoc` (index 2) only. With
+  `Y_SWEET_ATTRIBUTED_TOKENS` off, which is how every Dalus deployment runs today (the Terraform
+  variable `y_sweet_attributed_tokens` defaults to `false` and nothing in the app repository
+  sets it), this build mints exactly the tokens that build mints: the same bytes for the same
+  request, the browser's `userId` plus `writer: "ui"` included, since the writer is dropped with
+  the switch off. A rollback then leaves every outstanding token decodable. With the
+  switch on, every mint that names an actor gets `ManagedAttributedDoc` (index 4), and with
+  suspension off `AttributedDoc` (index 3). The production build cannot decode either: after a
+  rollback, every request and websocket upgrade with such a token gets `401` until its holder
+  mints a new token through the app (which the production build then mints as index 2), for up
+  to the token's lifetime (3600 s for Dalus browser tokens, 300 s on the appliance). No format
+  that build can decode carries an actor, so the cure is the order under
+  [Turning it on and off](#turning-it-on-and-off): switch attribution off, deploy, wait out the
+  longest token lifetime, then roll back.
+
 #### Suspension and attribution together
 
 Both features read the `userId` of the mint request. With both switches on, a token for a

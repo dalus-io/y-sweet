@@ -4799,6 +4799,43 @@ mod test {
         deployed.stop().await;
     }
 
+    /// What the app asks for a signed-in browser (`userId`, writer `ui`, an hour). With the
+    /// server's attributed tokens off, as every deployment has them, the answer is the
+    /// production build's own token, bit for bit (`gen_managed_doc_token` is pinned to that
+    /// build's bytes in `each_mint_function_produces_its_pinned_token`), so rolling back to that
+    /// build leaves every outstanding token valid. With them on it is the combined token
+    /// (index 4), which that build cannot decode: see the operator page on rolling back.
+    #[tokio::test]
+    async fn the_apps_browser_token_is_the_production_builds_unless_attribution_is_on() {
+        let request = json!({ "userId": "member", "writer": "ui", "validForSeconds": 3600 });
+        for attribution in [false, true] {
+            let deployed = Deployed::start(Switches {
+                suspension: true,
+                attribution,
+                ..Default::default()
+            })
+            .await;
+            let token = deployed.mint(request.clone()).await.unwrap();
+            let minted = deployed
+                .verifier
+                .verify_managed_doc_access(&token, DOC_ID, 0)
+                .unwrap();
+            let production = deployed.verifier.gen_managed_doc_token(
+                DOC_ID,
+                Authorization::Full,
+                Some(("member".to_string(), 0)),
+                ExpirationTimeEpochMillis(minted.deadline.unwrap()),
+            );
+            assert_eq!(
+                token == production,
+                !attribution,
+                "attribution {attribution}"
+            );
+            assert_eq!(minted.access.actor.is_some(), attribution);
+            deployed.stop().await;
+        }
+    }
+
     #[tokio::test]
     async fn a_managed_websocket_ends_when_its_token_expires() {
         // As the production build does: with suspension, a socket lives as long as its token.
