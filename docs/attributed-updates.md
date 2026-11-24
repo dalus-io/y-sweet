@@ -392,8 +392,18 @@ takes milliseconds. A response already being sent when the user is suspended is 
 Every suspension or restore is a new *generation* of the user, stored as a record of its own
 at the end of the user's chain: `__dalus_auth/users/<user>/1.json`, `2.json`, and so on, each
 holding a generation and whether the user is suspended. The user's state is the last record
-of the chain. The chain always starts at `1.json`, and the server finds its end by reading
-upwards until a position is missing.
+of the chain. The chain always starts at `1.json`. A position is written only once every
+position before it is stored, and none is ever removed, so the server finds the end by
+doubling and then halving: about two reads per doubling of the length plus one for the single
+object (21 reads for 1000 changes), once per user per process.
+
+The chain is never compacted. Each change adds one object of about 50 bytes (two when it is
+the user's first change in a process, which also stores a settling record), kept for good:
+for an account suspended and restored a hundred times, about 200 objects and 10 KB. Removing
+the old records would mean either a chain that no longer starts at a fixed key or a mutable
+pointer to its start, and a mutable object read at recovery is exactly what a late write can
+corrupt (see below); so they stay. Deleting a user's directory by hand is not a way to reset
+them: it restores a suspended user.
 
 Records are never overwritten with a different acknowledged state, for this reason: a write
 to the store can time out for the server and be applied by the store later. With one object

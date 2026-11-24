@@ -9,8 +9,9 @@
 //! - a write that timed out for this server and is applied by the store later (an S3 write
 //!   can be) lands on a position that is, by then, not the last. It cannot replace a state
 //!   that was acknowledged after it, which a single overwritten object could not rule out;
-//! - the chain always starts at position 1, whatever else the store holds, and its end is
-//!   found by reading positions upwards until one is missing.
+//! - the chain always starts at position 1, whatever else the store holds, and since no
+//!   position is ever removed its end is found by doubling and halving (see
+//!   [UserAccess::chain_end]). It is never compacted: see the operator page for why.
 //!
 //! Earlier builds kept one object per user (`__dalus_auth/users/<user>.json`) and overwrote
 //! it. It is still read, but it can only raise a user's state, never lower it: it counts
@@ -168,6 +169,42 @@ impl UserAccess {
             .clone())
     }
 
+    /// The length of the user's chain and its last record. A position is written only once
+    /// every position before it is in the store, and none is ever removed, so the positions in
+    /// the store are exactly 1 to the length: the end is found by doubling and then halving,
+    /// in about two reads per doubling of the length rather than one read per change.
+    async fn chain_end(
+        store: &Arc<Box<dyn Store>>,
+        user: &str,
+        deadline: Option<Instant>,
+    ) -> Result<(u64, Option<Record>)> {
+        let read = |position| async move {
+            Self::read(store, &Self::chain_key(user, position)?, deadline).await
+        };
+        let Some(first) = read(1).await? else {
+            return Ok((0, None));
+        };
+        // `present` is in the store and `absent` is not.
+        let (mut present, mut last) = (1u64, first);
+        let mut absent = loop {
+            let probe = present
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("User access chain too long"))?;
+            match read(probe).await? {
+                Some(record) => (present, last) = (probe, record),
+                None => break probe,
+            }
+        };
+        while absent - present > 1 {
+            let middle = present + (absent - present) / 2;
+            match read(middle).await? {
+                Some(record) => (present, last) = (middle, record),
+                None => absent = middle,
+            }
+        }
+        Ok((present, Some(last)))
+    }
+
     async fn load(
         cached: &mut Option<Entry>,
         store: &Option<Arc<Box<dyn Store>>>,
@@ -181,15 +218,7 @@ impl UserAccess {
         let Some(store) = store else {
             return Err(anyhow!("User-scoped access requires durable storage"));
         };
-        // The chain, from its fixed start to its last record.
-        let mut chain_len = 0;
-        let mut last = None;
-        while let Some(record) =
-            Self::read(store, &Self::chain_key(user, chain_len + 1)?, deadline).await?
-        {
-            last = Some(record);
-            chain_len += 1;
-        }
+        let (mut chain_len, last) = Self::chain_end(store, user, deadline).await?;
         // The single object of earlier builds counts only where it is ahead of the chain:
         // when its generation is above the one the chain's state binds tokens to. This build
         // writes it first in every change, with that generation, so it is never behind a
@@ -498,6 +527,8 @@ mod tests {
         fail_after: Arc<std::sync::Mutex<Option<usize>>>,
         /// Every write takes this long (and stores nothing if abandoned before).
         set_delay: Arc<std::sync::Mutex<Option<Duration>>>,
+        /// How many reads were made.
+        gets: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl LateStore {
@@ -526,6 +557,7 @@ mod tests {
             Ok(())
         }
         async fn get(&self, key: &str) -> y_sweet_core::store::Result<Option<Vec<u8>>> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.data.lock().unwrap().get(key).cloned())
         }
         async fn set(&self, key: &str, value: Vec<u8>) -> y_sweet_core::store::Result<()> {
@@ -994,6 +1026,45 @@ mod tests {
         assert_eq!(backing.land_late_writes(), 1);
         for access in [access, UserAccess::default()] {
             assert!(access.generation(&store, "member").await.is_err());
+        }
+    }
+
+    /// Every change adds a record and none is ever removed, so the chain only grows. Looking a
+    /// user up must not cost a read per change ever made: with a store read taking tens of
+    /// milliseconds, a user changed a few hundred times would no longer fit the deadline of a
+    /// suspension call.
+    #[tokio::test]
+    async fn looking_up_a_long_chain_takes_a_few_reads() {
+        for len in [0u64, 1, 2, 3, 5, 8, 1000, 1025] {
+            let backing = LateStore::default();
+            let store = backing.handle();
+            for position in 1..=len {
+                let record = Record {
+                    generation: position,
+                    suspended: position % 2 == 1,
+                    keeps: None,
+                };
+                backing.data.lock().unwrap().insert(
+                    format!("__dalus_auth/users/member/{position}.json"),
+                    serde_json::to_vec(&record).unwrap(),
+                );
+            }
+            let access = UserAccess::default();
+            let generation = access.generation(&store, "member").await;
+            // The last record decides: suspended at odd lengths.
+            assert_eq!(generation.is_err(), len % 2 == 1, "{len}");
+            if len > 0 && len % 2 == 0 {
+                assert_eq!(generation.unwrap(), len);
+            }
+            let reads = backing.gets.load(std::sync::atomic::Ordering::SeqCst);
+            // About two per doubling of the length, plus the single object.
+            let bound = 2 * (64 - len.leading_zeros() as usize) + 3;
+            assert!(reads <= bound, "{len} records took {reads} reads");
+            // And the next change goes on from the end.
+            access.set_suspended(&store, "member", false).await.unwrap();
+            assert!(backing
+                .keys()
+                .contains(&format!("__dalus_auth/users/member/{}.json", len + 2)));
         }
     }
 
