@@ -29,10 +29,25 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use y_sweet_core::store::Store;
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Record {
     generation: u64,
     suspended: bool,
+    /// Set on a record that only settles a position of the chain (see
+    /// [UserAccess::set_suspended]): the generation of the change whose state it keeps. Tokens
+    /// are bound to the generation of the last real change, so settling invalidates none.
+    /// Never set in the single object, which holds real changes only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keeps: Option<u64>,
+}
+
+impl Record {
+    /// The generation tokens of this state are minted at and checked against: that of the
+    /// change that made it. The production build mints at, and checks against, the
+    /// generation in the single object, which is the same number.
+    fn token_generation(&self) -> u64 {
+        self.keeps.unwrap_or(self.generation)
+    }
 }
 
 /// How long one read or write of a record may take.
@@ -174,7 +189,7 @@ impl UserAccess {
         if entry.record.suspended {
             return Err(anyhow!("User access denied"));
         }
-        Ok(entry.record.generation)
+        Ok(entry.record.token_generation())
     }
 
     // The server uses `authorize_guarded`; this is kept as the patch has it, with its tests.
@@ -187,7 +202,7 @@ impl UserAccess {
     ) -> Result<CancellationToken> {
         let cell = self.cell(user).await?;
         let entry = Self::load(&mut *cell.lock().await, store, user).await?;
-        if entry.record.suspended || entry.record.generation != generation {
+        if entry.record.suspended || entry.record.token_generation() != generation {
             return Err(anyhow!("User access denied"));
         }
         Ok(entry.cancellation)
@@ -203,7 +218,7 @@ impl UserAccess {
     ) -> Result<Authorized> {
         let cell = self.cell(user).await?;
         let entry = Self::load(&mut *cell.lock().await, store, user).await?;
-        if entry.record.suspended || entry.record.generation != generation {
+        if entry.record.suspended || entry.record.token_generation() != generation {
             return Err(anyhow!("User access denied"));
         }
         Ok(Authorized {
@@ -212,7 +227,7 @@ impl UserAccess {
         })
     }
 
-    /// Moves the user to `record`, which is in the store as the next position of the
+    /// Moves the user to `record`, a change that is in the store as the next position of the
     /// chain: what was authorized under `old` is cancelled, and whatever of it is still
     /// under way is waited for.
     async fn advance(cached: &mut Option<Entry>, old: &Entry, record: Record) -> Entry {
@@ -250,9 +265,14 @@ impl UserAccess {
             // first, with a record that changes nothing but the generation, and the change
             // goes one higher. If the unconfirmed write lands on the settled position after
             // all, it is below the change by then.
+            //
+            // Settling changes nothing for the user: the record keeps the state and the token
+            // generation, so their tokens and connections stay good. If the change then
+            // fails, the user is exactly as before.
             let unchanged = Record {
                 generation: Self::next_generation(&old.record)?,
                 suspended: old.record.suspended,
+                keeps: Some(old.record.token_generation()),
             };
             Self::write(
                 store,
@@ -260,12 +280,19 @@ impl UserAccess {
                 &unchanged,
             )
             .await?;
-            old = Self::advance(&mut cached, &old, unchanged).await;
+            old = Entry {
+                record: unchanged,
+                chain_len: old.chain_len + 1,
+                next_key_used: false,
+                ..old
+            };
+            *cached = Some(old.clone());
         }
 
         let record = Record {
             generation: Self::next_generation(&old.record)?,
             suspended,
+            keeps: None,
         };
         // Persist before acknowledging. Failure leaves the old state and allows a safe retry.
         if let Err(error) =
@@ -536,7 +563,8 @@ mod tests {
         // the next position before using the one after it.
         access.set_suspended(&store, "member", false).await.unwrap();
         assert_eq!(access.generation(&store, "member").await.unwrap(), 5);
-        assert_eq!(chain(2), r#"{"generation":4,"suspended":true}"#);
+        // The settling record keeps the state and the generation tokens are bound to.
+        assert_eq!(chain(2), r#"{"generation":4,"suspended":true,"keeps":3}"#);
         assert_eq!(chain(3), r#"{"generation":5,"suspended":false}"#);
         assert_eq!(backing.keys().len(), 4);
         // The single object is in the format, and at the state, an earlier build expects.
@@ -605,6 +633,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!other.cancellation.is_cancelled());
+    }
+
+    /// The app treats any answer but `204` as "the account change was not completed": it rolls
+    /// back its own change and asks the admin to retry. So a change that fails must leave the
+    /// user as they were: open connections stay open and tokens keep working, in this process
+    /// and after a restart. Here the change's first write (settling the position an earlier
+    /// process may have used) succeeds and its own write fails.
+    #[tokio::test]
+    async fn a_change_that_fails_leaves_the_users_connections_and_tokens_alone() {
+        for suspended_before in [false, true] {
+            let backing = LateStore::default();
+            let store = backing.handle();
+            if suspended_before {
+                UserAccess::default()
+                    .set_suspended(&store, "member", true)
+                    .await
+                    .unwrap();
+                UserAccess::default()
+                    .set_suspended(&store, "member", false)
+                    .await
+                    .unwrap();
+            }
+            let access = UserAccess::default();
+            let generation = access.generation(&store, "member").await.unwrap();
+            let connection = access
+                .authorize_guarded(&store, "member", generation)
+                .await
+                .unwrap();
+
+            // The settling write lands on the next position; the change's own write fails.
+            let chain_len = backing
+                .keys()
+                .iter()
+                .filter(|key| key.contains("member/"))
+                .count();
+            *backing.fail_sets_to.lock().unwrap() = Some(format!("member/{}.json", chain_len + 2));
+            assert!(access.set_suspended(&store, "member", true).await.is_err());
+            *backing.fail_sets_to.lock().unwrap() = None;
+            assert!(
+                backing
+                    .keys()
+                    .contains(&format!("__dalus_auth/users/member/{}.json", chain_len + 1)),
+                "the settling write was not made, so this tests nothing"
+            );
+
+            assert!(
+                !connection.cancellation.is_cancelled(),
+                "the user was disconnected"
+            );
+            for access in [access, UserAccess::default()] {
+                assert_eq!(
+                    access.generation(&store, "member").await.unwrap(),
+                    generation
+                );
+                assert!(access.authorize(&store, "member", generation).await.is_ok());
+            }
+        }
     }
 
     const SINGLE_OBJECT: &str = "__dalus_auth/users/member.json";

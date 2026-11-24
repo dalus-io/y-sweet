@@ -404,10 +404,16 @@ rules make that hold:
 - The first change of a user after the server started does the same, because the server
   cannot know whether the previous process left such a write behind.
 
-So a change takes one or two generations and up to three writes, and a user's tokens can be
-invalidated by a change that then fails (when its first write succeeded and its second did
-not): the call answers `503`, the user's state is unchanged, their sockets are closed and they
-need new tokens. Repeating the call is safe.
+So a change takes one or two generations and up to three writes. The record that settles a
+position keeps the state and also the generation the user's tokens are bound to (`"keeps"`),
+so it changes nothing for the user: tokens are bound to the generation of the last real
+change, not of the last record. That is what makes a failed call harmless. The app treats any
+answer but `204` as "not completed" (it rolls its own change back and the admin retries), and
+a call that fails leaves the user as they were: no socket is closed, every token keeps
+working, here and after a restart. The one exception is inherent in a write of unknown
+outcome: if the change's own write timed out but reached the store, the call answers `503`,
+this process carries on with the old state, and the change takes effect at the next restart
+unless a later change outranks it. Repeating the call is safe and settles it.
 
 **The single object of earlier builds** (`__dalus_auth/users/<user>.json`) can raise a user's
 state but never lower it:
