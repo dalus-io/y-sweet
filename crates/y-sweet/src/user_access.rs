@@ -14,11 +14,13 @@
 //!
 //! Earlier builds kept one object per user (`__dalus_auth/users/<user>.json`) and overwrote
 //! it. It is still read, but it can only raise a user's state, never lower it: it counts
-//! when its generation is higher than the chain's (a change an earlier build made, before
-//! this build first saw the user or during a rollback), and it is then copied to the end of
-//! the chain, after which nothing written to that object later with a lower generation, such
-//! as an earlier build's write that timed out and lands late, matters any more. It is still
-//! written after every change, so that a build that knows only that object sees the change.
+//! when its generation is higher than the one the chain's state binds tokens to (a change an
+//! earlier build made, before this build first saw the user or during a rollback), and it is
+//! then copied to the end of the chain, after which nothing written to that object later with
+//! a lower generation, such as an earlier build's write that timed out and lands late, matters
+//! any more. It is written first in every change, and a change is acknowledged only once it is
+//! there too, so that a build that knows only that object sees every acknowledged change and
+//! the object is never behind the chain's last change.
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -152,26 +154,41 @@ impl UserAccess {
             last = Some(record);
             chain_len += 1;
         }
-        // The single object of earlier builds counts only where it is ahead of the chain.
+        // The single object of earlier builds counts only where it is ahead of the chain:
+        // when its generation is above the one the chain's state binds tokens to. This build
+        // writes it first in every change, with that generation, so it is never behind a
+        // change this build acknowledged; an earlier build writes it one generation on from
+        // what it read there, so a change it made after this build's last one is always
+        // above. That holds also when this build's last record is a settling one whose own
+        // generation is the same or higher: the earlier build's change is newer than it.
         let single = Self::read(store, &key).await?;
-        let record = match (last, single) {
-            (Some(last), Some(single)) if single.generation <= last.generation => last,
-            (Some(last), None) => last,
-            (None, None) => Record::default(),
-            (_, Some(single)) => {
-                // A change by an earlier build. Make it part of the chain, so that it holds
-                // whatever is written to the single object after this. If the copy cannot be
-                // made now, the user's state is the same; the next change settles the
-                // position (it is marked as possibly used below, like any first position).
-                if Self::write(store, &Self::chain_key(user, chain_len + 1)?, &single)
-                    .await
-                    .is_ok()
-                {
-                    chain_len += 1;
-                }
-                single
-            }
+        let mut record = last.clone().unwrap_or_default();
+        let ahead = |single: &Record| {
+            last.as_ref()
+                .map_or(true, |last| single.generation > last.token_generation())
         };
+        if let Some(single) = single.filter(ahead) {
+            // A change by an earlier build. Make it part of the chain, so that it holds
+            // whatever is written to the single object after this. Its generation stays the
+            // one tokens are bound to; the record takes a generation above the chain's if it
+            // is not already, so that generations along the chain only grow. If the copy
+            // cannot be made now, the user's state is the same; the next change settles the
+            // position (it is marked as possibly used below, like any first position).
+            record = match &last {
+                Some(last) if single.generation <= last.generation => Record {
+                    generation: Self::next_generation(last)?,
+                    suspended: single.suspended,
+                    keeps: Some(single.generation),
+                },
+                _ => single,
+            };
+            if Self::write(store, &Self::chain_key(user, chain_len + 1)?, &record)
+                .await
+                .is_ok()
+            {
+                chain_len += 1;
+            }
+        }
         let entry = Entry {
             record,
             chain_len,
@@ -294,24 +311,21 @@ impl UserAccess {
             suspended,
             keeps: None,
         };
-        // Persist before acknowledging. Failure leaves the old state and allows a safe retry.
-        if let Err(error) =
-            Self::write(store, &Self::chain_key(user, old.chain_len + 1)?, &record).await
-        {
-            // The write may have reached the store all the same: its position is used.
-            if let Some(entry) = cached.as_mut() {
-                entry.next_key_used = true;
+        // Persist before acknowledging, in both places: the single object first, then the
+        // chain. The single object is what an earlier build reads after a rollback, so a
+        // change it does not hold is not acknowledged; and written first, it is never behind
+        // the chain's last change, which is what lets this build tell an earlier build's
+        // later change from its own (see [UserAccess::load]). Failure leaves this process
+        // in the old state and allows a safe retry.
+        for key in [Self::key(user)?, Self::chain_key(user, old.chain_len + 1)?] {
+            if let Err(error) = Self::write(store, &key, &record).await {
+                // The write may have reached the store all the same: the generation and the
+                // chain position are used. The next change settles them first.
+                if let Some(entry) = cached.as_mut() {
+                    entry.next_key_used = true;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-        // The change is made. Earlier builds read only the single object: keep it current
-        // for them (a rolling deploy, a rollback). It is not what this build decides by, so
-        // failing to write it does not fail the change.
-        if Self::write(store, &Self::key(user)?, &record)
-            .await
-            .is_err()
-        {
-            tracing::warn!("could not update the single-object copy of a user access record");
         }
         Self::advance(&mut cached, &old, record).await;
         Ok(())
@@ -426,6 +440,8 @@ mod tests {
         late: Arc<std::sync::Mutex<Vec<StoredWrite>>>,
         /// Writes to keys ending in this fail outright.
         fail_sets_to: Arc<std::sync::Mutex<Option<String>>>,
+        /// How many more writes go through before one fails outright (and stores nothing).
+        fail_after: Arc<std::sync::Mutex<Option<usize>>>,
     }
 
     impl LateStore {
@@ -475,8 +491,22 @@ mod tests {
                 self.late.lock().unwrap().push((key.to_string(), value));
                 return std::future::pending().await;
             }
+            let fail_now = {
+                let mut fail_after = self.fail_after.lock().unwrap();
+                match *fail_after {
+                    Some(0) => {
+                        *fail_after = None;
+                        true
+                    }
+                    Some(left) => {
+                        *fail_after = Some(left - 1);
+                        false
+                    }
+                    None => false,
+                }
+            };
             let failing = self.fail_sets_to.lock().unwrap().clone();
-            if failing.is_some_and(|end| key.ends_with(&end)) {
+            if fail_now || failing.is_some_and(|end| key.ends_with(&end)) {
                 return Err(y_sweet_core::store::StoreError::ConnectionError(
                     "test failure".to_string(),
                 ));
@@ -576,21 +606,30 @@ mod tests {
         assert_eq!(stored(SINGLE), r#"{"generation":6,"suspended":true}"#);
         assert_eq!(chain(4), stored(SINGLE));
 
-        // If the single object cannot be written the change stands, and a restart finds it
-        // in the chain although the single object is behind.
+        // If the single object cannot be written the change is not made: an earlier build
+        // would not see it. Nothing else is written, and a restart finds the old state.
         *backing.fail_sets_to.lock().unwrap() = Some("users/member.json".to_string());
-        access.set_suspended(&store, "member", false).await.unwrap();
+        assert!(access.set_suspended(&store, "member", false).await.is_err());
         assert_eq!(stored(SINGLE), r#"{"generation":6,"suspended":true}"#);
+        assert_eq!(backing.keys().len(), 5);
         *backing.fail_sets_to.lock().unwrap() = None;
+        assert!(UserAccess::default()
+            .generation(&store, "member")
+            .await
+            .is_err());
+        // The retry settles the generation the failed write may have used, then restores.
+        access.set_suspended(&store, "member", false).await.unwrap();
+        assert_eq!(chain(5), r#"{"generation":7,"suspended":true,"keeps":6}"#);
+        assert_eq!(stored(SINGLE), r#"{"generation":8,"suspended":false}"#);
         let restarted = UserAccess::default();
-        assert_eq!(restarted.generation(&store, "member").await.unwrap(), 7);
+        assert_eq!(restarted.generation(&store, "member").await.unwrap(), 8);
 
         // An earlier build that suspends the user afterwards (a rollback) writes only the
         // single object, one generation on from the one it read there. That is honoured,
         // and a build like this one continues from it.
         backing.data.lock().unwrap().insert(
             SINGLE.to_string(),
-            br#"{"generation":8,"suspended":true}"#.to_vec(),
+            br#"{"generation":9,"suspended":true}"#.to_vec(),
         );
         let upgraded = UserAccess::default();
         assert!(upgraded.generation(&store, "member").await.is_err());
@@ -598,7 +637,7 @@ mod tests {
             .set_suspended(&store, "member", false)
             .await
             .unwrap();
-        assert_eq!(upgraded.generation(&store, "member").await.unwrap(), 10);
+        assert_eq!(upgraded.generation(&store, "member").await.unwrap(), 11);
     }
 
     #[tokio::test]
@@ -662,15 +701,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            // The settling write lands on the next position; the change's own write fails.
+            // The settling write (the call's first) lands on the next position; the change's
+            // own first write (the second) fails.
             let chain_len = backing
                 .keys()
                 .iter()
                 .filter(|key| key.contains("member/"))
                 .count();
-            *backing.fail_sets_to.lock().unwrap() = Some(format!("member/{}.json", chain_len + 2));
+            *backing.fail_after.lock().unwrap() = Some(1);
             assert!(access.set_suspended(&store, "member", true).await.is_err());
-            *backing.fail_sets_to.lock().unwrap() = None;
+            assert_eq!(*backing.fail_after.lock().unwrap(), None);
             assert!(
                 backing
                     .keys()
@@ -688,6 +728,142 @@ mod tests {
                     generation
                 );
                 assert!(access.authorize(&store, "member", generation).await.is_ok());
+            }
+        }
+    }
+
+    /// What the production build (4f1909b with user-suspension.patch) does with the store:
+    /// it knows only the single object, reads it (absent is generation 0), and writes it one
+    /// generation on. Tokens it mints carry that generation, and it accepts a token only at it.
+    async fn production_sets(store: &Option<Arc<Box<dyn Store>>>, suspended: bool) {
+        let store = store.as_ref().unwrap();
+        let current = UserAccess::read(store, SINGLE_OBJECT)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        let record = Record {
+            generation: current.generation + 1,
+            suspended,
+            keeps: None,
+        };
+        UserAccess::write(store, SINGLE_OBJECT, &record)
+            .await
+            .unwrap();
+    }
+
+    /// The state the production build sees.
+    async fn production_view(store: &Option<Arc<Box<dyn Store>>>) -> Record {
+        UserAccess::read(store.as_ref().unwrap(), SINGLE_OBJECT)
+            .await
+            .unwrap()
+            .unwrap_or_default()
+    }
+
+    /// Histories this build may leave a user in before a rollback: changes that succeeded, and
+    /// a last change one of whose writes failed (counted from the first write of that call).
+    async fn leave_history(backing: &LateStore, history: &[bool], failing_write: Option<usize>) {
+        let store = backing.handle();
+        let access = UserAccess::default();
+        for (i, suspended) in history.iter().enumerate() {
+            let last = i + 1 == history.len();
+            if last {
+                *backing.fail_after.lock().unwrap() = failing_write;
+            }
+            let result = access.set_suspended(&store, "member", *suspended).await;
+            // A call makes two or three writes: a later one may not get to the failing one.
+            let failed = failing_write.is_some() && backing.fail_after.lock().unwrap().is_none();
+            assert_eq!(result.is_ok(), !(last && failed));
+            *backing.fail_after.lock().unwrap() = None;
+        }
+    }
+
+    const HISTORIES: &[&[bool]] = &[&[true], &[true, false], &[false, true, false]];
+
+    /// Rolled back, the production build suspends or restores the user and acknowledges it.
+    /// Rolled forward, this build must enforce that, whatever it left behind: also when its
+    /// own last change failed half way and the production build's write lands on the same
+    /// generation as this build's last record.
+    #[tokio::test]
+    async fn a_change_the_production_build_made_during_a_rollback_holds_after_rolling_forward() {
+        for history in HISTORIES {
+            for failing_write in [None, Some(0), Some(1), Some(2)] {
+                for production_suspends in [true, false] {
+                    let case = format!("{history:?}, write {failing_write:?} failed, production suspends: {production_suspends}");
+                    let backing = LateStore::default();
+                    let store = backing.handle();
+                    leave_history(&backing, history, failing_write).await;
+                    // Rolled back: the production build makes its change. A user it restores
+                    // gets a token bound to its generation.
+                    production_sets(&store, production_suspends).await;
+                    let production_token = production_view(&store).await.generation;
+
+                    // Rolled forward, in a fresh process, twice (the first one may have moved
+                    // what it found into the chain).
+                    for _ in 0..2 {
+                        let access = UserAccess::default();
+                        let generation = access.generation(&store, "member").await;
+                        assert_eq!(generation.is_err(), production_suspends, "{case}");
+                        if !production_suspends {
+                            assert_eq!(generation.unwrap(), production_token, "{case}");
+                            assert!(
+                                access
+                                    .authorize(&store, "member", production_token)
+                                    .await
+                                    .is_ok(),
+                                "{case}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reverse: this build suspends or restores the user and acknowledges it, then the
+    /// production build is deployed again. It must see the change, and a restored user's
+    /// tokens from this build must be good there.
+    #[tokio::test]
+    async fn a_change_this_build_acknowledged_holds_after_rolling_back() {
+        for history in HISTORIES {
+            for failing_write in [None, Some(0), Some(1), Some(2)] {
+                for suspends in [true, false] {
+                    let case = format!(
+                        "{history:?}, write {failing_write:?} failed, then suspends: {suspends}"
+                    );
+                    for failing_single in [false, true] {
+                        let backing = LateStore::default();
+                        let store = backing.handle();
+                        leave_history(&backing, history, failing_write).await;
+                        let access = UserAccess::default();
+                        if failing_single {
+                            // The single object cannot be written: the change is not
+                            // acknowledged, and the retry is.
+                            *backing.fail_sets_to.lock().unwrap() =
+                                Some("users/member.json".to_string());
+                            assert!(
+                                access
+                                    .set_suspended(&store, "member", suspends)
+                                    .await
+                                    .is_err(),
+                                "{case}: acknowledged without the single object"
+                            );
+                            *backing.fail_sets_to.lock().unwrap() = None;
+                        }
+                        access
+                            .set_suspended(&store, "member", suspends)
+                            .await
+                            .unwrap();
+                        let seen = production_view(&store).await;
+                        assert_eq!(seen.suspended, suspends, "{case}");
+                        if !suspends {
+                            assert_eq!(
+                                access.generation(&store, "member").await.unwrap(),
+                                seen.generation,
+                                "{case}: a token minted here would be refused there"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

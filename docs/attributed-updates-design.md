@@ -122,8 +122,14 @@ had to settle:
   generation found in the single object, which made recovery depend on that mutable object: a write of the
   old build, pending since before the upgrade, could lower it afterwards, the scan then began below the
   chain and found nothing, and a suspended user came back. The single object is now only ever an input
-  that can raise the state: it counts when its generation is above the chain's and is then appended to
-  the chain. It is still written as a mirror for builds that know nothing else. The operator page has the
+  that can raise the state: it counts when its generation is above the generation the chain's state binds
+  tokens to, and is then appended to the chain. Comparing against the chain's last record generation
+  instead lost a rollback's suspension: a change of this build that failed after its settling write left a
+  record at generation N, the production build then suspended the user at N (one on from the single object
+  it read), and the tie went to the chain. The single object is written first in every change, and a change
+  is acknowledged only once it is there, so it is never behind this build's last change and every change
+  this build acknowledges is visible to a build that knows nothing else; before, a failed write of it only
+  logged a warning, and the production build, rolled back to, missed that change. The operator page has the
   details and what remains uncovered.
 - **Shutdown, GC, loading.** Revocation records are written straight to the store by the suspension
   endpoint, with their own 3 s limit, and are durable before the endpoint answers; they are not docs, so

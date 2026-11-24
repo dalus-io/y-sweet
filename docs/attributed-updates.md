@@ -418,27 +418,40 @@ unless a later change outranks it. Repeating the call is safe and settles it.
 **The single object of earlier builds** (`__dalus_auth/users/<user>.json`) can raise a user's
 state but never lower it:
 
-- It is read, and it counts only when its generation is higher than the last record of the
-  chain. That is the case for everything the production build wrote before this build first
-  saw the user, and for a change an earlier build makes during a rollback.
-- When it counts, it is copied to the end of the chain at once (the first time this build
-  looks the user up, be it for a mint that is then refused). From then on it is part of the
-  chain, and nothing written to the single object afterwards with a lower or equal
-  generation matters. In particular a write of the earlier build that timed out before the
+- It is written first in every change, before the chain, with the change's generation; the
+  change is acknowledged only once both are stored. If it cannot be written the call answers
+  `503`, writes nothing more, and this process keeps the old state (the next change settles the
+  generation the failed write may have used). So a build that knows only that object (the
+  production build, during a rolling deploy or after a rollback) sees every acknowledged change,
+  and the object is never behind the chain's last change. If the object was written but the
+  chain write then fails, the call also answers `503` and this process keeps the old state, but
+  the change is stored: a restart, or the production build, finds it. That is the same as a write
+  of unknown outcome, and a retry settles it.
+- It is read, and it counts only when its generation is higher than the generation the chain's
+  last record binds tokens to (its `keeps`, or its own generation for a real change). That is
+  the case for everything the production build wrote before this build first saw the user, and
+  for any change the production build makes during a rollback: it writes one generation on from
+  what it read there, which is at least the generation of this build's last change. It wins also
+  when this build's last record is a settling one at the same or a higher generation (a change
+  of this build that failed half way before the rollback): the production build's change is the
+  newer one.
+- When it counts, it is copied to the end of the chain at once (the first time this build looks
+  the user up, be it for a mint that is then refused), with the generation tokens are bound to
+  kept from it, and a record generation above the chain's if it is not already. From then on it
+  is part of the chain, and nothing written to the single object afterwards with a generation at
+  or below that matters. In particular a write of the earlier build that timed out before the
   upgrade and lands after it, such as a restore landing on top of a later suspension, is
-  ignored. If the copy cannot be stored, the lookup still succeeds with the same state, and
-  the user's next change puts it in the chain.
-- It is still written after every change, with the new state, so that a build that knows
-  only that object (the production build, during a rolling deploy or after a rollback) sees
-  the change. If writing it fails the change stands and the server logs `could not update the
-  single-object copy of a user access record` (warn, no user id); that build would then see
-  the previous state until the next change.
+  ignored. If the copy cannot be stored, the lookup still succeeds with the same state, and the
+  user's next change puts it in the chain.
 
 What this cannot cover: a late write of an earlier build that lands before this build has
 ever looked that user up is indistinguishable from the state that build meant to leave, and
-is taken as it. And a build that knows only the single object, running at the same time as
-this one, can still overwrite that object with an older state that it alone will read; two
-servers on one store are forbidden for this among other reasons.
+is taken as it. A write of this build that timed out and lands only after a rollback, on the
+single object, overwrites what the production build stored there for its own reading (this
+build, rolled forward, still decides by the chain). And a build that knows only the single
+object, running at the same time as this one, can still overwrite that object with an older
+state that it alone will read; two servers on one store are forbidden for this among other
+reasons.
 
 #### Rolling back to the production build
 
@@ -450,8 +463,9 @@ leaves behind:
   variable `y_sweet_attributed_tokens` defaults to `false` and nothing in the app repository
   sets it), this build mints exactly the tokens that build mints: the same bytes for the same
   request, the browser's `userId` plus `writer: "ui"` included, since the writer is dropped with
-  the switch off. A rollback then leaves every outstanding token decodable. With the
-  switch on, every mint that names an actor gets `ManagedAttributedDoc` (index 4), and with
+  the switch off. A rollback then leaves every outstanding token decodable, and valid: both
+  builds bind tokens to the generation in the single object for the user's current state (this
+  build writes it with every acknowledged change and mints at it). With the switch on, every mint that names an actor gets `ManagedAttributedDoc` (index 4), and with
   suspension off `AttributedDoc` (index 3). The production build cannot decode either: after a
   rollback, every request and websocket upgrade with such a token gets `401` until its holder
   mints a new token through the app (which the production build then mints as index 2), for up
@@ -459,6 +473,14 @@ leaves behind:
   that build can decode carries an actor, so the cure is the order under
   [Turning it on and off](#turning-it-on-and-off): switch attribution off, deploy, wait out the
   longest token lifetime, then roll back.
+
+- **Suspensions and restores.** Every change this build acknowledges is in the single object,
+  so the production build enforces it after a rollback, and tokens this build minted for a
+  restored user stay valid there. Every change the production build acknowledges during a
+  rollback is honoured by this build when it is deployed again, whatever this build left behind
+  (see the single object under [Revocation records](#revocation-records)). Tests emulate the
+  production build's reads and writes for both directions, after histories that end in a call
+  that failed at each of its writes.
 
 #### Suspension and attribution together
 
