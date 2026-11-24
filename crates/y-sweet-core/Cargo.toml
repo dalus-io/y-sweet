@@ -25,12 +25,18 @@ rusty-s3 = "0.5.0"
 serde = { version = "1.0.173", features = ["derive"] }
 serde_json = "1.0.103"
 sha2 = "0.10.7"
+subtle = "2.6.1"
 thiserror = "1.0.44"
 time = { version = "0.3.25", features = ["wasm-bindgen"] }
 tracing = "0.1.37"
 yrs = { version = "0.19.1" }
 yrs-kvstore = "0.3.0"
 
+# For the S3 store's request timeout. reqwest already brings tokio in on these targets; the
+# wasm build (y-sweet-worker) has no timer and applies no timeout.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.29.1", features = ["time"] }
+
 [dev-dependencies]
-tokio = { version = "1.29.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.29.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 dashmap = "6.0.1"

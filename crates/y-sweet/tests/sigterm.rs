@@ -1,0 +1,446 @@
+//! Runs the real `y-sweet serve` binary and stops it with `SIGTERM`, the way `docker stop` and
+//! ECS do: once serving, to check that the update webhook's final flush still happens, and
+//! during startup, to check that a hung store does not make the stop wait forever.
+#![cfg(unix)]
+
+use axum::{body::Bytes, http::StatusCode, routing::post, Router};
+use serde_json::Value;
+use std::{
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use yrs::{Text, Transact};
+
+/// Held by each test from before it binds anything until its server has bound its port.
+///
+/// A test finds a free port by binding one and releasing it, then starts the server on it.
+/// The tests of this file run in parallel, and in that window another test could be handed
+/// the same port, for its own server or for a listener; one server would then fail to start.
+static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn sigterm_flushes_the_update_webhook_before_exit() {
+    let starting = STARTING.lock().await;
+    let received: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let receiver = {
+        let received = received.clone();
+        Router::new().route(
+            "/updates",
+            post(move |body: Bytes| {
+                let received = received.clone();
+                async move {
+                    received
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        )
+    };
+    let receiver_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let receiver_url = format!("http://{}/updates", receiver_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(receiver_listener, receiver).await.unwrap() });
+
+    // A free port for the server. Another process could take it before the server binds it;
+    // unlikely enough for a test.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_y-sweet"))
+        .args([
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--prod",
+        ])
+        .env_clear()
+        .env("Y_SWEET_UPDATE_WEBHOOK_URL", &receiver_url)
+        .env("Y_SWEET_UPDATE_WEBHOOK_SECRET", "secret")
+        // Only the shutdown flush can close the batch.
+        .env("Y_SWEET_UPDATE_WEBHOOK_BATCH_MS", "3600000")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let base = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) = http.get(format!("{base}/ready")).send().await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "server never became ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(starting);
+
+    let update = {
+        let doc = yrs::Doc::with_client_id(1);
+        let text = doc.get_or_insert_text("t");
+        let mut txn = doc.transact_mut();
+        text.push(&mut txn, "hello");
+        txn.encode_update_v1()
+    };
+    let response = http
+        .post(format!("{base}/d/doc1/update"))
+        .body(update)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(received.lock().unwrap().is_empty());
+
+    // The shell's builtin `kill`, so no `kill` binary needs to be installed.
+    let killed = Command::new("sh")
+        .args(["-c", &format!("kill -TERM {}", child.id())])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("server did not exit after SIGTERM");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // A clean exit, not death by the signal.
+    assert!(status.success(), "{status:?}");
+
+    let received = received.lock().unwrap();
+    assert_eq!(received.len(), 1, "the pending batch was not flushed");
+    assert_eq!(received[0]["doc_id"], "doc1");
+    assert_eq!(received[0]["events"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn sigterm_during_a_hung_store_init_exits_promptly() {
+    let starting = STARTING.lock().await;
+    use tokio::io::AsyncReadExt;
+
+    // An S3 endpoint that accepts the connection, reads the request and never answers. The S3
+    // client has no timeout, so without the fix startup waits here for good and swallows the
+    // signal.
+    let s3 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_url = format!("http://{}", s3.local_addr().unwrap());
+    let (request_seen_tx, request_seen) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = s3.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = socket.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        request_seen_tx.send(()).unwrap();
+        // Hold the connection open, unanswered.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        drop(socket);
+    });
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_y-sweet"))
+        .args([
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--prod",
+            "s3://bucket",
+        ])
+        .env_clear()
+        .env("AWS_ACCESS_KEY_ID", "test")
+        .env("AWS_SECRET_ACCESS_KEY", "test")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_ENDPOINT_URL_S3", &s3_url)
+        .env("AWS_S3_USE_PATH_STYLE", "true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Startup is now inside the store's init, waiting on the endpoint.
+    tokio::time::timeout(Duration::from_secs(30), request_seen)
+        .await
+        .expect("the server never reached the store")
+        .unwrap();
+    // The server binds its port before it initialises the store.
+    drop(starting);
+
+    let killed = Command::new("sh")
+        .args(["-c", &format!("kill -TERM {}", child.id())])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("SIGTERM during startup was ignored");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(status.success(), "{status:?}");
+}
+
+#[tokio::test]
+async fn sigterm_saves_pending_edits_to_the_store() {
+    stop_signal_saves_pending_edits("TERM", &[]).await;
+}
+
+/// `SIGINT` is what the Dalus deployments send (`STOPSIGNAL SIGINT`, `stop_signal: SIGINT`).
+#[tokio::test]
+async fn sigint_saves_pending_edits_to_the_store() {
+    stop_signal_saves_pending_edits("INT", &[]).await;
+}
+
+/// A mistake in the optional webhook's settings must not keep the sync server from starting
+/// (or from saving docs when it stops).
+#[tokio::test]
+async fn a_broken_webhook_configuration_does_not_stop_the_server() {
+    for broken in [
+        &[("Y_SWEET_UPDATE_WEBHOOK_URL", "not a url")][..],
+        &[("Y_SWEET_UPDATE_WEBHOOK_URL", "https://example.com/hook")],
+        &[
+            ("Y_SWEET_UPDATE_WEBHOOK_URL", "https://example.com/hook"),
+            ("Y_SWEET_UPDATE_WEBHOOK_SECRET", "s"),
+            ("Y_SWEET_UPDATE_WEBHOOK_BATCH_MS", "soon"),
+        ],
+        &[
+            ("Y_SWEET_UPDATE_WEBHOOK_URL", "https://example.com/hook"),
+            ("Y_SWEET_UPDATE_WEBHOOK_SECRET", "s"),
+            ("Y_SWEET_UPDATE_WEBHOOK_CA_FILE", "/nonexistent/ca.pem"),
+        ],
+    ] {
+        stop_signal_saves_pending_edits("INT", broken).await;
+    }
+}
+
+/// An environment that defines every setting of this fork but leaves it empty or blank, as an
+/// env file or a compose file that passes the variables through does, starts the server with
+/// each of them at its default. So does a shutdown timeout that is not a number.
+#[tokio::test]
+async fn empty_or_invalid_settings_do_not_stop_the_server() {
+    for value in ["", " "] {
+        stop_signal_saves_pending_edits(
+            "INT",
+            &[
+                ("Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS", value),
+                ("Y_SWEET_ATTRIBUTED_TOKENS", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_URL", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_SECRET", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_BATCH_MS", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_MAX_BYTES", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_CONCURRENCY", value),
+                ("Y_SWEET_UPDATE_WEBHOOK_CA_FILE", value),
+            ],
+        )
+        .await;
+    }
+    stop_signal_saves_pending_edits("INT", &[("Y_SWEET_SHUTDOWN_TIMEOUT_SECONDS", "soon")]).await;
+}
+
+/// Runs `y-sweet serve` with `env` on a free port and returns whether it comes up (and stops
+/// it), or exits first.
+async fn starts(env: &[(&str, &str)]) -> bool {
+    let starting = STARTING.lock().await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_y-sweet"))
+        .args(["serve", "--host", "127.0.0.1", "--prod"])
+        .args(["--port", &port.to_string()])
+        .env_clear()
+        .envs(env.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let started = loop {
+        if let Ok(response) = http
+            .get(format!("http://127.0.0.1:{port}/ready"))
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                break true;
+            }
+        }
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        assert!(Instant::now() < deadline, "neither ready nor exited");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    drop(starting);
+    let _ = child.kill();
+    let _ = child.wait();
+    started
+}
+
+/// The switches that decide who gets in refuse to run without what they need, or with a
+/// value that is neither on nor off, rather than start a server that enforces nothing.
+#[tokio::test]
+async fn suspension_and_token_expiry_need_auth_and_a_clear_value() {
+    // A private key in the format `y-sweet gen-auth` prints.
+    const AUTH: (&str, &str) = ("Y_SWEET_AUTH", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd");
+
+    // The appliance image sets this one, and always runs with auth.
+    assert!(!starts(&[("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "true")]).await);
+    assert!(!starts(&[("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "1")]).await);
+    assert!(starts(&[("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "true"), AUTH]).await);
+    assert!(!starts(&[("Y_SWEET_USER_SUSPENSION", "true")]).await);
+    assert!(starts(&[("Y_SWEET_USER_SUSPENSION", "true"), AUTH]).await);
+    assert!(
+        starts(&[
+            ("Y_SWEET_USER_SUSPENSION", "true"),
+            ("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "true"),
+            ("Y_SWEET_ATTRIBUTED_TOKENS", "true"),
+            AUTH
+        ])
+        .await
+    );
+
+    // Off, empty and unset ask for nothing.
+    for off in ["false", "0", "", " "] {
+        assert!(
+            starts(&[
+                ("Y_SWEET_ENFORCE_TOKEN_EXPIRY", off),
+                ("Y_SWEET_USER_SUSPENSION", off)
+            ])
+            .await,
+            "{off:?}"
+        );
+    }
+    // Neither on nor off.
+    assert!(!starts(&[("Y_SWEET_ENFORCE_TOKEN_EXPIRY", "enabled"), AUTH]).await);
+    assert!(!starts(&[("Y_SWEET_USER_SUSPENSION", "enabled"), AUTH]).await);
+}
+
+async fn stop_signal_saves_pending_edits(signal: &str, env: &[(&str, &str)]) {
+    let starting = STARTING.lock().await;
+    use std::sync::Arc;
+    use y_sweet::stores::filesystem::FileSystemStore;
+    use y_sweet_core::{doc_sync::DocWithSyncKv, store::Store};
+    use yrs::{GetString, ReadTxn};
+
+    let dir = std::env::temp_dir().join(format!("y-sweet-sigterm-{}", nanoid::nanoid!()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_y-sweet"))
+        .args([
+            "serve",
+            dir.to_str().unwrap(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--prod",
+            // Far longer than the test: only the shutdown can save the edit.
+            "--checkpoint-freq-seconds",
+            "3600",
+        ])
+        .env_clear()
+        .envs(env.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let base = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) = http.get(format!("{base}/ready")).send().await {
+            if response.status().is_success() {
+                break;
+            }
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the server exited during startup"
+        );
+        assert!(Instant::now() < deadline, "server never became ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(starting);
+
+    let update = {
+        let doc = yrs::Doc::with_client_id(1);
+        let text = doc.get_or_insert_text("t");
+        let mut txn = doc.transact_mut();
+        text.push(&mut txn, "saved on stop");
+        txn.encode_update_v1()
+    };
+    let response = http
+        .post(format!("{base}/d/doc1/update"))
+        .body(update)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let killed = Command::new("sh")
+        .args(["-c", &format!("kill -{signal} {}", child.id())])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("server did not exit after SIG{signal}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(status.success(), "{status:?}");
+
+    // Read the doc back from the directory the server used.
+    let store: Box<dyn Store> = Box::new(FileSystemStore::new(dir.clone()).unwrap());
+    let doc = DocWithSyncKv::new("doc1", Some(Arc::new(store)), || {}, false, None)
+        .await
+        .unwrap();
+    let text = {
+        let awareness = doc.awareness();
+        let awareness = awareness.read().unwrap();
+        let txn = awareness.doc().transact();
+        txn.get_text("t")
+            .map(|t| t.get_string(&txn))
+            .unwrap_or_default()
+    };
+    assert_eq!(text, "saved on stop");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
