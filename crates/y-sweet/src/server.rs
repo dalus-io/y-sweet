@@ -1389,6 +1389,7 @@ async fn handle_socket_upgrade(
     let cancellation_token = server_state.cancellation_token.clone();
     let write_gate = server_state.write_gate.clone();
     let connection_tracker = server_state.connection_tracker.clone();
+    let authorization_can_end = server_state.user_suspension || server_state.enforce_token_expiry;
 
     Ok(ws.on_upgrade(move |socket| {
         connection_tracker.track_future(handle_socket(
@@ -1398,6 +1399,7 @@ async fn handle_socket_upgrade(
             access,
             cancellation_token,
             write_gate,
+            authorization_can_end,
         ))
     }))
 }
@@ -1466,6 +1468,11 @@ async fn handle_socket_upgrade_single(
     handle_socket_upgrade(ws, Path(single_doc_id), access.into(), State(server_state)).await
 }
 
+/// `authorization_can_end` is whether the server enforces user suspension or token expiry.
+/// Off, this is PR #1's loop in what it does: nothing ends the connection but the peer, the
+/// write gate and shutdown, and the sender task drains what is queued for the socket before
+/// it lets go of it. On, it is the production builds' loop: the connection also ends with its
+/// authorization, and the sender is stopped with it, so nothing more reaches the peer.
 async fn handle_socket(
     socket: WebSocket,
     doc_id: String,
@@ -1473,6 +1480,7 @@ async fn handle_socket(
     access: Access,
     cancellation_token: CancellationToken,
     write_gate: Arc<WriteGate>,
+    authorization_can_end: bool,
 ) {
     let Access {
         doc: DocAccess {
@@ -1508,12 +1516,15 @@ async fn handle_socket(
 
         loop {
             tokio::select! {
-                biased;
-                _ = sender_cancel.cancelled() => break,
+                _ = sender_cancel.cancelled(), if authorization_can_end => break,
                 msg = recv.recv() => {
                     let Some(msg) = msg else {
                         break;
                     };
+                    // Nothing more for a user who has been suspended, whichever branch won.
+                    if authorization_can_end && sender_cancel.is_cancelled() {
+                        break;
+                    }
                     let _ = sink.send(Message::Binary(msg)).await;
                 }
                 _ = ticker.tick() => {
@@ -1552,11 +1563,13 @@ async fn handle_socket(
     };
     tokio::pin!(expiry);
 
+    // Not `biased`: with the switches off the branches are PR #1's, picked as PR #1 picks
+    // them. With them on, a frame that wins over a suspension or the deadline is refused by
+    // the check at the top of its branch, as the production builds' biased loop refused it.
     loop {
         tokio::select! {
-            biased;
-            _ = user_cancel.cancelled() => break,
-            _ = &mut expiry => break,
+            _ = user_cancel.cancelled(), if authorization_can_end => break,
+            _ = &mut expiry, if deadline.is_some() => break,
             _ = cancellation_token.cancelled() => {
                 tracing::debug!("Closing doc connection due to server cancel...");
                 break;
@@ -1611,9 +1624,11 @@ async fn handle_socket(
     // Close the connection first: it unregisters from the doc under the doc lock, and after
     // that nothing more is queued for this socket.
     drop(connection);
-    // Drop both socket halves; leaving the sender alive would leave the peer
-    // unaware that its authorization has ended until the next ping timeout.
-    sender.abort();
+    if authorization_can_end {
+        // Drop both socket halves; leaving the sender alive would leave the peer
+        // unaware that its authorization has ended until the next ping timeout.
+        sender.abort();
+    }
 }
 
 async fn set_user_suspension(
@@ -4044,6 +4059,78 @@ mod test {
         serving.await.unwrap().unwrap();
         let stored = stored_keys(&store).await;
         assert!(stored.contains("1") && !stored.contains("2"), "{stored:?}");
+    }
+
+    /// With user suspension and token expiry enforcement both off, the socket loop is PR #1's:
+    /// when a connection ends (here because the write gate closed, as in shutdown), what was
+    /// already queued for the socket is still delivered, because the sender task drains its
+    /// queue before it lets go of the socket. Only ending an authorization (a suspension, a
+    /// token's deadline) may cut that short.
+    #[tokio::test]
+    async fn with_both_switches_off_an_ending_socket_still_gets_what_was_queued_for_it() {
+        use y_sweet_core::sync::{Message as SyncProtocolMessage, SyncMessage};
+        use yrs::{updates::decoder::Decode, Map, ReadTxn, Transact};
+
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token).await;
+        let (gate, docs) = (server.write_gate.clone(), server.docs.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        // Edits far larger than socket buffers hold, while the observer reads nothing: most of
+        // them wait in its queue.
+        const EDITS: u64 = 48;
+        let big_edit = |id: u64| {
+            let client = yrs::Doc::with_client_id(id);
+            let map = client.get_or_insert_map("m");
+            let mut txn = client.transact_mut();
+            map.insert(&mut txn, id.to_string(), "x".repeat(512 * 1024));
+            txn.encode_update_v1()
+        };
+        let mut observer = ws_connect(addr, DOC_ID).await.unwrap();
+        let mut writer = ws_connect(addr, DOC_ID).await.unwrap();
+        for id in 1..=EDITS {
+            writer.send(ws_update(big_edit(id))).await.unwrap();
+        }
+        eventually("every edit is applied", || {
+            memory_keys(&docs, DOC_ID).len() == EDITS as usize
+        })
+        .await;
+
+        // The observer's connection ends: its next frame finds the gate closed.
+        gate.close();
+        observer.send(ws_update(map_edit(1000))).await.unwrap();
+
+        let received = yrs::Doc::new();
+        let read_all = async {
+            while let Some(Ok(message)) = observer.next().await {
+                let tokio_tungstenite::tungstenite::Message::Binary(bytes) = message else {
+                    continue;
+                };
+                if let Ok(SyncProtocolMessage::Sync(SyncMessage::Update(update))) =
+                    SyncProtocolMessage::decode_v1(&bytes)
+                {
+                    received
+                        .transact_mut()
+                        .apply_update(yrs::Update::decode_v1(&update).unwrap());
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), read_all)
+            .await
+            .expect("the socket was never closed");
+        let txn = received.transact();
+        let got = txn.get_map("m").map_or(0, |map| map.len(&txn));
+        assert_eq!(
+            got, EDITS as u32,
+            "edits queued for the socket were dropped"
+        );
+        drop(txn);
+
+        token.cancel();
+        serving.await.unwrap().unwrap();
     }
 
     #[tokio::test]

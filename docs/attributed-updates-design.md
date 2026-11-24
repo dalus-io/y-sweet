@@ -96,6 +96,11 @@ had to settle:
   drops the `DocConnection`, which unregisters from the doc under the doc lock (the connection-churn fix
   below), and only then aborts the sender task so that the socket closes at once. A suspension that
   closes many sockets of one doc while others connect is therefore serialized like any other churn.
+  The sender is aborted only on a server that enforces suspension or expiry, as the production builds
+  did; with both switches off the loop is PR #1's (no extra branches, no `biased` order, and the sender
+  drains what is queued for the socket before it lets go), which a test pins. With them on the selects
+  are not `biased` either; a frame or a queued message that wins over a suspension or the deadline is
+  refused by the check at the top of its branch instead.
 - **What the suspension answer guarantees.** Checking a flag before applying is not enough: a write can
   pass the check, wait for the doc lock, and be applied after the endpoint has answered. Each user has an
   activity guard, a read/write lock. A request takes it for reading at its last check (after its doc is in
