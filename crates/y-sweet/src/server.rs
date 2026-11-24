@@ -1714,14 +1714,12 @@ async fn auth_doc(
         valid_for_seconds,
         user_id,
         writer,
-        user_scoped,
     }) = body.unwrap_or_default();
 
-    // With user suspension, the user the token is bound to: the request's `userId`, unless
-    // the request says the token is not to be scoped to them.
-    let scoped_user = user_id
-        .clone()
-        .filter(|_| server_state.user_suspension && user_scoped != Some(false));
+    // With user suspension, the user the token is bound to: the request's `userId`, always,
+    // as in the production build. There is no way out: a token that names a user and outlived
+    // their suspension would be the hole suspension exists to close.
+    let scoped_user = user_id.clone().filter(|_| server_state.user_suspension);
 
     let actor_requested = user_id.is_some() || writer.is_some();
     let (user_id_bytes, writer_bytes) = (
@@ -1889,7 +1887,6 @@ mod test {
                 user_id: None,
                 writer: None,
                 valid_for_seconds: None,
-                user_scoped: None,
             })),
         )
         .await
@@ -2004,7 +2001,6 @@ mod test {
             user_id: user_id.map(str::to_string),
             writer: writer.map(str::to_string),
             valid_for_seconds: None,
-            user_scoped: None,
         })
     }
 
@@ -4737,8 +4733,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn with_attribution_a_token_bound_to_a_suspended_user_stops_and_an_unscoped_one_does_not()
-    {
+    async fn with_attribution_every_token_that_names_a_user_is_bound_to_them() {
         let deployed = Deployed::start(Switches {
             suspension: true,
             attribution: true,
@@ -4746,28 +4741,30 @@ mod test {
         })
         .await;
         let root = deployed.root();
-        let actor = |writer: &str| {
+        let actor = |user: Option<&str>, writer: &str| {
             Some(Actor {
-                user_id: Some("member".to_string()),
+                user_id: user.map(str::to_string),
                 writer: Some(writer.to_string()),
             })
         };
 
-        // A browser token and two tokens of server-side writers acting for the same user.
-        // One of the writers says it is not to be scoped to the user.
+        // A browser token and two tokens of server-side writers acting for the same user, one
+        // of which asks not to be scoped to the user. The production build ignores fields it
+        // does not know and binds every token minted with a `userId`; so does this one. A
+        // writer that names no user is bound to nobody.
         let browser = deployed
             .mint(json!({ "userId": "member", "writer": "ui" }))
             .await
             .unwrap();
-        let bound = deployed
+        let copilot = deployed
             .mint(json!({ "userId": "member", "writer": "copilot" }))
             .await
             .unwrap();
-        let unscoped = deployed
+        let opted_out = deployed
             .mint(json!({ "userId": "member", "writer": "import", "userScoped": false }))
             .await
             .unwrap();
-        // All three name the user as the actor; only the unscoped one is bound to no user.
+        let job = deployed.mint(json!({ "writer": "import" })).await.unwrap();
         let bound_to = |token: &str| {
             let managed = deployed
                 .verifier
@@ -4776,62 +4773,55 @@ mod test {
             (managed.access.actor, managed.user)
         };
         let member = Some(("member".to_string(), 0));
-        assert_eq!(bound_to(&browser), (actor("ui"), member.clone()));
-        assert_eq!(bound_to(&bound), (actor("copilot"), member));
-        assert_eq!(bound_to(&unscoped), (actor("import"), None));
+        assert_eq!(
+            bound_to(&browser),
+            (actor(Some("member"), "ui"), member.clone())
+        );
+        assert_eq!(
+            bound_to(&copilot),
+            (actor(Some("member"), "copilot"), member.clone())
+        );
+        assert_eq!(
+            bound_to(&opted_out),
+            (actor(Some("member"), "import"), member)
+        );
+        assert_eq!(bound_to(&job), (actor(None, "import"), None));
 
-        let mut browser_socket = deployed.connect(&browser).await.unwrap();
-        let mut bound_socket = deployed.connect(&bound).await.unwrap();
-        let mut unscoped_socket = deployed.connect(&unscoped).await.unwrap();
-        assert_eq!(deployed.update(&bound, map_edit(1)).await, 200);
-        assert_eq!(deployed.update(&unscoped, map_edit(2)).await, 200);
+        let mut sockets = Vec::new();
+        for token in [&browser, &copilot, &opted_out] {
+            sockets.push(deployed.connect(token).await.unwrap());
+        }
+        let mut job_socket = deployed.connect(&job).await.unwrap();
+        assert_eq!(deployed.update(&copilot, map_edit(1)).await, 200);
+        assert_eq!(deployed.update(&opted_out, map_edit(2)).await, 200);
 
         assert_eq!(deployed.suspend("member", true, &root).await, 204);
 
-        // Bound tokens: sockets closed, HTTP writes and new mints refused.
-        assert!(closed_by_server(&mut browser_socket, Duration::from_secs(3)).await);
-        assert!(closed_by_server(&mut bound_socket, Duration::from_secs(3)).await);
-        assert_eq!(deployed.update(&browser, map_edit(3)).await, 401);
-        assert_eq!(deployed.update(&bound, map_edit(4)).await, 401);
-        assert_eq!(
-            deployed
-                .mint(json!({ "userId": "member", "writer": "copilot" }))
-                .await,
-            Err(403)
-        );
-        // The unscoped writer carries on, attributed to the user all the same.
-        assert!(!closed_by_server(&mut unscoped_socket, Duration::from_millis(300)).await);
-        send_edit(&mut unscoped_socket, 5).await;
-        assert_eq!(deployed.update(&unscoped, map_edit(6)).await, 200);
-        assert!(deployed
-            .mint(json!({ "userId": "member", "writer": "import", "userScoped": false }))
-            .await
-            .is_ok());
-        eventually("the unscoped writer's edits are applied", || {
-            deployed.keys().contains("5") && deployed.keys().contains("6")
+        // Every token that names the user: sockets closed, HTTP writes and new mints refused.
+        for socket in &mut sockets {
+            assert!(closed_by_server(socket, Duration::from_secs(3)).await);
+        }
+        for (token, edit) in [(&browser, 3), (&copilot, 4), (&opted_out, 5)] {
+            assert_eq!(deployed.update(token, map_edit(edit)).await, 401);
+        }
+        for request in [
+            json!({ "userId": "member", "writer": "copilot" }),
+            json!({ "userId": "member", "writer": "import", "userScoped": false }),
+        ] {
+            assert_eq!(deployed.mint(request).await, Err(403));
+        }
+        // The writer bound to nobody carries on.
+        assert!(!closed_by_server(&mut job_socket, Duration::from_millis(300)).await);
+        send_edit(&mut job_socket, 6).await;
+        assert_eq!(deployed.update(&job, map_edit(7)).await, 200);
+        eventually("the unbound writer's edits are applied", || {
+            deployed.keys().contains("6") && deployed.keys().contains("7")
         })
         .await;
         let keys = deployed.keys();
-        assert!(!keys.contains("3") && !keys.contains("4"), "{keys:?}");
-
-        let mut actors: Vec<_> = deployed
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|event| event.actor.clone().and_then(|actor| actor.writer))
-            .collect();
-        actors.sort();
-        let writer = |writer: &str| Some(writer.to_string());
-        assert_eq!(
-            actors,
-            [
-                writer("copilot"),
-                writer("import"),
-                writer("import"),
-                writer("import")
-            ]
-        );
+        for refused in ["3", "4", "5"] {
+            assert!(!keys.contains(refused), "{keys:?}");
+        }
         deployed.stop().await;
     }
 

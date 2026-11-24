@@ -127,9 +127,10 @@ had to settle:
   can still take effect at the next restart: no later generation exists to outrank it. That is inherent
   in a write of unknown outcome; what cannot happen any more is that it outranks a later change.
 - **Tokens with attribution.** A token that must carry both the binding and the actor is variant 4.
-  Whether a request's `userId` binds the token is decided as the patch decides it (it does), with
-  `"userScoped": false` as the request's way out; see the operator page for what that means for
-  server-side writers.
+  Whether a request's `userId` binds the token is decided as the patch decides it: it always does. There
+  is no way out (an earlier revision of this port had `"userScoped": false`; the production build ignores
+  that field and binds, so a token minted with it here survived a suspension the production build would
+  have enforced). See the operator page for what that means for server-side writers.
 
 Attributed tokens minted while `AttributedDoc` was index 2 (only builds of this branch up to 649406a with
 the switch on) are rejected by later builds; they expire within their lifetime, an hour by default.

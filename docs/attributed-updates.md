@@ -449,15 +449,16 @@ where they used to send none, so their tokens become bound too. When that user i
 - new tokens for that `userId` are refused with `403`, for every writer kind, until the user is
   restored.
 
-A request can ask for the other behaviour with `"userScoped": false`: the token still names
-the user as the actor, so its writes are attributed to them, but it is bound to no user and is
-untouched by their suspension, like the tokens internal jobs get today. The field is read only
-with user suspension on, and an older server ignores it. Which server-side writers should
-keep working for a suspended user is the application's decision; the server does not know
-writer kinds and treats every request alike. Two more things follow from sharing the field:
-with suspension on, a `userId` that is fine for attribution alone (any bytes, up to 128) is
-refused with `403` unless it fits the stricter character set above or the request is not
-user-scoped; and a request with a `writer` but no `userId` is attributed and bound to nobody.
+There is no way out of the binding for a request that names a user: the production build
+ignores any field it does not know and binds on `userId`, and so does this one (an earlier
+revision of this port read `"userScoped": false` as an opt-out; it is ignored now, like any
+unknown field). A writer that must keep working for a suspended user has to be minted without a
+`userId`, which also means without attribution to that user: a token with a `writer` and no
+`userId` is attributed to the writer kind and bound to nobody. Which server-side writers
+should stop for a suspended user is the application's decision, made by whether it sends the
+`userId`; the server does not know writer kinds and treats every request alike. With
+suspension on, a `userId` that is fine for attribution alone (any bytes, up to 128) is refused
+with `403` unless it fits the stricter character set above.
 
 ### Token expiry
 

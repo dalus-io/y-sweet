@@ -32,12 +32,6 @@ pub struct AuthDocRequest {
     pub writer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "validForSeconds")]
     pub valid_for_seconds: Option<u64>,
-    /// Only read by a server that enforces user suspension. There, a token minted with a
-    /// `userId` is bound to that user: it stops working when the user is suspended. `false`
-    /// asks for a token that names the user (for attribution) without being bound to them,
-    /// for a writer that acts for a user and is governed by other means. Absent means `true`.
-    #[serde(default, rename = "userScoped")]
-    pub user_scoped: Option<bool>,
 }
 
 impl Default for AuthDocRequest {
@@ -47,7 +41,6 @@ impl Default for AuthDocRequest {
             user_id: None,
             writer: None,
             valid_for_seconds: None,
-            user_scoped: None,
         }
     }
 }
