@@ -850,15 +850,13 @@ pub(crate) mod test {
     }
 
     async fn reload(store: &MemoryStore) -> crate::doc_sync::DocWithSyncKv {
-        crate::doc_sync::DocWithSyncKv::new(
-            "doc",
-            Some(Arc::new(Box::new(store.clone()))),
-            || (),
-            false,
-            None,
-        )
-        .await
-        .unwrap()
+        let store: Option<Arc<Box<dyn Store>>> = Some(Arc::new(Box::new(store.clone())));
+        // `new` takes the update callback only with the `sync` feature.
+        #[cfg(feature = "sync")]
+        let doc = crate::doc_sync::DocWithSyncKv::new("doc", store, || (), false, None).await;
+        #[cfg(not(feature = "sync"))]
+        let doc = crate::doc_sync::DocWithSyncKv::new("doc", store, || (), false).await;
+        doc.unwrap()
     }
 
     #[tokio::test]
