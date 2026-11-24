@@ -821,6 +821,49 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn a_save_sent_inside_the_window_that_ends_after_it_does_not_settle_the_doc() {
+        // It may be applied before the stale write, so only a save started after the window
+        // settles the doc, however late this one finishes.
+        let store = HeldStore::new();
+        let sync_kv = Arc::new(
+            SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+                .await
+                .unwrap(),
+        );
+        let window = Duration::from_millis(300);
+        sync_kv.set_suspect_window(window, Duration::ZERO);
+        sync_kv.set(b"a", b"1");
+        *store.fail_next_set_with.lock().unwrap() = Some(StoreError::Timeout {
+            limit: Duration::from_millis(1),
+            what: "waiting for",
+        });
+        store.set_release.add_permits(1);
+        assert!(sync_kv.persist().await.is_err());
+        let failed_at = Instant::now();
+
+        // Sent inside the window, held by the store until the window has passed.
+        let spanning = tokio::spawn({
+            let sync_kv = sync_kv.clone();
+            async move { sync_kv.persist().await.map_err(|e| e.to_string()) }
+        });
+        store.set_entered.notified().await;
+        assert!(failed_at.elapsed() < window, "the test ran too slowly");
+        tokio::time::sleep(window).await;
+        assert!(!sync_kv.is_suspect());
+        store.set_release.add_permits(1);
+        spanning.await.unwrap().unwrap();
+        assert!(sync_kv.is_unsettled());
+        assert!(sync_kv.has_unsaved_changes());
+
+        // The next save, sent after the window, does.
+        store.set_release.add_permits(1);
+        sync_kv.persist().await.unwrap();
+        assert!(!sync_kv.is_unsettled());
+        assert!(!sync_kv.has_unsaved_changes());
+        assert_eq!(store.sets.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn an_abandoned_save_keeps_the_doc_dirty() {
         let store = HeldStore::new();
         let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())

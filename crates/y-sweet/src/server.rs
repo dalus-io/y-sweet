@@ -3250,6 +3250,51 @@ mod test {
     }
 
     #[tokio::test]
+    async fn a_doc_gc_fails_to_save_during_shutdown_gets_its_final_save() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // GC has retired the doc and is saving it when shutdown starts; that save fails. GC
+        // keeps the doc, and the persistence worker's final save must still store the edit
+        // (and not skip it as a copy GC dropped).
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_checkpoints(&store, &token, Duration::from_millis(50)).await;
+        let docs = server.docs.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        store.hold_sets.store(true, SeqCst);
+        assert_eq!(
+            post_update(addr, DOC_ID, map_edit(1)).await.unwrap(),
+            Some(200)
+        );
+        // The checkpoint's save is held; GC retires the doc and waits to save it.
+        store.set_entered.notified().await;
+        eventually("GC retires the doc", || is_retired(&docs, DOC_ID)).await;
+
+        token.cancel();
+        store.fail_sets.store(true, SeqCst);
+        // The checkpoint's save fails; then GC's, made after shutdown began.
+        store.set_release.add_permits(1);
+        store.set_entered.notified().await;
+        store.set_release.add_permits(1);
+        eventually("GC keeps the doc", || !is_retired(&docs, DOC_ID)).await;
+        assert!(!stored_keys(&store).await.contains("1"));
+
+        // The store recovers while the final save is being retried.
+        store.fail_sets.store(false, SeqCst);
+        store.hold_sets.store(false, SeqCst);
+        store.set_release.add_permits(100);
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+        assert!(stored_keys(&store).await.contains("1"));
+    }
+
+    #[tokio::test]
     async fn a_hung_save_makes_writers_fail_fast_and_shutdown_stays_bounded() {
         use std::sync::atomic::Ordering::SeqCst;
 
