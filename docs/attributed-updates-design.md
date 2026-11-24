@@ -351,7 +351,12 @@ ordered, with a budget per stage:
    write gate closes, in two steps: admission stops at once and unconditionally (later writes get `503`, or
    the websocket message is dropped unapplied), even if the requests above overran the budget; then it waits,
    bounded, for writes already admitted. A write is admitted only around applying the update, never across
-   loading its doc or store I/O, so that wait is short. Budget 5 s.
+   loading its doc or store I/O, so that wait is short. Budget 5 s. The gate is sealed just before the final
+   saves start; a write that finishes applying after the seal (the wait gave up on it) may be missing from
+   them, so the HTTP handler answers it `503` instead of `200`. Waiting longer for it would take time from
+   the saves of every doc, and a second save round after it could not be bounded either; not acknowledging
+   it keeps the rule exact: every acknowledged write is in the final save. A websocket client's
+   acknowledgement is the echo of a later message, which the closed gate already refuses.
 3. The persistence and GC workers, on their own token, stop; each does a final save, and retries it with
    backoff (0.25 s doubling to 5 s) if it fails. The saves have until the shutdown timeout.
 4. The dispatcher, on its own token, flushes. Budget 7 s (its internal budget is 5 s). It starts when the

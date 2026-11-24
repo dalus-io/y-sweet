@@ -150,27 +150,58 @@ struct DocLoader {
 /// yet been admitted is refused from then on, however long draining takes. [WriteGate::drained]
 /// then waits for writes already admitted to finish applying. A write holds its admission only
 /// while it applies, never across doc loading or store I/O, so draining is quick.
+///
+/// Draining is bounded, so a write can still be applying when the final saves start
+/// ([WriteGate::seal]). Such a write may be missing from them; [Admission::in_time] tells it
+/// so, and it is not acknowledged. (A websocket client's acknowledgement is the echo of a later
+/// message, which the closed gate refuses.)
 pub(crate) struct WriteGate {
     accepting: std::sync::atomic::AtomicBool,
+    /// Set when the final saves start.
+    sealed: std::sync::atomic::AtomicBool,
     /// Admitted writes hold this for reading; draining takes it for writing.
     in_progress: tokio::sync::RwLock<()>,
+}
+
+/// One admitted write. Hold it while applying.
+pub(crate) struct Admission<'a> {
+    _applying: tokio::sync::RwLockReadGuard<'a, ()>,
+    sealed: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Admission<'_> {
+    /// Whether what this write has applied so far is in the final saves. Ask after applying,
+    /// before acknowledging: false once the final saves have started without waiting for it.
+    fn in_time(&self) -> bool {
+        !self.sealed.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl WriteGate {
     fn new() -> Self {
         Self {
             accepting: std::sync::atomic::AtomicBool::new(true),
+            sealed: std::sync::atomic::AtomicBool::new(false),
             in_progress: tokio::sync::RwLock::new(()),
         }
     }
 
-    /// Admits one write: `None` once the gate is closed. Hold the guard while applying.
-    async fn enter(&self) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+    /// Admits one write: `None` once the gate is closed. Hold the admission while applying.
+    async fn enter(&self) -> Option<Admission<'_>> {
         let guard = self.in_progress.read().await;
         // Checked after taking the read lock: a write admitted here is one `drained` waits for.
         self.accepting
             .load(std::sync::atomic::Ordering::SeqCst)
-            .then_some(guard)
+            .then_some(Admission {
+                _applying: guard,
+                sealed: &self.sealed,
+            })
+    }
+
+    /// Marks the start of the final saves: a write that finishes applying after this is not
+    /// in time ([Admission::in_time]).
+    fn seal(&self) {
+        self.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn close(&self) {
@@ -923,13 +954,17 @@ impl Server {
             .await
             .is_err()
         {
-            // A write admitted before the close may land after the final save below.
+            // A write admitted before the close may land after the final save below; the seal
+            // keeps it from being acknowledged.
             stage_timed_out("write_gate", budgets.connections);
         }
 
         // Stage 3: the final saves. They have until the total deadline, and a save that fails
         // is retried until then (see `doc_persistence_worker`).
         let total_deadline = shutdown_began + budgets.total;
+        // Before any final save reads its doc: a write that sees the gate unsealed after
+        // applying is in the saves.
+        self.write_gate.seal();
         self.doc_workers_token.cancel();
         self.doc_worker_tracker.close();
         let saves = self.doc_worker_tracker.wait();
@@ -1130,6 +1165,14 @@ async fn update_doc_inner(
     if let Err(err) = apply_update_to(&awareness, &body, access.actor.as_ref()) {
         tracing::error!(?err, "Failed to apply update");
         return Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, err));
+    }
+    // Shutdown stopped waiting for this write and started the final saves, which may not hold
+    // it: refuse it like any write after the gate closed. Resending an update is harmless.
+    if !admitted.in_time() {
+        return Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            anyhow!("The server is shutting down."),
+        ));
     }
     drop(admitted);
     drop(awareness);
@@ -2919,6 +2962,45 @@ mod test {
 
         *store.held_key.lock().unwrap() = None;
         assert!(!stored_keys(&store).await.contains("2"));
+    }
+
+    #[tokio::test]
+    async fn a_write_still_applying_when_the_drain_times_out_is_not_acknowledged() {
+        // Admitted before the gate closes, and still applying when the drain limit passes, so
+        // the final saves start without it. Whatever it applies from then on may not be in
+        // them: it must not be acknowledged. (The admission is held here the way a handler
+        // holds it; a handler stuck on the doc lock would block a runtime thread.)
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token)
+            .await
+            .with_shutdown_budgets(ShutdownBudgets {
+                connections: Duration::from_millis(300),
+                total: Duration::from_secs(5),
+                webhook: Duration::from_secs(1),
+            });
+        let (gate, docs) = (server.write_gate.clone(), server.docs.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        // A write that applies while the gate is open is in time.
+        let admitted = gate.enter().await.expect("the gate is open");
+        docs.get(DOC_ID).unwrap().apply_update(&map_edit(1), None).unwrap();
+        assert!(admitted.in_time());
+        drop(admitted);
+
+        let stuck = gate.enter().await.expect("the gate is open");
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+        // The final saves are done; the stuck write applies now.
+        docs.get(DOC_ID).unwrap().apply_update(&map_edit(7), None).unwrap();
+        let stored = stored_keys(&store).await;
+        assert!(stored.contains("1") && !stored.contains("7"), "{stored:?}");
+        assert!(!stuck.in_time(), "acknowledged but not saved");
     }
 
     /// Posts `body` to `/d/{doc_id}/update` and returns the status, or `None` if the request

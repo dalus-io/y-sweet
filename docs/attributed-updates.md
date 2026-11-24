@@ -494,7 +494,7 @@ default). Either one runs these stages:
 | Stage | What happens | Time limit |
 | --- | --- | --- |
 | 1 | Stop accepting connections; tell every websocket to close. | (immediate) |
-| 2 | Let in-flight HTTP requests finish and websockets close, then close the write gate, whether or not they did: from here on a write is refused (`503` on HTTP; a websocket is dropped without applying the message, and the client resends on reconnect), including one that was still loading its doc or receiving its body. Writes already applying finish first. No write is acknowledged after this point. | 5 s |
+| 2 | Let in-flight HTTP requests finish and websockets close, then close the write gate, whether or not they did: from here on a write is refused (`503` on HTTP; a websocket is dropped without applying the message, and the client resends on reconnect), including one that was still loading its doc or receiving its body. Writes already applying finish first, within the stage's limit (at least 0.5 s); one still applying after that is not acknowledged either (`503`), because the final saves may not hold it. No write is acknowledged after this point. | 5 s |
 | 3 | Stop every doc's persistence worker; each makes a final save to the store, retrying a save that fails (after 0.25 s, 0.5 s, ... up to every 5 s). | until the shutdown timeout |
 | 4 | Stop the update webhook; it flushes everything applied above. Starts when the saves are done, or beside them once only 7 s of the shutdown timeout are left. | 7 s (the flush itself has 5 s) |
 
