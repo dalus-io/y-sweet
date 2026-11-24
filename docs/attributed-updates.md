@@ -69,7 +69,6 @@ The request and response formats of every endpoint are unchanged. `userId` and `
 auth request are accepted and ignored, as upstream does (upstream ignores `writer` as an unknown
 field), whatever their length.
 
-The design and its rationale are in [attributed-updates-design.md](attributed-updates-design.md).
 This page is for whoever runs the server or writes the receiver.
 
 ## Configuration
