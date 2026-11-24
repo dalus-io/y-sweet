@@ -71,7 +71,6 @@ The request and response formats of every endpoint are unchanged. `userId` and `
 auth request are accepted and ignored, as upstream does (upstream ignores `writer` as an unknown
 field), whatever their length.
 
-The design and its rationale are in [attributed-updates-design.md](attributed-updates-design.md).
 This page is for whoever runs the server or writes the receiver.
 
 ## Configuration
@@ -167,8 +166,9 @@ connection could not be made (refused, DNS, TLS, the connect timeout), or the st
 request (`401`, `403`, `404`). After a failure that counts, the doc is *suspect* for a window:
 
 - The window is 5 minutes from the failure, or 5 times the time that request was given if
-  that is longer (a higher `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS`, or a large doc). Another
-  such failure inside the window extends it.
+  that is longer (a higher `Y_SWEET_S3_REQUEST_TIMEOUT_SECONDS`, or a large doc). This holds
+  for a reset or a `5xx` as for a timeout: the request failed sooner, but the store may hold
+  it as long. Another such failure inside the window extends it.
 - A successful save of a suspect doc does not count as having saved it. The doc is saved
   again **every 60 s** during the window although nothing in it changed, so a stale write
   that lands is overwritten with the current state within a minute. A doc that does change
@@ -265,6 +265,12 @@ A longer value is rejected with `400` when the switch is on. With the switch off
 ignored, as upstream does, and the request succeeds with a plain token; the server logs
 `auth request actor too long` (warn, with the lengths only, never the values) so that the
 problem shows up before the switch is turned on. The response (`ClientToken`) is unchanged.
+
+A body that is not a valid request is refused, whatever the switch: `415` without
+`Content-Type: application/json`, `400` for JSON that does not parse, `422` for a field of the
+wrong type or an unknown `authorization` (a numeric `userId`, an object as `writer`). Upstream
+read any of these as an empty request and minted a full-access token, even for a request that
+asked for `read-only`. An empty body is still the default request (full access), as upstream.
 
 What gets minted:
 
@@ -732,7 +738,7 @@ default). Either one runs these stages:
 | Stage | What happens | Time limit |
 | --- | --- | --- |
 | 1 | Stop accepting connections; tell every websocket to close. | (immediate) |
-| 2 | Let in-flight HTTP requests finish and websockets close, then close the write gate, whether or not they did: from here on a write is refused (`503` on HTTP; a websocket is dropped without applying the message, and the client resends on reconnect), including one that was still loading its doc or receiving its body. Writes already applying finish first. No write is acknowledged after this point. | 5 s |
+| 2 | Let in-flight HTTP requests finish and websockets close, then close the write gate, whether or not they did: from here on a write is refused (`503` on HTTP; a websocket is dropped without applying the message, and the client resends on reconnect), including one that was still loading its doc or receiving its body. Writes already applying finish first, within the stage's limit (at least 0.5 s); one still applying after that is not acknowledged either (`503`), because the final saves may not hold it. No write is acknowledged after this point. | 5 s |
 | 3 | Stop every doc's persistence worker; each makes a final save to the store, retrying a save that fails (after 0.25 s, 0.5 s, ... up to every 5 s). | until the shutdown timeout |
 | 4 | Stop the update webhook; it flushes everything applied above. Starts when the saves are done, or beside them once only 7 s of the shutdown timeout are left. | 7 s (the flush itself has 5 s) |
 

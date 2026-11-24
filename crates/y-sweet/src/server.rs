@@ -151,27 +151,58 @@ struct DocLoader {
 /// yet been admitted is refused from then on, however long draining takes. [WriteGate::drained]
 /// then waits for writes already admitted to finish applying. A write holds its admission only
 /// while it applies, never across doc loading or store I/O, so draining is quick.
+///
+/// Draining is bounded, so a write can still be applying when the final saves start
+/// ([WriteGate::seal]). Such a write may be missing from them; [Admission::in_time] tells it
+/// so, and it is not acknowledged. (A websocket client's acknowledgement is the echo of a later
+/// message, which the closed gate refuses.)
 pub(crate) struct WriteGate {
     accepting: std::sync::atomic::AtomicBool,
+    /// Set when the final saves start.
+    sealed: std::sync::atomic::AtomicBool,
     /// Admitted writes hold this for reading; draining takes it for writing.
     in_progress: tokio::sync::RwLock<()>,
+}
+
+/// One admitted write. Hold it while applying.
+pub(crate) struct Admission<'a> {
+    _applying: tokio::sync::RwLockReadGuard<'a, ()>,
+    sealed: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Admission<'_> {
+    /// Whether what this write has applied so far is in the final saves. Ask after applying,
+    /// before acknowledging: false once the final saves have started without waiting for it.
+    fn in_time(&self) -> bool {
+        !self.sealed.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl WriteGate {
     fn new() -> Self {
         Self {
             accepting: std::sync::atomic::AtomicBool::new(true),
+            sealed: std::sync::atomic::AtomicBool::new(false),
             in_progress: tokio::sync::RwLock::new(()),
         }
     }
 
-    /// Admits one write: `None` once the gate is closed. Hold the guard while applying.
-    async fn enter(&self) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+    /// Admits one write: `None` once the gate is closed. Hold the admission while applying.
+    async fn enter(&self) -> Option<Admission<'_>> {
         let guard = self.in_progress.read().await;
         // Checked after taking the read lock: a write admitted here is one `drained` waits for.
         self.accepting
             .load(std::sync::atomic::Ordering::SeqCst)
-            .then_some(guard)
+            .then_some(Admission {
+                _applying: guard,
+                sealed: &self.sealed,
+            })
+    }
+
+    /// Marks the start of the final saves: a write that finishes applying after this is not
+    /// in time ([Admission::in_time]).
+    fn seal(&self) {
+        self.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn close(&self) {
@@ -1065,13 +1096,17 @@ impl Server {
             .await
             .is_err()
         {
-            // A write admitted before the close may land after the final save below.
+            // A write admitted before the close may land after the final save below; the seal
+            // keeps it from being acknowledged.
             stage_timed_out("write_gate", budgets.connections);
         }
 
         // Stage 3: the final saves. They have until the total deadline, and a save that fails
         // is retried until then (see `doc_persistence_worker`).
         let total_deadline = shutdown_began + budgets.total;
+        // Before any final save reads its doc: a write that sees the gate unsealed after
+        // applying is in the saves.
+        self.write_gate.seal();
         self.doc_workers_token.cancel();
         self.doc_worker_tracker.close();
         let saves = self.doc_worker_tracker.wait();
@@ -1347,6 +1382,14 @@ async fn update_doc_inner(
         return Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, err));
     }
     drop(granted);
+    // Shutdown stopped waiting for this write and started the final saves, which may not hold
+    // it: refuse it like any write after the gate closed. Resending an update is harmless.
+    if !admitted.in_time() {
+        return Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            anyhow!("The server is shutting down."),
+        ));
+    }
     drop(admitted);
     drop(awareness);
 
@@ -1715,21 +1758,50 @@ async fn new_doc(
     Ok(Json(NewDocResponse { doc_id }))
 }
 
+/// The body of an auth request. An empty body asks for the defaults (a full-access token), as
+/// upstream allows. Any other body must be a JSON [AuthDocRequest]; one that is not is refused,
+/// never read as the defaults, which would mint a full-access token for a request that may have
+/// asked for read-only.
+fn parse_auth_request(headers: &HeaderMap, body: &Bytes) -> Result<AuthDocRequest, AppError> {
+    if body.is_empty() {
+        return Ok(AuthDocRequest::default());
+    }
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let essence = value.split(';').next().unwrap_or("").trim();
+            essence.eq_ignore_ascii_case("application/json")
+                || (essence.starts_with("application/") && essence.ends_with("+json"))
+        })
+        .unwrap_or(false);
+    if !is_json {
+        return Err(AppError(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            anyhow!("Expected request with `Content-Type: application/json`"),
+        ));
+    }
+    Json::<AuthDocRequest>::from_bytes(body)
+        .map(|Json(request)| request)
+        .map_err(|rejection| AppError(rejection.status(), anyhow!(rejection.body_text())))
+}
+
 async fn auth_doc(
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
     TypedHeader(host): TypedHeader<headers::Host>,
     State(server_state): State<Arc<Server>>,
     Path(doc_id): Path<String>,
-    body: Option<Json<AuthDocRequest>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<ClientToken>, AppError> {
     server_state.check_auth(auth_header)?;
 
-    let Json(AuthDocRequest {
+    let AuthDocRequest {
         authorization,
         valid_for_seconds,
         user_id,
         writer,
-    }) = body.unwrap_or_default();
+    } = parse_auth_request(&headers, &body)?;
 
     // With user suspension, the user the token is bound to: the request's `userId`, always,
     // as in the production build. There is no way out: a token that names a user and outlived
@@ -1897,12 +1969,8 @@ mod test {
             ))),
             State(Arc::new(server_state)),
             Path(doc_id.clone()),
-            Some(Json(AuthDocRequest {
-                authorization: Authorization::Full,
-                user_id: None,
-                writer: None,
-                valid_for_seconds: None,
-            })),
+            json_headers(),
+            Bytes::from_static(br#"{"authorization": "full"}"#),
         )
         .await
         .unwrap();
@@ -1938,7 +2006,8 @@ mod test {
             ))),
             State(Arc::new(server_state)),
             Path(doc_id.clone()),
-            None,
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap();
@@ -1995,7 +2064,8 @@ mod test {
             localhost(),
             State(server.clone()),
             Path(DOC_ID.to_string()),
-            request.map(Json),
+            json_headers(),
+            Bytes::from(json_body(request).to_string()),
         )
         .await;
         match response {
@@ -2008,6 +2078,28 @@ mod test {
                 .unwrap()),
             Err(AppError(status, _)) => Err(status),
         }
+    }
+
+    fn json_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        headers
+    }
+
+    /// `request` as a client sends it; `None` is the empty object.
+    fn json_body(request: Option<AuthDocRequest>) -> Value {
+        let Some(request) = request else {
+            return json!({});
+        };
+        json!({
+            "authorization": request.authorization,
+            "userId": request.user_id,
+            "writer": request.writer,
+            "validForSeconds": request.valid_for_seconds,
+        })
     }
 
     fn request(user_id: Option<&str>, writer: Option<&str>) -> Option<AuthDocRequest> {
@@ -2031,6 +2123,74 @@ mod test {
         assert_eq!(request.writer, None);
         let request: AuthDocRequest = serde_json::from_str("{}").unwrap();
         assert_eq!((request.user_id, request.writer), (None, None));
+    }
+
+    /// Posts `body` to the auth endpoint of a served server. Returns the status, and on `200`
+    /// the authorization the minted token grants.
+    async fn auth_over_http(
+        content_type: Option<&str>,
+        body: &'static str,
+    ) -> (u16, Option<Authorization>) {
+        let (server, verifier) = server_with_auth(true).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(server.serve(listener, false));
+
+        let mut request = reqwest::Client::new()
+            .post(format!("http://{addr}/doc/{DOC_ID}/auth"))
+            .bearer_auth(verifier.server_token())
+            .body(body);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        if status != 200 {
+            return (status, None);
+        }
+        let token: ClientToken = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        let access = verifier
+            .verify_doc_token(&token.token.unwrap(), DOC_ID, current_time_epoch_millis())
+            .unwrap();
+        (status, Some(access.authorization))
+    }
+
+    #[tokio::test]
+    async fn auth_without_a_body_mints_a_full_token() {
+        // What upstream accepts, e.g. `curl -X POST` with no body.
+        assert_eq!(
+            auth_over_http(None, "").await,
+            (200, Some(Authorization::Full))
+        );
+        assert_eq!(
+            auth_over_http(Some("application/json"), "{}").await,
+            (200, Some(Authorization::Full))
+        );
+        assert_eq!(
+            auth_over_http(Some("application/json"), r#"{"authorization": "read-only"}"#).await,
+            (200, Some(Authorization::ReadOnly))
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_with_a_malformed_body_is_refused_not_defaulted_to_full() {
+        // Each asks for read-only; none may come back with a token, least of all a full one.
+        let json = Some("application/json");
+        let cases: [(Option<&str>, &'static str, u16); 6] = [
+            (json, r#"{"authorization": "read-only", "userId": 7}"#, 422),
+            (json, r#"{"authorization": "read-only", "writer": {"kind": "ui"}}"#, 422),
+            (json, r#"{"authorization": "read-only-ish"}"#, 422),
+            (json, r#"{"authorization": "read-only""#, 400),
+            (Some("text/plain"), r#"{"authorization": "read-only"}"#, 415),
+            (None, r#"{"authorization": "read-only"}"#, 415),
+        ];
+        for (content_type, body, status) in cases {
+            assert_eq!(
+                auth_over_http(content_type, body).await,
+                (status, None),
+                "{content_type:?} {body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3145,6 +3305,45 @@ mod test {
         assert!(!stored_keys(&store).await.contains("2"));
     }
 
+    #[tokio::test]
+    async fn a_write_still_applying_when_the_drain_times_out_is_not_acknowledged() {
+        // Admitted before the gate closes, and still applying when the drain limit passes, so
+        // the final saves start without it. Whatever it applies from then on may not be in
+        // them: it must not be acknowledged. (The admission is held here the way a handler
+        // holds it; a handler stuck on the doc lock would block a runtime thread.)
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_store(&store, &token)
+            .await
+            .with_shutdown_budgets(ShutdownBudgets {
+                connections: Duration::from_millis(300),
+                total: Duration::from_secs(5),
+                webhook: Duration::from_secs(1),
+            });
+        let (gate, docs) = (server.write_gate.clone(), server.docs.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        // A write that applies while the gate is open is in time.
+        let admitted = gate.enter().await.expect("the gate is open");
+        docs.get(DOC_ID).unwrap().apply_update(&map_edit(1), None).unwrap();
+        assert!(admitted.in_time());
+        drop(admitted);
+
+        let stuck = gate.enter().await.expect("the gate is open");
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+        // The final saves are done; the stuck write applies now.
+        docs.get(DOC_ID).unwrap().apply_update(&map_edit(7), None).unwrap();
+        let stored = stored_keys(&store).await;
+        assert!(stored.contains("1") && !stored.contains("7"), "{stored:?}");
+        assert!(!stuck.in_time(), "acknowledged but not saved");
+    }
+
     /// Posts `body` to `/d/{doc_id}/update` and returns the status, or `None` if the request
     /// failed.
     fn post_update(
@@ -3389,6 +3588,51 @@ mod test {
         assert!(stored.contains("1") && stored.contains("2"), "{stored:?}");
         token.cancel();
         serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_doc_gc_fails_to_save_during_shutdown_gets_its_final_save() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // GC has retired the doc and is saving it when shutdown starts; that save fails. GC
+        // keeps the doc, and the persistence worker's final save must still store the edit
+        // (and not skip it as a copy GC dropped).
+        let store = TestStore::default();
+        let token = CancellationToken::new();
+        let server = server_with_checkpoints(&store, &token, Duration::from_millis(50)).await;
+        let docs = server.docs.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(listener, false));
+
+        store.hold_sets.store(true, SeqCst);
+        assert_eq!(
+            post_update(addr, DOC_ID, map_edit(1)).await.unwrap(),
+            Some(200)
+        );
+        // The checkpoint's save is held; GC retires the doc and waits to save it.
+        store.set_entered.notified().await;
+        eventually("GC retires the doc", || is_retired(&docs, DOC_ID)).await;
+
+        token.cancel();
+        store.fail_sets.store(true, SeqCst);
+        // The checkpoint's save fails; then GC's, made after shutdown began.
+        store.set_release.add_permits(1);
+        store.set_entered.notified().await;
+        store.set_release.add_permits(1);
+        eventually("GC keeps the doc", || !is_retired(&docs, DOC_ID)).await;
+        assert!(!stored_keys(&store).await.contains("1"));
+
+        // The store recovers while the final save is being retried.
+        store.fail_sets.store(false, SeqCst);
+        store.hold_sets.store(false, SeqCst);
+        store.set_release.add_permits(100);
+        tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+        assert!(stored_keys(&store).await.contains("1"));
     }
 
     #[tokio::test]

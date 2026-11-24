@@ -730,7 +730,10 @@ pub(crate) mod test {
 
             // A timeout does, and so does a connection lost after the request went out.
             *store.fail_next_set_with.lock().unwrap() = Some(if interrupted {
-                StoreError::Interrupted("reset".to_string())
+                StoreError::Interrupted {
+                    message: "reset".to_string(),
+                    limit: Duration::from_millis(1),
+                }
             } else {
                 StoreError::Timeout {
                     limit: Duration::from_millis(1),
@@ -786,24 +789,78 @@ pub(crate) mod test {
 
     #[tokio::test]
     async fn the_suspect_window_is_several_times_the_timeout_that_started_it() {
-        let store = HeldStore::new();
-        store.set_release.add_permits(100);
-        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
-            .await
-            .unwrap();
-        sync_kv.set_suspect_window(Duration::ZERO, Duration::ZERO);
-        sync_kv.set(b"a", b"1");
-
+        // The same for a save that timed out and one cut off sooner (reset, `5xx`): both may
+        // be held by the store for as long as the request was given.
         let limit = Duration::from_secs(600);
+        let failures = [
+            StoreError::Timeout {
+                limit,
+                what: "waiting for",
+            },
+            StoreError::Interrupted {
+                message: "reset".to_string(),
+                limit,
+            },
+        ];
+        for failure in failures {
+            let store = HeldStore::new();
+            store.set_release.add_permits(100);
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+                .await
+                .unwrap();
+            sync_kv.set_suspect_window(Duration::ZERO, Duration::ZERO);
+            sync_kv.set(b"a", b"1");
+
+            *store.fail_next_set_with.lock().unwrap() = Some(failure);
+            assert!(sync_kv.persist().await.is_err());
+            let until = sync_kv.suspect.lock().unwrap().as_ref().unwrap().until;
+            let window = until - Instant::now();
+            assert!(window > limit * (SUSPECT_WINDOW_TIMEOUTS - 1) && window <= limit * 5);
+        }
+        assert!(DEFAULT_SUSPECT_WINDOW >= crate::store::s3::DEFAULT_REQUEST_TIMEOUT * 5);
+    }
+
+    #[tokio::test]
+    async fn a_save_sent_inside_the_window_that_ends_after_it_does_not_settle_the_doc() {
+        // It may be applied before the stale write, so only a save started after the window
+        // settles the doc, however late this one finishes.
+        let store = HeldStore::new();
+        let sync_kv = Arc::new(
+            SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+                .await
+                .unwrap(),
+        );
+        let window = Duration::from_millis(300);
+        sync_kv.set_suspect_window(window, Duration::ZERO);
+        sync_kv.set(b"a", b"1");
         *store.fail_next_set_with.lock().unwrap() = Some(StoreError::Timeout {
-            limit,
+            limit: Duration::from_millis(1),
             what: "waiting for",
         });
+        store.set_release.add_permits(1);
         assert!(sync_kv.persist().await.is_err());
-        let until = sync_kv.suspect.lock().unwrap().as_ref().unwrap().until;
-        let window = until - Instant::now();
-        assert!(window > limit * (SUSPECT_WINDOW_TIMEOUTS - 1) && window <= limit * 5);
-        assert!(DEFAULT_SUSPECT_WINDOW >= crate::store::s3::DEFAULT_REQUEST_TIMEOUT * 5);
+        let failed_at = Instant::now();
+
+        // Sent inside the window, held by the store until the window has passed.
+        let spanning = tokio::spawn({
+            let sync_kv = sync_kv.clone();
+            async move { sync_kv.persist().await.map_err(|e| e.to_string()) }
+        });
+        store.set_entered.notified().await;
+        assert!(failed_at.elapsed() < window, "the test ran too slowly");
+        tokio::time::sleep(window).await;
+        assert!(!sync_kv.is_suspect());
+        store.set_release.add_permits(1);
+        spanning.await.unwrap().unwrap();
+        assert!(sync_kv.is_unsettled());
+        assert!(sync_kv.has_unsaved_changes());
+
+        // The next save, sent after the window, does.
+        store.set_release.add_permits(1);
+        sync_kv.persist().await.unwrap();
+        assert!(!sync_kv.is_unsettled());
+        assert!(!sync_kv.has_unsaved_changes());
+        assert_eq!(store.sets.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -850,15 +907,13 @@ pub(crate) mod test {
     }
 
     async fn reload(store: &MemoryStore) -> crate::doc_sync::DocWithSyncKv {
-        crate::doc_sync::DocWithSyncKv::new(
-            "doc",
-            Some(Arc::new(Box::new(store.clone()))),
-            || (),
-            false,
-            None,
-        )
-        .await
-        .unwrap()
+        let store: Option<Arc<Box<dyn Store>>> = Some(Arc::new(Box::new(store.clone())));
+        // `new` takes the update callback only with the `sync` feature.
+        #[cfg(feature = "sync")]
+        let doc = crate::doc_sync::DocWithSyncKv::new("doc", store, || (), false, None).await;
+        #[cfg(not(feature = "sync"))]
+        let doc = crate::doc_sync::DocWithSyncKv::new("doc", store, || (), false).await;
+        doc.unwrap()
     }
 
     #[tokio::test]
