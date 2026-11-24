@@ -2167,7 +2167,11 @@ mod test {
             (200, Some(Authorization::Full))
         );
         assert_eq!(
-            auth_over_http(Some("application/json"), r#"{"authorization": "read-only"}"#).await,
+            auth_over_http(
+                Some("application/json"),
+                r#"{"authorization": "read-only"}"#
+            )
+            .await,
             (200, Some(Authorization::ReadOnly))
         );
     }
@@ -2178,7 +2182,11 @@ mod test {
         let json = Some("application/json");
         let cases: [(Option<&str>, &'static str, u16); 6] = [
             (json, r#"{"authorization": "read-only", "userId": 7}"#, 422),
-            (json, r#"{"authorization": "read-only", "writer": {"kind": "ui"}}"#, 422),
+            (
+                json,
+                r#"{"authorization": "read-only", "writer": {"kind": "ui"}}"#,
+                422,
+            ),
             (json, r#"{"authorization": "read-only-ish"}"#, 422),
             (json, r#"{"authorization": "read-only""#, 400),
             (Some("text/plain"), r#"{"authorization": "read-only"}"#, 415),
@@ -3326,7 +3334,10 @@ mod test {
 
         // A write that applies while the gate is open is in time.
         let admitted = gate.enter().await.expect("the gate is open");
-        docs.get(DOC_ID).unwrap().apply_update(&map_edit(1), None).unwrap();
+        docs.get(DOC_ID)
+            .unwrap()
+            .apply_update(&map_edit(1), None)
+            .unwrap();
         assert!(admitted.in_time());
         drop(admitted);
 
@@ -3338,7 +3349,10 @@ mod test {
             .unwrap()
             .unwrap();
         // The final saves are done; the stuck write applies now.
-        docs.get(DOC_ID).unwrap().apply_update(&map_edit(7), None).unwrap();
+        docs.get(DOC_ID)
+            .unwrap()
+            .apply_update(&map_edit(7), None)
+            .unwrap();
         let stored = stored_keys(&store).await;
         assert!(stored.contains("1") && !stored.contains("7"), "{stored:?}");
         assert!(!stuck.in_time(), "acknowledged but not saved");
