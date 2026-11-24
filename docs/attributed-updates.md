@@ -368,7 +368,12 @@ behaves as the production build with `user-suspension.patch` did:
 - **Token lifetime.** A websocket opened with a managed token is closed when the token
   expires.
 - **State.** Small JSON objects under `__dalus_auth/users/` in the store; include them in
-  backups. Reads and writes of them have a 3 s limit each. A user's state is read once and
+  backups. Reads and writes of them have a 3 s limit each, and a suspension or restore has a
+  6 s limit in all, waiting for another change of the same user included: the web app aborts
+  the request after 8 s and then treats the change as not made, so the server answers first
+  (`503` when the limit is reached). A call that is abandoned part way, at that limit or
+  because the request went away, counts its started writes as possibly landed, like failed
+  ones (see below). A user's state is read once and
   then kept in memory, which is one more reason this server must be the only one on its
   store. See [Revocation records](#revocation-records).
 

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, RwLock},
-    time::timeout,
+    time::{timeout, timeout_at, Instant},
 };
 use tokio_util::sync::CancellationToken;
 use y_sweet_core::store::Store;
@@ -54,6 +54,13 @@ impl Record {
 
 /// How long one read or write of a record may take.
 const STORAGE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a suspension or restore may take in all, from the call to its answer, waiting
+/// for another change of the same user included. The app aborts the request after 8 s
+/// (`AbortSignal.timeout(8000)` in `apps/web/lib/common/y-sweet/user-access.ts`) and then
+/// treats the change as not made; this leaves 2 s of that for the network and the request's
+/// way in and out, so that the server's answer, not the app's abort, decides.
+const CHANGE_DEADLINE: Duration = Duration::from_secs(6);
 
 #[derive(Clone, Default)]
 struct Entry {
@@ -105,15 +112,41 @@ impl UserAccess {
         Ok(format!("__dalus_auth/users/{user}/{position}.json"))
     }
 
-    async fn read(store: &Arc<Box<dyn Store>>, key: &str) -> Result<Option<Record>> {
-        Ok(match timeout(STORAGE_TIMEOUT, store.get(key)).await?? {
-            Some(bytes) => Some(serde_json::from_slice(&bytes)?),
-            None => None,
-        })
+    /// How long the next read or write may take: [STORAGE_TIMEOUT], or less if the call it is
+    /// part of has a deadline that comes sooner.
+    fn limit(deadline: Option<Instant>) -> Duration {
+        match deadline {
+            Some(deadline) => {
+                STORAGE_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()))
+            }
+            None => STORAGE_TIMEOUT,
+        }
     }
 
-    async fn write(store: &Arc<Box<dyn Store>>, key: &str, record: &Record) -> Result<()> {
-        timeout(STORAGE_TIMEOUT, store.set(key, serde_json::to_vec(record)?)).await??;
+    async fn read(
+        store: &Arc<Box<dyn Store>>,
+        key: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Record>> {
+        Ok(
+            match timeout(Self::limit(deadline), store.get(key)).await?? {
+                Some(bytes) => Some(serde_json::from_slice(&bytes)?),
+                None => None,
+            },
+        )
+    }
+
+    async fn write(
+        store: &Arc<Box<dyn Store>>,
+        key: &str,
+        record: &Record,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        timeout(
+            Self::limit(deadline),
+            store.set(key, serde_json::to_vec(record)?),
+        )
+        .await??;
         Ok(())
     }
 
@@ -139,6 +172,7 @@ impl UserAccess {
         cached: &mut Option<Entry>,
         store: &Option<Arc<Box<dyn Store>>>,
         user: &str,
+        deadline: Option<Instant>,
     ) -> Result<Entry> {
         let key = Self::key(user)?;
         if let Some(entry) = cached.as_ref() {
@@ -150,7 +184,9 @@ impl UserAccess {
         // The chain, from its fixed start to its last record.
         let mut chain_len = 0;
         let mut last = None;
-        while let Some(record) = Self::read(store, &Self::chain_key(user, chain_len + 1)?).await? {
+        while let Some(record) =
+            Self::read(store, &Self::chain_key(user, chain_len + 1)?, deadline).await?
+        {
             last = Some(record);
             chain_len += 1;
         }
@@ -161,7 +197,7 @@ impl UserAccess {
         // what it read there, so a change it made after this build's last one is always
         // above. That holds also when this build's last record is a settling one whose own
         // generation is the same or higher: the earlier build's change is newer than it.
-        let single = Self::read(store, &key).await?;
+        let single = Self::read(store, &key, deadline).await?;
         let mut record = last.clone().unwrap_or_default();
         let ahead = |single: &Record| {
             last.as_ref()
@@ -182,9 +218,14 @@ impl UserAccess {
                 },
                 _ => single,
             };
-            if Self::write(store, &Self::chain_key(user, chain_len + 1)?, &record)
-                .await
-                .is_ok()
+            if Self::write(
+                store,
+                &Self::chain_key(user, chain_len + 1)?,
+                &record,
+                deadline,
+            )
+            .await
+            .is_ok()
             {
                 chain_len += 1;
             }
@@ -202,7 +243,7 @@ impl UserAccess {
 
     pub async fn generation(&self, store: &Option<Arc<Box<dyn Store>>>, user: &str) -> Result<u64> {
         let cell = self.cell(user).await?;
-        let entry = Self::load(&mut *cell.lock().await, store, user).await?;
+        let entry = Self::load(&mut *cell.lock().await, store, user, None).await?;
         if entry.record.suspended {
             return Err(anyhow!("User access denied"));
         }
@@ -218,7 +259,7 @@ impl UserAccess {
         generation: u64,
     ) -> Result<CancellationToken> {
         let cell = self.cell(user).await?;
-        let entry = Self::load(&mut *cell.lock().await, store, user).await?;
+        let entry = Self::load(&mut *cell.lock().await, store, user, None).await?;
         if entry.record.suspended || entry.record.token_generation() != generation {
             return Err(anyhow!("User access denied"));
         }
@@ -234,7 +275,7 @@ impl UserAccess {
         generation: u64,
     ) -> Result<Authorized> {
         let cell = self.cell(user).await?;
-        let entry = Self::load(&mut *cell.lock().await, store, user).await?;
+        let entry = Self::load(&mut *cell.lock().await, store, user, None).await?;
         if entry.record.suspended || entry.record.token_generation() != generation {
             return Err(anyhow!("User access denied"));
         }
@@ -246,20 +287,30 @@ impl UserAccess {
 
     /// Moves the user to `record`, a change that is in the store as the next position of the
     /// chain: what was authorized under `old` is cancelled, and whatever of it is still
-    /// under way is waited for.
-    async fn advance(cached: &mut Option<Entry>, old: &Entry, record: Record) -> Entry {
+    /// under way is waited for, until `deadline`.
+    async fn advance(
+        cached: &mut Option<Entry>,
+        old: &Entry,
+        record: Record,
+        deadline: Instant,
+    ) -> Result<()> {
         old.cancellation.cancel();
-        let entry = Entry {
+        *cached = Some(Entry {
             record,
             chain_len: old.chain_len + 1,
             ..Entry::default()
-        };
-        *cached = Some(entry.clone());
+        });
         // Holders keep this only across a check and an in-memory read or write, never across
         // IO, so the wait is short. New holders queue behind this and then find the
-        // cancellation.
-        drop(old.activity.write().await);
-        entry
+        // cancellation. If it is not short enough, the change stands (it is stored, and
+        // nothing new of the user is admitted) but is not acknowledged: something authorized
+        // before it may still be under way.
+        drop(
+            timeout_at(deadline, old.activity.write())
+                .await
+                .map_err(|_| anyhow!("Timed out waiting for the user's work under way"))?,
+        );
+        Ok(())
     }
 
     pub async fn set_suspended(
@@ -268,9 +319,12 @@ impl UserAccess {
         user: &str,
         suspended: bool,
     ) -> Result<()> {
+        let deadline = Instant::now() + CHANGE_DEADLINE;
         let cell = self.cell(user).await?;
-        let mut cached = cell.lock().await;
-        let mut old = Self::load(&mut cached, store, user).await?;
+        let mut cached = timeout_at(deadline, cell.lock())
+            .await
+            .map_err(|_| anyhow!("Timed out waiting for another change of the user"))?;
+        let mut old = Self::load(&mut cached, store, user, Some(deadline)).await?;
         let store = store
             .as_ref()
             .ok_or_else(|| anyhow!("Durable storage required"))?;
@@ -295,15 +349,14 @@ impl UserAccess {
                 store,
                 &Self::chain_key(user, old.chain_len + 1)?,
                 &unchanged,
+                Some(deadline),
             )
             .await?;
             old = Entry {
                 record: unchanged,
                 chain_len: old.chain_len + 1,
-                next_key_used: false,
                 ..old
             };
-            *cached = Some(old.clone());
         }
 
         let record = Record {
@@ -317,18 +370,19 @@ impl UserAccess {
         // the chain's last change, which is what lets this build tell an earlier build's
         // later change from its own (see [UserAccess::load]). Failure leaves this process
         // in the old state and allows a safe retry.
+        //
+        // Until both are stored, the generation and the chain position count as used: a
+        // write that failed, or that was abandoned (at the deadline, or with the request), may
+        // reach the store all the same, and the next change must settle them first. That is
+        // recorded before writing, so it holds however this call ends.
+        *cached = Some(Entry {
+            next_key_used: true,
+            ..old.clone()
+        });
         for key in [Self::key(user)?, Self::chain_key(user, old.chain_len + 1)?] {
-            if let Err(error) = Self::write(store, &key, &record).await {
-                // The write may have reached the store all the same: the generation and the
-                // chain position are used. The next change settles them first.
-                if let Some(entry) = cached.as_mut() {
-                    entry.next_key_used = true;
-                }
-                return Err(error);
-            }
+            Self::write(store, &key, &record, Some(deadline)).await?;
         }
-        Self::advance(&mut cached, &old, record).await;
-        Ok(())
+        Self::advance(&mut cached, &old, record, deadline).await
     }
 }
 
@@ -442,6 +496,8 @@ mod tests {
         fail_sets_to: Arc<std::sync::Mutex<Option<String>>>,
         /// How many more writes go through before one fails outright (and stores nothing).
         fail_after: Arc<std::sync::Mutex<Option<usize>>>,
+        /// Every write takes this long (and stores nothing if abandoned before).
+        set_delay: Arc<std::sync::Mutex<Option<Duration>>>,
     }
 
     impl LateStore {
@@ -490,6 +546,10 @@ mod tests {
             if stall {
                 self.late.lock().unwrap().push((key.to_string(), value));
                 return std::future::pending().await;
+            }
+            let delay = *self.set_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
             let fail_now = {
                 let mut fail_after = self.fail_after.lock().unwrap();
@@ -737,7 +797,7 @@ mod tests {
     /// generation on. Tokens it mints carry that generation, and it accepts a token only at it.
     async fn production_sets(store: &Option<Arc<Box<dyn Store>>>, suspended: bool) {
         let store = store.as_ref().unwrap();
-        let current = UserAccess::read(store, SINGLE_OBJECT)
+        let current = UserAccess::read(store, SINGLE_OBJECT, None)
             .await
             .unwrap()
             .unwrap_or_default();
@@ -746,14 +806,14 @@ mod tests {
             suspended,
             keeps: None,
         };
-        UserAccess::write(store, SINGLE_OBJECT, &record)
+        UserAccess::write(store, SINGLE_OBJECT, &record, None)
             .await
             .unwrap();
     }
 
     /// The state the production build sees.
     async fn production_view(store: &Option<Arc<Box<dyn Store>>>) -> Record {
-        UserAccess::read(store.as_ref().unwrap(), SINGLE_OBJECT)
+        UserAccess::read(store.as_ref().unwrap(), SINGLE_OBJECT, None)
             .await
             .unwrap()
             .unwrap_or_default()
@@ -865,6 +925,75 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The app gives the whole suspension request 8 s. A change makes up to three writes,
+    /// after up to a few reads, each with its own 3 s limit: with a store that is slow but
+    /// within that limit, the call must still answer in time, and answer that it failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_change_answers_within_its_deadline_however_slow_the_store() {
+        let backing = LateStore::default();
+        let store = backing.handle();
+        // A user this build changed before, in an earlier process: the change settles first.
+        UserAccess::default()
+            .set_suspended(&store, "member", true)
+            .await
+            .unwrap();
+        let access = Arc::new(UserAccess::default());
+        let generation_before = access.generation(&store, "member").await.is_err();
+        assert!(generation_before);
+
+        *backing.set_delay.lock().unwrap() = Some(Duration::from_millis(2500));
+        let started = tokio::time::Instant::now();
+        // Two calls for the user at once: the second waits for the first, within the same
+        // deadline.
+        let (first, second) = tokio::join!(
+            access.set_suspended(&store, "member", false),
+            access.set_suspended(&store, "member", false)
+        );
+        let took = started.elapsed();
+        assert!(took <= CHANGE_DEADLINE, "took {took:?}");
+        assert!(CHANGE_DEADLINE < Duration::from_secs(8));
+        assert!(first.is_err() && second.is_err());
+        // Not done, as answered: this process still enforces the suspension. (The first
+        // call got its single-object write in before the deadline cut its chain write, so a
+        // restart would find the restore: the outcome of a call that failed after a write
+        // landed, which the retry settles.)
+        assert!(access.generation(&store, "member").await.is_err());
+
+        // A store that is fast again lets the retry through.
+        *backing.set_delay.lock().unwrap() = None;
+        access.set_suspended(&store, "member", false).await.unwrap();
+        assert!(access.generation(&store, "member").await.is_ok());
+    }
+
+    /// A call can be abandoned at any await, by its deadline or because the request is gone:
+    /// a write it had started may still land. The next change must then not reuse that
+    /// write's position or generation, or the late write could replace it.
+    #[tokio::test(start_paused = true)]
+    async fn a_change_abandoned_during_a_write_cannot_undo_the_next_one() {
+        let backing = LateStore::default();
+        let store = backing.handle();
+        let access = UserAccess::default();
+        access.set_suspended(&store, "member", true).await.unwrap();
+
+        // A restore whose second write (the chain) reaches the store late, and whose caller
+        // stops waiting before that.
+        *backing.stall_after.lock().unwrap() = Some(1);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            access.set_suspended(&store, "member", false)
+        )
+        .await
+        .is_err());
+        assert_eq!(*backing.stall_after.lock().unwrap(), None);
+
+        // The user is suspended again, acknowledged; then the restore's write lands.
+        access.set_suspended(&store, "member", true).await.unwrap();
+        assert_eq!(backing.land_late_writes(), 1);
+        for access in [access, UserAccess::default()] {
+            assert!(access.generation(&store, "member").await.is_err());
         }
     }
 
