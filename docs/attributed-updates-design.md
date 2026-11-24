@@ -79,7 +79,9 @@ variant, written out by hand from the layout.
 
 User suspension and token expiry enforcement, formerly patches applied to revision 4f1909b when the
 production and appliance images were built, are part of the server behind `Y_SWEET_USER_SUSPENSION` and
-`Y_SWEET_ENFORCE_TOKEN_EXPIRY` (both off by default; the operator page has the behaviour). What the port
+`Y_SWEET_ENFORCE_TOKEN_EXPIRY` (expiry off by default; suspension on by default for a server with auth
+and a store that does not enforce expiry, which is where the production build enforced it unconditionally;
+the operator page has the behaviour). What the port
 had to settle:
 
 - **One verification path.** `Server::verify_doc_token` returns the access, a cancellation token and a

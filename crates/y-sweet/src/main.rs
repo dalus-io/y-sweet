@@ -93,16 +93,22 @@ enum ServSubcommand {
         /// revocation generation, accept only such tokens (and the server token), and serve
         /// `POST /users/:user_id/suspension`. Needs `--auth` and a store. Accepts `true` or
         /// `false`, like `--attributed-tokens`.
+        ///
+        /// Unset (or empty), it is on when the server has `--auth` and a store and does not
+        /// enforce token expiry: where the Dalus production build enforced suspension, which
+        /// had no switch. So the hosted deployment keeps it with its existing settings, and
+        /// the appliance (which enforces token expiry) and local servers without auth or a
+        /// store keep running without it. Set it to decide explicitly.
         #[clap(
             long,
             env = "Y_SWEET_USER_SUSPENSION",
             action = clap::ArgAction::Set,
             num_args = 0..=1,
-            default_value = "false",
+            default_value = "",
             default_missing_value = "true",
-            value_parser = parse_plain_switch,
+            value_parser = parse_user_suspension_setting,
         )]
-        user_suspension: bool,
+        user_suspension: UserSuspensionSetting,
 
         /// Enforce token expiry: a doc token that can write must expire, and a websocket ends
         /// when the token it was opened with does. Needs `--auth`. Accepts `true` or `false`,
@@ -266,6 +272,34 @@ fn parse_plain_switch(value: &str) -> Result<bool, String> {
             value.trim()
         )
     })
+}
+
+/// `--user-suspension` as given: `None` when unset or empty (see [user_suspension_enabled]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UserSuspensionSetting(Option<bool>);
+
+fn parse_user_suspension_setting(value: &str) -> Result<UserSuspensionSetting, String> {
+    if value.trim().is_empty() {
+        return Ok(UserSuspensionSetting(None));
+    }
+    parse_plain_switch(value).map(|on| UserSuspensionSetting(Some(on)))
+}
+
+/// Whether the server enforces user suspension. A value that is set decides. Unset, it is on
+/// for a server with auth and a store that does not enforce token expiry: the hosted
+/// deployment, whose production build (revision 4f1909b with the user-suspension patch)
+/// enforced suspension unconditionally. The appliance enforces token expiry and its build
+/// (the token-expiry patch) had no suspension; a server without auth has no tokens to bind,
+/// and one without a store nowhere to keep a suspension.
+fn user_suspension_enabled(
+    setting: UserSuspensionSetting,
+    has_auth: bool,
+    has_store: bool,
+    enforce_token_expiry: bool,
+) -> bool {
+    setting
+        .0
+        .unwrap_or(has_auth && has_store && !enforce_token_expiry)
 }
 
 /// `None` for an option that is unset or set to nothing.
@@ -564,6 +598,14 @@ async fn run() -> Result<()> {
 
                 let token = CancellationToken::new();
 
+                let user_suspension_default = user_suspension.0.is_none();
+                let user_suspension = user_suspension_enabled(
+                    *user_suspension,
+                    !server_has_no_auth,
+                    store.is_some(),
+                    *enforce_token_expiry,
+                );
+
                 let server = y_sweet::server::Server::new(
                     store,
                     std::time::Duration::from_secs(*checkpoint_freq_seconds),
@@ -579,7 +621,7 @@ async fn run() -> Result<()> {
                     shutdown_timeout,
                 ))
                 .with_attributed_tokens(*attributed_tokens)
-                .with_user_suspension(*user_suspension)?
+                .with_user_suspension(user_suspension)?
                 .with_token_expiry_enforcement(*enforce_token_expiry)?;
                 let mut server = server;
                 // Set up here, before the configuration line below, so that the line reports
@@ -596,7 +638,8 @@ async fn run() -> Result<()> {
                 // the rest of the URL and the secret are never logged.
                 tracing::info!(
                     attributed_tokens = *attributed_tokens,
-                    user_suspension = *user_suspension,
+                    user_suspension,
+                    user_suspension_default,
                     enforce_token_expiry = *enforce_token_expiry,
                     shutdown_timeout_seconds = shutdown_timeout.as_secs(),
                     update_webhook_enabled = update_webhook.is_some(),
@@ -903,28 +946,56 @@ mod tests {
                     user_suspension,
                     enforce_token_expiry,
                     ..
-                } => Ok::<_, String>((user_suspension, enforce_token_expiry)),
+                } => Ok::<_, String>((user_suspension.0, enforce_token_expiry)),
                 _ => unreachable!(),
             }
         };
-        // Both off unless asked for.
-        assert_eq!(parsed(&[]), Ok((false, false)));
-        assert_eq!(parsed(&["--user-suspension"]), Ok((true, false)));
-        assert_eq!(parsed(&["--enforce-token-expiry=true"]), Ok((false, true)));
+        // Unset unless given: suspension then follows the rest of the configuration (see
+        // the test below); expiry enforcement is off.
+        assert_eq!(parsed(&[]), Ok((None, false)));
+        assert_eq!(parsed(&["--user-suspension"]), Ok((Some(true), false)));
+        assert_eq!(
+            parsed(&["--user-suspension=false"]),
+            Ok((Some(false), false))
+        );
+        assert_eq!(parsed(&["--enforce-token-expiry=true"]), Ok((None, true)));
         assert_eq!(
             parsed(&["--user-suspension=1", "--enforce-token-expiry", "true"]),
-            Ok((true, true))
+            Ok((Some(true), true))
         );
         // Empty counts as unset, as for every setting of this fork.
         assert_eq!(
             parsed(&["--user-suspension=", "--enforce-token-expiry= "]),
-            Ok((false, false))
+            Ok((None, false))
         );
         // A value that is neither is an error: these decide who gets in.
         let error = parsed(&["--enforce-token-expiry=enabled"]).unwrap_err();
         assert!(error.contains("expected `true` or `false`"), "{error}");
         assert!(!error.contains("attributed"), "{error}");
         assert!(parsed(&["--user-suspension=maybe"]).is_err());
+    }
+
+    #[test]
+    fn user_suspension_is_on_wherever_the_production_build_enforced_it() {
+        // (setting, auth, store, token expiry enforced)
+        let on = |setting, auth, store, expiry| {
+            user_suspension_enabled(UserSuspensionSetting(setting), auth, store, expiry)
+        };
+        // Hosted: auth and a store, expiry not enforced. The production build there (the
+        // user-suspension patch) always enforced suspension and had no switch, so an image
+        // swap with the existing settings must keep it on.
+        assert!(on(None, true, true, false));
+        // The appliance enforces token expiry (its image sets it) and its build
+        // (token-expiry.patch) had no suspension: off.
+        assert!(!on(None, true, true, true));
+        // Without auth or without a store there is nothing to bind or keep: off, as upstream.
+        assert!(!on(None, false, true, false));
+        assert!(!on(None, true, false, false));
+        assert!(!on(None, false, false, false));
+        // A value that is set always wins (and on without auth then fails at startup).
+        assert!(!on(Some(false), true, true, false));
+        assert!(on(Some(true), true, true, true));
+        assert!(on(Some(true), false, false, false));
     }
 
     /// `(attributed_tokens, store)` as parsed from `y-sweet serve <args>`.

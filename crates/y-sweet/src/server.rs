@@ -413,7 +413,8 @@ impl Server {
         self
     }
 
-    /// Turns user suspension on or off (off by default).
+    /// Turns user suspension on or off (off unless called; `y-sweet serve` turns it on by
+    /// default for a server with auth and a store that does not enforce token expiry).
     ///
     /// On, the server works as the Dalus production build with the user-suspension patch does:
     ///

@@ -315,14 +315,26 @@ A binary without this feature cannot decode an attributed token and rejects it w
 
 ## User suspension and token expiry
 
-Two more switches, both off by default, replace the patches the Dalus images used to apply to
-fork revision 4f1909b at build time. One binary now serves production (suspension), the on-prem
-appliance (token expiry) and attribution, in any combination.
+Two more switches replace the patches the Dalus images used to apply to fork revision 4f1909b
+at build time. One binary now serves production (suspension), the on-prem appliance (token
+expiry) and attribution, in any combination.
 
 | Variable | Flag | Default | Meaning |
 | --- | --- | --- | --- |
-| `Y_SWEET_USER_SUSPENSION` | `--user-suspension [true\|false]` | `false` | Bind doc tokens to users, and let users be suspended. Needs `Y_SWEET_AUTH`, and a store for any token that names a user. |
+| `Y_SWEET_USER_SUSPENSION` | `--user-suspension [true\|false]` | on with `Y_SWEET_AUTH` and a store, unless token expiry is enforced; else off | Bind doc tokens to users, and let users be suspended. Needs `Y_SWEET_AUTH`, and a store for any token that names a user. |
 | `Y_SWEET_ENFORCE_TOKEN_EXPIRY` | `--enforce-token-expiry [true\|false]` | `false` | A doc token that can write must expire, and a websocket ends with its token. Needs `Y_SWEET_AUTH`. |
+
+**Why suspension defaults to on.** The production build (4f1909b with `user-suspension.patch`)
+had no switch: it always enforced suspension. Its deployment sets `Y_SWEET_AUTH` and an S3
+store and nothing about suspension, so swapping that image for this one must keep suspension
+on with the same settings; with an off default the endpoint would answer `404`, the web app's
+suspend action would fail, and a suspended user's open socket would stay writable. The
+appliance image sets `Y_SWEET_ENFORCE_TOKEN_EXPIRY=true` and its build had no suspension, so
+there the default is off, as it is for a server without auth (nothing to bind) or without a
+store (nowhere to keep a suspension), such as local development with the stock settings. A
+value that is set always wins: `Y_SWEET_USER_SUSPENSION=false` turns it off on a hosted
+server, `true` turns it on beside token expiry. The startup line reports the outcome as
+`user_suspension` and whether it came from the default as `user_suspension_default`.
 
 Both read their value like `Y_SWEET_ATTRIBUTED_TOKENS` (`true`/`1`/`yes`/`on`,
 `false`/`0`/`no`/`off`, any letter case; empty is unset). A value that is neither, or a switch
@@ -334,8 +346,8 @@ that silently enforced nothing would be worse than one that does not start. The
 
 ### User suspension
 
-With `Y_SWEET_USER_SUSPENSION=true` the server behaves as the production build with
-`user-suspension.patch` did:
+With user suspension on (by default or with `Y_SWEET_USER_SUSPENSION=true`) the server
+behaves as the production build with `user-suspension.patch` did:
 
 - **Minting.** `POST /doc/:doc_id/auth` mints managed tokens. A request with a `userId` gets a
   token bound to that user and the user's current *generation*; a request without one gets a
