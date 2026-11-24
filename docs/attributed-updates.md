@@ -8,7 +8,9 @@ This fork of Y-Sweet can do two things upstream cannot:
    its actor, batched per doc, in order per doc, signed, with at-least-once delivery and a signal
    when something was lost (see [Gaps](#gaps) for what the receiver must do with it).
 
-The two are independent and both are off by default.
+The two are independent and both are off by default. Two further switches, user suspension and
+token expiry enforcement, are described under
+[User suspension and token expiry](#user-suspension-and-token-expiry).
 
 ### Differences from upstream with both switches off
 
@@ -284,17 +286,19 @@ server token, with a plain doc token, or on a server without auth are unattribut
 
 ### Token formats this build knows
 
-| Variant | Minted by | This build |
-| --- | --- | --- |
-| `Doc` | upstream; here when the request names no actor or the switch is off | accepts |
-| `ManagedDoc` (user id and revocation generation) | the Dalus production build with user suspension (fork revision 4f1909b plus its patch) | rejects with `401`: it cannot check the generation, and must not ignore it |
-| `AttributedDoc` | here, with the switch on | accepts |
+| Index | Variant | Minted | Accepted |
+| --- | --- | --- | --- |
+| 1 | `Doc` | upstream; here when the request names no actor or attributed tokens are off | unless user suspension is on |
+| 2 | `ManagedDoc` (user id and revocation generation) | here with user suspension on, and by the Dalus production build of fork revision 4f1909b plus its patch: same bytes | only with user suspension on |
+| 3 | `AttributedDoc` | here, with attributed tokens on | unless user suspension is on |
+| 4 | `ManagedAttributedDoc` (both) | here, with user suspension and attributed tokens on, when the request names an actor | only with user suspension on |
 
-So a build of this branch cannot take over from the production suspension build while that
-build's tokens are outstanding without every client re-authenticating, and the two must never
-verify each other's tokens side by side. Builds of this branch up to 649406a used the
-`ManagedDoc` slot for `AttributedDoc`; attributed tokens they minted are rejected by later
-builds until they expire.
+A server that does not enforce suspension answers a managed token with `401` (`The token is of
+a kind this server does not accept`): it cannot check the generation the token is bound to, and
+must not ignore it. A server that does enforce it answers every unmanaged token with `401`, as
+the production build does, so their holders authenticate again. Builds of this branch up to
+649406a used index 2 for `AttributedDoc`; attributed tokens they minted are rejected by later
+builds until they expire. See [User suspension and token expiry](#user-suspension-and-token-expiry).
 
 ### Turning it on and off
 
@@ -314,6 +318,247 @@ A binary without this feature cannot decode an attributed token and rejects it w
   3. Only then deploy the older image.
 
   Turning the webhook off needs no such care: unset the URL and restart.
+
+## User suspension and token expiry
+
+Two more switches replace the patches the Dalus images used to apply to fork revision 4f1909b
+at build time. One binary now serves production (suspension), the on-prem appliance (token
+expiry) and attribution, in any combination.
+
+| Variable | Flag | Default | Meaning |
+| --- | --- | --- | --- |
+| `Y_SWEET_USER_SUSPENSION` | `--user-suspension [true\|false]` | on with `Y_SWEET_AUTH` and a store, unless token expiry is enforced; else off | Bind doc tokens to users, and let users be suspended. Needs `Y_SWEET_AUTH`, and a store for any token that names a user. |
+| `Y_SWEET_ENFORCE_TOKEN_EXPIRY` | `--enforce-token-expiry [true\|false]` | `false` | A doc token that can write must expire, and a websocket ends with its token. Needs `Y_SWEET_AUTH`. |
+
+**Why suspension defaults to on.** The production build (4f1909b with `user-suspension.patch`)
+had no switch: it always enforced suspension. Its deployment sets `Y_SWEET_AUTH` and an S3
+store and nothing about suspension, so swapping that image for this one must keep suspension
+on with the same settings; with an off default the endpoint would answer `404`, the web app's
+suspend action would fail, and a suspended user's open socket would stay writable. The
+appliance image sets `Y_SWEET_ENFORCE_TOKEN_EXPIRY=true` and its build had no suspension, so
+there the default is off, as it is for a server without auth (nothing to bind) or without a
+store (nowhere to keep a suspension), such as local development with the stock settings. A
+value that is set always wins: `Y_SWEET_USER_SUSPENSION=false` turns it off on a hosted
+server, `true` turns it on beside token expiry. The startup line reports the outcome as
+`user_suspension` and whether it came from the default as `user_suspension_default`.
+
+Both read their value like `Y_SWEET_ATTRIBUTED_TOKENS` (`true`/`1`/`yes`/`on`,
+`false`/`0`/`no`/`off`, any letter case; empty is unset). A value that is neither, or a switch
+turned on without `Y_SWEET_AUTH`, is a startup error (`User suspension requires --auth`,
+`Token expiry enforcement requires --auth`): these switches decide who gets in, and a server
+that silently enforced nothing would be worse than one that does not start. The
+`attributed updates configuration` line reports both (`user_suspension`,
+`enforce_token_expiry`).
+
+### User suspension
+
+With user suspension on (by default or with `Y_SWEET_USER_SUSPENSION=true`) the server
+behaves as the production build with `user-suspension.patch` did:
+
+- **Minting.** `POST /doc/:doc_id/auth` mints managed tokens. A request with a `userId` gets a
+  token bound to that user and the user's current *generation*; a request without one gets a
+  token bound to nobody. The user id must be 1 to 128 characters of `A-Z a-z 0-9 - _`. Minting
+  for a suspended user, for an invalid user id, or with a `userId` on a server without a store
+  is refused with `403`.
+- **Verifying.** Every doc endpoint (`as-update`, `update`, the websocket) accepts only the
+  server token and managed tokens. A token bound to a user is accepted only while that user is
+  not suspended and is still at the token's generation; otherwise `401`. Tokens of any other
+  kind get `401`, so after the switch is turned on every client authenticates again.
+- **Suspending.** `POST /users/:user_id/suspension` with the server token and the body
+  `{"suspended": true}` or `{"suspended": false}` (nothing else: an unknown field is `422`)
+  answers `204` once the change is stored. Either direction moves the user to a new
+  generation, so every token minted before it is dead for good, also after the user is
+  restored; a restored user needs new tokens. The user's open websockets are closed at once.
+  A storage failure answers `503` and changes nothing; the call can be repeated. Without the
+  server token: `401`. With the switch off the route does not exist (`404`).
+- **Token lifetime.** A websocket opened with a managed token is closed when the token
+  expires.
+- **State.** Small JSON objects under `__dalus_auth/users/` in the store; include them in
+  backups. Reads and writes of them have a 3 s limit each, and a suspension or restore has a
+  6 s limit in all, waiting for another change of the same user included: the web app aborts
+  the request after 8 s and then treats the change as not made, so the server answers first
+  (`503` when the limit is reached). A call that is abandoned part way, at that limit or
+  because the request went away, counts its started writes as possibly landed, like failed
+  ones (see below). A user's state is read once and
+  then kept in memory, which is one more reason this server must be the only one on its
+  store. See [Revocation records](#revocation-records).
+
+**What the `204` means.** When the suspension endpoint has answered, nothing of that user is
+applied or read any more: not an HTTP update, not a websocket frame, not an `as-update`
+read. A request is checked when it arrives and again at the moment it acts, once its doc is
+in memory; from that second check until it is done it holds a per-user guard, and the endpoint
+takes that guard exclusively before it answers. So a request that got in before the
+suspension is finished before the `204`, and one that asks after it is refused (`401`), also
+if it had been waiting for its doc to load or for the doc lock. The endpoint therefore waits
+for the user's writes that are in progress, which is in-memory work on a doc and normally
+takes milliseconds. A response already being sent when the user is suspended is not recalled.
+
+#### Revocation records
+
+Every suspension or restore is a new *generation* of the user, stored as a record of its own
+at the end of the user's chain: `__dalus_auth/users/<user>/1.json`, `2.json`, and so on, each
+holding a generation and whether the user is suspended. The user's state is the last record
+of the chain. The chain always starts at `1.json`. A position is written only once every
+position before it is stored, and none is ever removed, so the server finds the end by
+doubling and then halving: about two reads per doubling of the length plus one for the single
+object (21 reads for 1000 changes), once per user per process.
+
+The chain is never compacted. Each change adds one object of about 50 bytes (two when it is
+the user's first change in a process, which also stores a settling record), kept for good:
+for an account suspended and restored a hundred times, about 200 objects and 10 KB. Removing
+the old records would mean either a chain that no longer starts at a fixed key or a mutable
+pointer to its start, and a mutable object read at recovery is exactly what a late write can
+corrupt (see below); so they stay. Deleting a user's directory by hand is not a way to reset
+them: it restores a suspended user.
+
+Records are never overwritten with a different acknowledged state, for this reason: a write
+to the store can time out for the server and be applied by the store later. With one object
+per user, overwritten on every change (which is how the production build with the patch
+stores it), such a late write can replace a state that was acknowledged after it: a restore
+that timed out, landing after a later suspension, un-suspends the user at the next restart.
+Here a late write lands on a position that is no longer the last, and changes nothing. Two
+rules make that hold:
+
+- A change whose write failed is never retried on the same position. The next change first
+  stores a record that keeps the current state on the position that may have been used,
+  then stores itself on the one after.
+- The first change of a user after the server started does the same, because the server
+  cannot know whether the previous process left such a write behind.
+
+So a change takes one or two generations and up to three writes. The record that settles a
+position keeps the state and also the generation the user's tokens are bound to (`"keeps"`),
+so it changes nothing for the user: tokens are bound to the generation of the last real
+change, not of the last record. That is what makes a failed call harmless. The app treats any
+answer but `204` as "not completed" (it rolls its own change back and the admin retries), and
+a call that fails leaves the user as they were: no socket is closed, every token keeps
+working, here and after a restart. The one exception is inherent in a write of unknown
+outcome: if the change's own write timed out but reached the store, the call answers `503`,
+this process carries on with the old state, and the change takes effect at the next restart
+unless a later change outranks it. Repeating the call is safe and settles it.
+
+**The single object of earlier builds** (`__dalus_auth/users/<user>.json`) can raise a user's
+state but never lower it:
+
+- It is written first in every change, before the chain, with the change's generation; the
+  change is acknowledged only once both are stored. If it cannot be written the call answers
+  `503`, writes nothing more, and this process keeps the old state (the next change settles the
+  generation the failed write may have used). So a build that knows only that object (the
+  production build, during a rolling deploy or after a rollback) sees every acknowledged change,
+  and the object is never behind the chain's last change. If the object was written but the
+  chain write then fails, the call also answers `503` and this process keeps the old state, but
+  the change is stored: a restart, or the production build, finds it. That is the same as a write
+  of unknown outcome, and a retry settles it.
+- It is read, and it counts only when its generation is higher than the generation the chain's
+  last record binds tokens to (its `keeps`, or its own generation for a real change). That is
+  the case for everything the production build wrote before this build first saw the user, and
+  for any change the production build makes during a rollback: it writes one generation on from
+  what it read there, which is at least the generation of this build's last change. It wins also
+  when this build's last record is a settling one at the same or a higher generation (a change
+  of this build that failed half way before the rollback): the production build's change is the
+  newer one.
+- When it counts, it is copied to the end of the chain at once (the first time this build looks
+  the user up, be it for a mint that is then refused), with the generation tokens are bound to
+  kept from it, and a record generation above the chain's if it is not already. From then on it
+  is part of the chain, and nothing written to the single object afterwards with a generation at
+  or below that matters. In particular a write of the earlier build that timed out before the
+  upgrade and lands after it, such as a restore landing on top of a later suspension, is
+  ignored. If the copy cannot be stored, the lookup still succeeds with the same state, and the
+  user's next change puts it in the chain.
+
+What this cannot cover: a late write of an earlier build that lands before this build has
+ever looked that user up is indistinguishable from the state that build meant to leave, and
+is taken as it. A write of this build that timed out and lands only after a rollback, on the
+single object, overwrites what the production build stored there for its own reading (this
+build, rolled forward, still decides by the chain). And a build that knows only the single
+object, running at the same time as this one, can still overwrite that object with an older
+state that it alone will read; two servers on one store are forbidden for this among other
+reasons.
+
+#### Rolling back to the production build
+
+The production build is 4f1909b with `user-suspension.patch`. What it does with what this build
+leaves behind:
+
+- **Tokens.** It decodes the server token and `ManagedDoc` (index 2) only. With
+  `Y_SWEET_ATTRIBUTED_TOKENS` off, which is how every Dalus deployment runs today (the Terraform
+  variable `y_sweet_attributed_tokens` defaults to `false` and nothing in the app repository
+  sets it), this build mints exactly the tokens that build mints: the same bytes for the same
+  request, the browser's `userId` plus `writer: "ui"` included, since the writer is dropped with
+  the switch off. A rollback then leaves every outstanding token decodable, and valid: both
+  builds bind tokens to the generation in the single object for the user's current state (this
+  build writes it with every acknowledged change and mints at it). With the switch on, every mint that names an actor gets `ManagedAttributedDoc` (index 4), and with
+  suspension off `AttributedDoc` (index 3). The production build cannot decode either: after a
+  rollback, every request and websocket upgrade with such a token gets `401` until its holder
+  mints a new token through the app (which the production build then mints as index 2), for up
+  to the token's lifetime (3600 s for Dalus browser tokens, 300 s on the appliance). No format
+  that build can decode carries an actor, so the cure is the order under
+  [Turning it on and off](#turning-it-on-and-off): switch attribution off, deploy, wait out the
+  longest token lifetime, then roll back.
+
+- **Suspensions and restores.** Every change this build acknowledges is in the single object,
+  so the production build enforces it after a rollback, and tokens this build minted for a
+  restored user stay valid there. Every change the production build acknowledges during a
+  rollback is honoured by this build when it is deployed again, whatever this build left behind
+  (see the single object under [Revocation records](#revocation-records)). Tests emulate the
+  production build's reads and writes for both directions, after histories that end in a call
+  that failed at each of its writes.
+
+#### Suspension and attribution together
+
+Both features read the `userId` of the mint request. With both switches on, a token for a
+request that names an actor carries the actor *and* the binding (`ManagedAttributedDoc`), and
+the binding follows the same rule as without attribution: **a `userId` binds the token to that
+user.** That is what the production build does with such a request today (it ignores `writer`
+and binds on `userId`). The consequence is new for the application, though: with attribution
+on, its server-side writers (REST, Copilot, imports, action runs) send the acting user's id
+where they used to send none, so their tokens become bound too. When that user is suspended:
+
+- their open server-side connections are closed, like the user's browser connections;
+- HTTP updates with those tokens, and reconnects, get `401`;
+- new tokens for that `userId` are refused with `403`, for every writer kind, until the user is
+  restored.
+
+There is no way out of the binding for a request that names a user: the production build
+ignores any field it does not know and binds on `userId`, and so does this one (an earlier
+revision of this port read `"userScoped": false` as an opt-out; it is ignored now, like any
+unknown field). A writer that must keep working for a suspended user has to be minted without a
+`userId`, which also means without attribution to that user: a token with a `writer` and no
+`userId` is attributed to the writer kind and bound to nobody. Which server-side writers
+should stop for a suspended user is the application's decision, made by whether it sends the
+`userId`; the server does not know writer kinds and treats every request alike. With
+suspension on, a `userId` that is fine for attribution alone (any bytes, up to 128) is refused
+with `403` unless it fits the stricter character set above.
+
+### Token expiry
+
+With `Y_SWEET_ENFORCE_TOKEN_EXPIRY=true` the server behaves as the appliance build with
+`token-expiry.patch` did:
+
+- A doc token with full access is accepted only if it expires: one minted without an expiry,
+  or with the maximum one, gets `401`. Read-only tokens and the server token are not required
+  to expire. This applies to HTTP and websocket requests alike. Tokens this server mints
+  always expire (`validForSeconds`, default one hour).
+- A websocket is closed when the token it was opened with expires, and a frame that arrives
+  after that moment is not applied. The deadline is checked when a frame or an HTTP request
+  arrives and again at the moment it acts. A write that passes that second check just before
+  the deadline can complete just after it, by the time it waits for the doc lock and is
+  applied (normally well under a millisecond); nothing that starts after the deadline is
+  applied. The socket itself is closed by a timer set when it opens, while a token is judged
+  by the wall clock; where the two drift apart (a clock being corrected), a socket can be
+  closed slightly before the token stops verifying, and a reconnect in that gap is accepted
+  and closed again at the deadline.
+- Attributed tokens are held to the same rule and keep their actor. (The patch predates them
+  and would have rejected them.)
+- In single-doc mode (`serve-doc`), which has no tokens, the switch is a startup error.
+
+With both switches on, a managed token that can write must expire as well.
+
+With neither switch on, a websocket outlives the token it was opened with, as upstream.
+
+### Logs
+
+`user suspension changed` (info, `suspended`) on each successful call of the suspension
+endpoint. The user id is not logged, there or anywhere.
 
 ## The update webhook
 

@@ -90,12 +90,7 @@ impl DocWithSyncKv {
     }
 
     pub fn as_update(&self) -> Vec<u8> {
-        let awareness_guard = self.awareness.read().unwrap();
-        let doc = &awareness_guard.doc;
-
-        let txn = doc.transact();
-
-        txn.encode_state_as_update_v1(&StateVector::default())
+        state_as_update(&self.awareness)
     }
 
     /// Applies a v1 update to the doc. When `actor` is given, the transaction is tagged with it
@@ -121,6 +116,17 @@ impl DocWithSyncKv {
         self.sync_kv.shutdown();
         true
     }
+}
+
+/// The whole doc as one v1 update (see [DocWithSyncKv::as_update]), for a caller that holds
+/// the doc's awareness rather than the doc.
+pub fn state_as_update(awareness: &RwLock<Awareness>) -> Vec<u8> {
+    let awareness_guard = awareness.read().unwrap();
+    let doc = &awareness_guard.doc;
+
+    let txn = doc.transact();
+
+    txn.encode_state_as_update_v1(&StateVector::default())
 }
 
 /// Applies a v1 update to a doc through its awareness (see [DocWithSyncKv::apply_update]).
